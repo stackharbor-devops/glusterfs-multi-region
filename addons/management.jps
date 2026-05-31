@@ -1,5 +1,5 @@
 type: update
-version: 1.0
+version: 1.2
 id: glusterfs-management
 name: GlusterFS Cluster Management
 baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
@@ -12,6 +12,15 @@ description:
 # primary-env are passed in as settings (captured into globals) so each copy is
 # self-sufficient; the cluster's env list is rediscovered at button-press time
 # with getClusterEnvs, so the buttons fan out across all regions from anywhere.
+#
+# JPS addon-binding fundamentals (learned from jelastic-jps/kubernetes and
+# wordpress-multiregion-standalone references):
+#
+# 1. `addons:` block DEFINES the card (id, name, description, buttons).
+# 2. `installAddon` action ATTACHES it to a node-group's UI panel via nodeGroup.
+# 3. WITHOUT step 2, the addon installs cleanly but has no UI surface
+#    (no error, just silently invisible — what the user hit at first).
+# 4. `permanent: true` makes the card persist across the env lifecycle.
 # ---------------------------------------------------------------------------
 
 globals:
@@ -20,11 +29,8 @@ globals:
   master_env_name: ${settings.master_env_name:}
 
 onInstall:
-  # Bind the addon card (defined under `addons:` below) to the storage node-
-  # group's Add-Ons panel. Without this call, the addon installs but has no UI
-  # surface — Jelastic only renders addons that an installAddon call has
-  # attached to a node group. (Putting `nodeGroup:` inside the addon block
-  # itself does NOTHING; the binding lives in this action.)
+  # Bind the addon card to the storage node-group's Add-Ons panel. THIS is what
+  # makes the card visible — without it, the addon installs but is invisible.
   - installAddon:
     - id: glusterfs-mgmt
       nodeGroup: storage
@@ -32,6 +38,7 @@ onInstall:
 addons:
   - id: glusterfs-mgmt
     name: GlusterFS Cluster
+    permanent: true
     description: Status and maintenance for the multi-region GlusterFS cluster.
     buttons:
       - caption: Cluster Status
@@ -61,33 +68,40 @@ actions:
     - setGlobals:
         clusterEnvs: ${response.items.join(,)}
 
-  # Run a command on every region's storage master. command is passed via
-  # ${this.command} (already-resolved string - safe for quotes/semicolons).
-  runOnEachMaster:
+  # Build a parallel api[] array of ExecCmdById calls, one per region's storage
+  # master, all running the same command. Returns via onAfterReturn.api with
+  # async:true so the calls fan out concurrently across regions (vs a sequential
+  # forEach, which would serialize them).
+  fanOutToMasters:
+    - getClusterEnvs
     - script: |
-        var envs = '${globals.clusterEnvs}'.split(','), list = [];
+        var envs = '${globals.clusterEnvs}'.split(','), api = [], cmd = '${this.command}';
         for (var i = 0, n = envs.length; i < n; i++) {
           var resp = jelastic.env.control.GetEnvInfo(envs[i], session);
           if (resp.result != 0) return resp;
           for (var l = 0, k = resp.nodes; l < k.length; l++)
-            if (k[l].nodeGroup == 'storage' && k[l].ismaster)
-              list.push({ env: envs[i], id: k[l].id });
+            if (k[l].nodeGroup == 'storage' && k[l].ismaster) {
+              api.push({
+                method: "env.control.ExecCmdById",
+                envName: envs[i],
+                nodeId: k[l].id,
+                commandList: [{ command: cmd }]
+              });
+              break;
+            }
         }
-        return { result: 0, onAfterReturn: { setGlobals: { masterList: list } } };
-    - forEach(m:globals.masterList):
-        - api: env.control.ExecCmdById
-          envName: ${@m.env}
-          nodeId: ${@m.id}
-          commandList:
-            - command: ${this.command}
+        return { result: 0, onAfterReturn: { api: api, async: true } };
 
   clusterStatus:
-    - getClusterEnvs
-    - runOnEachMaster:
-        command: echo ===== PEERS =====; gluster peer status; echo ===== INFO =====; gluster volume info ${globals.volumeName}; echo ===== STATUS =====; gluster volume status ${globals.volumeName}
+    - fanOutToMasters:
+        command: |-
+          echo ===== PEERS =====; gluster peer status;
+          echo ===== INFO  =====; gluster volume info ${globals.volumeName};
+          echo ===== STATUS ====; gluster volume status ${globals.volumeName};
+          echo ===== AUTH.ALLOW ====; gluster volume info ${globals.volumeName} | grep auth.allow;
 
-  # Geo-replication only exists in async mode and only on the primary env - always
-  # target it so the button is meaningful from any region.
+  # Geo-replication only exists in async mode and only on the primary env, so
+  # always target it (works from any region; reports "no sessions" in sync mode).
   geoRepStatus:
     - script: |
         var resp = jelastic.env.control.GetEnvInfo('${globals.master_env_name}', session);
@@ -100,15 +114,14 @@ actions:
       envName: ${globals.master_env_name}
       nodeId: ${globals.masterNodeId}
       commandList:
-        - command: gluster volume geo-replication ${globals.volumeName} status || echo "No geo-replication sessions (synchronous mode, or none configured)."
+        - command: |-
+            gluster volume geo-replication ${globals.volumeName} status detail 2>&1 || echo "No geo-replication sessions (synchronous mode, or none configured).";
       user: root
 
   healVolumes:
-    - getClusterEnvs
-    - runOnEachMaster:
+    - fanOutToMasters:
         command: gluster volume heal ${globals.volumeName} full
 
   rebalanceVolumes:
-    - getClusterEnvs
-    - runOnEachMaster:
+    - fanOutToMasters:
         command: gluster volume rebalance ${globals.volumeName} start
