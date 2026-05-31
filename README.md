@@ -21,7 +21,9 @@ layers — modelled on `jelastic-jps/galera-multiregion` but for storage.
 - One environment per region (`envName-1 … envName-N`), all in one env-group.
 - **Region 1 is the geo-replication master**; it pushes the volume to every other
   region (one-directional **star** topology, asynchronous).
-- Cross-region transport is **public IP + firewall** (see *Networking* below).
+- Cross-region transport is selectable: **internal** (platform GRE routing, no
+  public IPs — default) or **public** (WAN, one public IP per node). See
+  *Networking* below.
 
 ## Volume model (the two options + slicing)
 
@@ -58,6 +60,7 @@ addons/
   management.jps                 # operational buttons (status/heal/rebalance), auto-installed on primary
   addRegion.jps                  # day-2: add a new region
   forgetRegion.jps               # day-2: remove a region (heal by forgetting)
+  switchNetworkMode.jps          # day-2: switch internal (GRE) <-> public (WAN)
 success/success.md               # post-install summary
 ```
 
@@ -93,21 +96,36 @@ gluster volume remove-brick <vol> <brick1> <brick2> <brick3> commit
 gluster peer detach <host>                                            # for each removed node
 ```
 
-## Networking & firewall (verify on first deploy)
+## Networking (internal GRE vs public WAN)
 
-Cross-region geo-replication uses each storage node's **public IPv4**
-(`extip: true`). The package opens, via `iptables`, ports **22**,
-**24007–24008**, and **49152–49251** from the other regions' storage IPs.
+Chosen at deploy via **Cross-region networking**, and switchable later with the
+`switchNetworkMode` add-on:
 
-Two platform-specific things to confirm on your installation:
-1. **Platform firewall.** Jelastic's own firewall layer may also need matching
-   inbound rules for those ports (Environment → Firewall, or the firewall API).
-   The in-container `iptables` rules alone may be insufficient or non-persistent.
-2. **Root vs `jelastic` SSH.** Geo-replication connects as the `jelastic` user via
-   the GlusterFS mountbroker; the recipe follows the upstream
-   `jelastic-jps/wordpress-multiregions` pattern. If sessions fail to start,
-   check `gluster volume geo-replication <vol> status` and the mountbroker setup
-   on the slave (`/var/mountbroker-root`, `geogroup`, user `jelastic`).
+- **Internal (default)** — regions talk over Jelastic's built-in **GRE routing**
+  between regions. **No public IPs**, nothing to expose. Geo-replication targets
+  each region's *internal* storage IP. Simplest and cheapest; note inter-region
+  GRE paths are shared and can saturate under heavy replication.
+- **Public** — the package attaches a **public IPv4 to every storage node**
+  (`binder.SetExtIpCount … ipv4 1`) and geo-replication targets those public IPs
+  over the WAN. Use when you want dedicated cross-region bandwidth / to avoid GRE.
+
+### Firewall (handled in the JPS)
+
+At cluster creation, `cluster-logic.jps` sets firewall rules on the `storage`
+group via the platform API (`environment.security.AddRule`):
+- **Outbound:** ALLOW all (so nodes can always reach peers).
+- **Inbound:** ALLOW TCP **22, 24007–24008, 49152–49251** (GlusterFS + SSH).
+
+These are real platform firewall rules (persistent, not in-container iptables),
+and are a no-op when the env firewall feature is disabled (nothing is filtered
+then). The same rules serve both networking modes. *Hardening note:* inbound
+`src` is `ALL`; in public mode you may want to restrict it to the peer regions'
+IPs — actual volume access is still gated by `auth.allow` and geo-rep by SSH keys.
+
+**Geo-rep account:** sessions connect as the `jelastic` user via the GlusterFS
+mountbroker (upstream `jelastic-jps/wordpress-multiregions` recipe). If a session
+fails to start, check `gluster volume geo-replication <vol> status` and the
+mountbroker on the slave (`/var/mountbroker-root`, `geogroup`, user `jelastic`).
 
 ## Hosting / `baseUrl`
 
@@ -135,6 +153,9 @@ deployment parameters are persisted.
   deletes the geo-replication session to a region that is down or being
   decommissioned (optionally deletes its environment). Combine forget + add to
   move a cluster off a bad region onto a new one.
+- **Switch network mode** (`addons/switchNetworkMode.jps`): flip the whole
+  deployment between internal (GRE) and public (WAN) — adds/removes public IPs and
+  re-establishes geo-replication in the new mode.
 
 ## Scaling
 

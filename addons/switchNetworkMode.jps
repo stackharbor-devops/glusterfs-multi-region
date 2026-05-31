@@ -1,0 +1,110 @@
+type: update
+version: 1.0
+id: glusterfs-switch-network-mode
+name: Switch GlusterFS Network Mode
+baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
+description:
+  short: Switch cross-region networking between internal (GRE) and public (WAN).
+
+# ---------------------------------------------------------------------------
+# Day-2 reconfiguration. RUN AGAINST THE PRIMARY ENVIRONMENT (envName-1).
+# Switches the whole deployment between:
+#   internal - platform GRE routing, no public IPs (removes them)
+#   public   - public WAN, adds a public IPv4 to every storage node
+# It deletes the existing geo-replication sessions (their target IPs change),
+# adds/removes public IPs per region, then re-establishes geo-replication in the
+# new mode. Disruptive to replication while it runs; advanced / needs testing.
+# ---------------------------------------------------------------------------
+
+onBeforeInit: |
+  return { result: 0, settings: { fields: [
+    { type: "list", name: "targetMode", caption: "Target networking mode", required: true, "default": "internal",
+      values: [
+        { value: "internal", caption: "Internal - platform GRE routing (remove public IPs)" },
+        { value: "public",   caption: "Public WAN (add a public IP to every storage node)" }
+      ] }
+  ] } };
+
+onInstall:
+  - importGlobalsFromNodeGroup: storage
+  - getClusterEnvs
+  - computeOldSlaveIPs
+  - deleteOldSessions
+  - setExtIpCounts
+  - reRunManager
+
+actions:
+  importGlobalsFromNodeGroup:
+    - script: |
+        var resp = api.env.control.GetNodeGroups("${env.name}", session);
+        if (resp.result != 0) return resp;
+        var groups = resp.object, globals;
+        for (var i = 0, n = groups.length; i < n; i++)
+          if (groups[i].name == "${this}" && groups[i].globals) {
+            globals = new org.yaml.snakeyaml.Yaml().load(groups[i].globals);
+            break;
+          }
+        if (!globals) return { result: 1, error: "No persisted GlusterFS globals found. Run this add-on against the primary environment." };
+        return { result: 0, onAfterReturn: { setGlobals: globals } };
+
+  getClusterEnvs:
+    - script: ${baseUrl}/scripts/getClusterEnvs.js
+      envName: ${env.envName}
+    - setGlobals:
+        clusterEnvs: ${response.items.join(,)}
+
+  # Resolve each secondary's CURRENT (old-mode) slave IP, so we can tear down the
+  # existing geo-replication sessions before the IPs change.
+  computeOldSlaveIPs:
+    - script: |
+        function extIp(node){ if(node.extIPs&&node.extIPs.length){var e=node.extIPs[0];return (e&&e.address)?e.address:e;} if(node.extIP)return node.extIP; if(node.externalIp)return node.externalIp; return node.address; }
+        var envs = '${globals.clusterEnvs}'.split(','), ips = [];
+        for (var i = 0, n = envs.length; i < n; i++) {
+          if (envs[i] == "${globals.master_env_name}") continue;
+          var resp = jelastic.env.control.GetEnvInfo(envs[i], session);
+          if (resp.result != 0) return resp;
+          for (var l = 0, k = resp.nodes; l < k.length; l++)
+            if (k[l].nodeGroup == 'storage' && k[l].ismaster)
+              ips.push(('${globals.networkMode}' == 'public') ? extIp(k[l]) : k[l].address);
+        }
+        return { result: 0, onAfterReturn: { setGlobals: { oldSlaveIPs: ips } } };
+
+  deleteOldSessions:
+    - forEach (ip:globals.oldSlaveIPs):
+      - api: env.control.ExecCmdById
+        envName: ${globals.master_env_name}
+        nodeId: ${nodes.storage.master.id}
+        commandList:
+          - command: |-
+              gluster volume geo-replication ${globals.volumeName} jelastic@${@ip}::${globals.volumeName} stop force || true;
+              gluster volume geo-replication ${globals.volumeName} jelastic@${@ip}::${globals.volumeName} delete force || true;
+
+  # Add (count 1) or remove (count 0) the public IP on every region's storage group.
+  setExtIpCounts:
+    - script: |
+        var envs = '${globals.clusterEnvs}'.split(','), count = ('${settings.targetMode}' == 'public') ? 1 : 0;
+        for (var i = 0, n = envs.length; i < n; i++) {
+          var r = jelastic.env.binder.SetExtIpCount(envs[i], session, "ipv4", count, "storage");
+          if (!r || r.result !== 0) return r;
+        }
+        return { result: 0 };
+
+  # Re-establish geo-replication in the new mode (recreates trust + sessions with
+  # the new IPs and persists the new networkMode).
+  reRunManager:
+    - script: |
+        var actions = [{
+          jps: "${baseUrl}/scripts/geoReplicationManager.jps?_r=${fn.random}",
+          envName: "${globals.master_env_name}",
+          settings: {
+            master_env_name: "${globals.master_env_name}",
+            volumeName: "${globals.volumeName}",
+            networkMode: "${settings.targetMode}",
+            envNamePrefix: "${globals.envNamePrefix}",
+            replicaCount: "${globals.replicaCount}",
+            nodesPerRegion: "${globals.nodesPerRegion}",
+            mountPoint: "${globals.replicatedPath}",
+            install_gluster_cluster: "true"
+          }
+        }];
+        return { result: 0, onAfterReturn: { 'marketplace.jps.install': actions } };

@@ -32,7 +32,8 @@ globals:
   replicaCount: ${settings.replicaCount:3}
 
 onInstall:
-  initiateGlusterFSCluster
+  - setupFirewall
+  - initiateGlusterFSCluster
 
 onAfterStart:
   - cmd[storage]: mount -a; exportfs -ra;
@@ -102,6 +103,28 @@ onBeforeStop:
   - umountFuze: ${nodes.storage.join(id,)}
 
 actions:
+  # Open outbound (so nodes can reach peers) and the GlusterFS + SSH ports inbound,
+  # on the storage node group, via the platform firewall API. No-op when the env
+  # firewall feature is disabled (nothing is filtered in that case). Works for both
+  # internal (GRE) and public (WAN) networking - src ALL covers either source.
+  setupFirewall:
+    - script: |
+        var envName = "${env.name}";
+        var inputRule  = { direction: "INPUT",  name: "glusterfs-in",  protocol: "TCP", ports: "22,24007-24008,49152-49251", src: "ALL", priority: 1080, action: "ALLOW" };
+        var outputRule = { direction: "OUTPUT", name: "glusterfs-out", protocol: "ALL", ports: "1-65535", dst: "ALL", priority: 1000, action: "ALLOW" };
+        if (jelastic.environment.security) {
+          var q = jelastic.billing.account.GetOwnerQuotas(appid, session, "firewall.enabled");
+          if (!q || q.result !== 0) return q;
+          var enabled = (q.array && q.array[0]) ? q.array[0].value : 0;
+          if (enabled) {
+            var r = jelastic.environment.security.AddRule(envName, session, inputRule, "storage");
+            if (!r || r.result !== 0) return r;
+            r = jelastic.environment.security.AddRule(envName, session, outputRule, "storage");
+            if (!r || r.result !== 0) return r;
+          }
+        }
+        return { result: 0 };
+
   initiateGlusterFSCluster:
     - umountFuze: ${nodes.storage.join(id,)}
     - environment.file.read:

@@ -19,6 +19,7 @@ globals:
   replicatedVolume: ${settings.volumeName:data}
   replicatedPath: ${settings.mountPoint:/data}
   replicaCount: ${settings.replicaCount:3}
+  networkMode: ${settings.networkMode:internal}
 
 nodes:
   - nodeType: storage
@@ -27,13 +28,21 @@ nodes:
     cluster: true
     fixedCloudlets: 1
     flexibleCloudlets: 8
-    extip: true            # public IPv4 per node -> enables cross-region geo-replication
     displayName: GlusterFS Storage
 
 onInstall:
+  # In public mode, give each storage node a public IPv4 for cross-region geo-rep.
+  # In internal mode, nodes use platform GRE routing and need no public IP.
+  - if ('${globals.networkMode}' == 'public'):
+      - attachPublicIP
   - installClusterLogic
 
 actions:
+  attachPublicIP:
+    - script: |
+        var r = jelastic.env.binder.SetExtIpCount("${env.name}", session, "ipv4", 1, "storage");
+        return (r && r.result === 0) ? { result: 0 } : r;
+
   # Install the permanent in-region cluster logic (volume create / mount / scale).
   installClusterLogic:
     install:

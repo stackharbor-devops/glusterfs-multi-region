@@ -22,7 +22,7 @@ globals:
   add_new_cluster: ${settings.add_new_cluster:false}
   master_env_name: ${settings.master_env_name}
   volumeName: ${settings.volumeName:data}
-  networkMode: ${settings.networkMode:public}
+  networkMode: ${settings.networkMode:internal}
   envNamePrefix: ${settings.envNamePrefix:}
   replicaCount: ${settings.replicaCount:3}
   nodesPerRegion: ${settings.nodesPerRegion:3}
@@ -32,16 +32,13 @@ onInstall:
   - getClusterEnvs
   - getGlusterMasterAddress
   - getGlusterSlaveAddress
-  - gatherPeerIPs
   - if ('${globals.install_gluster_cluster}' == 'true'):
       - generateSSHkey
       - setupGeoGlusterFS
-      - configureFirewallAllEnvs
       - addSlaveGlusterFS
   - if ('${globals.add_new_cluster}' == 'true'):
       - generateSSHkey
       - setupGeoGlusterFS
-      - configureFirewallAllEnvs
       - addSlaveGlusterFS
   # Persist the deployment parameters on the primary env so day-2 add-ons
   # (e.g. addRegion) can recover them later.
@@ -87,23 +84,6 @@ actions:
         }
         glbs["glusterfs_slaves_address"] = glusterfs_slaves_address;
         return { result: 0, onAfterReturn: onAfterReturn };
-
-  # All storage-node public IPs across all regions (used for firewall allow-list).
-  gatherPeerIPs:
-    - script: |
-        function extIp(node){ if(node.extIPs&&node.extIPs.length){var e=node.extIPs[0];return (e&&e.address)?e.address:e;} if(node.extIP)return node.extIP; if(node.externalIp)return node.externalIp; return node.address; }
-        var envs = '${globals.clusterEnvs}'.split(','), ips = [];
-        for (var i = 0, n = envs.length; i < n; i++) {
-          var resp = jelastic.env.control.GetEnvInfo(envs[i], session);
-          if (resp.result != 0) return resp;
-          for (var l = 0, k = resp.nodes; l < k.length; l++) {
-            if (k[l].nodeGroup == 'storage') {
-              var ip = ('${globals.networkMode}' == 'public') ? extIp(k[l]) : k[l].address;
-              if (ip) ips.push(ip);
-            }
-          }
-        }
-        return { result: 0, onAfterReturn: { setGlobals: { peerIPs: ips.join(',') } } };
 
   generateSSHkey:
     - api: env.control.ExecCmdById
@@ -158,22 +138,6 @@ actions:
               addCommonPubKey: true,
               commonPubKey: commonPubKey,
               volumeName: "${globals.volumeName}"
-            }
-          });
-        }
-        return { result: 0, onAfterReturn: { install: actions } };
-
-  # Open GlusterFS + SSH ports between regions (public-IP mode).
-  configureFirewallAllEnvs:
-    - script: |
-        var envs = '${globals.clusterEnvs}'.split(','), actions = [];
-        for (var i = 0, n = envs.length; i < n; i++) {
-          actions.push({
-            jps: "${baseUrl}/scripts/geoReplication.jps?_r=${fn.random}",
-            envName: envs[i],
-            settings: {
-              configure_firewall: true,
-              peerIPs: "${globals.peerIPs}"
             }
           });
         }

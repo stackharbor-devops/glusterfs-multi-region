@@ -20,7 +20,6 @@ globals:
   initial_glusterfs_master: ${settings.initial_glusterfs_master:false}
   initial_glusterfs_slave: ${settings.initial_glusterfs_slave:false}
   addCommonPubKey: ${settings.addCommonPubKey:false}
-  configure_firewall: ${settings.configure_firewall:false}
   volumeName: ${settings.volumeName:data}
 
 onInstall:
@@ -29,7 +28,6 @@ onInstall:
   - if ('${globals.initial_glusterfs_slave}' == 'true'): setupMountbroker
   - if ('${globals.initial_glusterfs_master}' == 'true'): createGeoSecret
   - if ('${globals.addCommonPubKey}' == 'true'): addCommonPubKey
-  - if ('${globals.configure_firewall}' == 'true'): configureFirewall
 
 actions:
   # Create the geo-replication group and add the geo-rep user to it (all nodes).
@@ -67,23 +65,4 @@ actions:
         mkdir -p /root/.ssh; chmod 700 /root/.ssh;
         echo '${settings.commonPubKey}' >> /root/.ssh/authorized_keys;
         chmod 600 /root/.ssh/authorized_keys;
-      user: root
-
-  # Public-IP mode: open the GlusterFS + SSH ports to the peer regions' IPs.
-  # settings.peerIPs is a comma-separated list of external IPs of all storage
-  # nodes across every region. Opening to the full set (incl. self) is harmless.
-  #
-  # NOTE: raw iptables runs inside the container and may not survive a redeploy,
-  # and Jelastic's platform firewall may also need matching inbound rules. See
-  # README "Networking & firewall" before relying on this in production.
-  configureFirewall:
-    - cmd[storage]: |-
-        IFS=',' read -ra PEERS <<< "${settings.peerIPs}";
-        for ip in "${PEERS[@]}"; do
-          [ -z "$ip" ] && continue;
-          iptables -C INPUT -s "$ip" -p tcp --dport 24007:24008 -j ACCEPT 2>/dev/null || iptables -I INPUT -s "$ip" -p tcp --dport 24007:24008 -j ACCEPT;
-          iptables -C INPUT -s "$ip" -p tcp --dport 49152:49251 -j ACCEPT 2>/dev/null || iptables -I INPUT -s "$ip" -p tcp --dport 49152:49251 -j ACCEPT;
-          iptables -C INPUT -s "$ip" -p tcp --dport 22 -j ACCEPT 2>/dev/null || iptables -I INPUT -s "$ip" -p tcp --dport 22 -j ACCEPT;
-        done;
-        mkdir -p /etc/iptables; iptables-save > /etc/iptables/rules.v4 2>/dev/null || true;
       user: root

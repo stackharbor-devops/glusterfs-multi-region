@@ -46,6 +46,11 @@ onBeforeInit: |
       required: true, min: 2, max: 5, disableInactive: true, selectFirstAvailable: false },
     { type: "string", name: "volumeName", caption: "Volume name", "default": "data", required: true },
     { type: "string", name: "mountPoint", caption: "Mount point", "default": "/data", required: true },
+    { type: "list", name: "networkMode", caption: "Cross-region networking", "default": "internal",
+      values: [
+        { value: "internal", caption: "Internal - platform GRE routing (no public IPs)" },
+        { value: "public",   caption: "Public WAN - adds a public IP to every storage node" }
+      ] },
     { type: "list", name: "topology", caption: "Per-region topology", "default": "cluster",
       values: [
         { value: "single",  caption: "Single node per region (geo-replication only)" },
@@ -132,7 +137,8 @@ actions:
               "nodes": "${globals.nodesPerRegion}",
               "replicaCount": "${globals.replicaCount}",
               "volumeName": "${settings.volumeName}",
-              "mountPoint": "${settings.mountPoint}"
+              "mountPoint": "${settings.mountPoint}",
+              "networkMode": "${settings.networkMode}"
             }
           });
         }
@@ -154,7 +160,7 @@ actions:
           settings: {
             "master_env_name": "${settings.envName}-1",
             "volumeName": "${settings.volumeName}",
-            "networkMode": "public",
+            "networkMode": "${settings.networkMode}",
             "envNamePrefix": "${settings.envName}",
             "replicaCount": "${globals.replicaCount}",
             "nodesPerRegion": "${globals.nodesPerRegion}",

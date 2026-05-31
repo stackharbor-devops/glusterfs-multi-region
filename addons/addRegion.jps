@@ -69,7 +69,8 @@ actions:
             "nodes": "${globals.nodesPerRegion}",
             "replicaCount": "${globals.replicaCount}",
             "volumeName": "${globals.volumeName}",
-            "mountPoint": "${globals.replicatedPath}"
+            "mountPoint": "${globals.replicatedPath}",
+            "networkMode": "${globals.networkMode}"
           }
         }];
         return { result: 0, onAfterReturn: { 'marketplace.jps.install': actions } };
@@ -83,7 +84,7 @@ actions:
           settings: {
             "master_env_name": "${globals.master_env_name}",
             "volumeName": "${globals.volumeName}",
-            "networkMode": "public",
+            "networkMode": "${globals.networkMode}",
             "envNamePrefix": "${globals.envNamePrefix}",
             "replicaCount": "${globals.replicaCount}",
             "nodesPerRegion": "${globals.nodesPerRegion}",
