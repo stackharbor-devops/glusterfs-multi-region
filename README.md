@@ -77,9 +77,11 @@ scripts/
   geoReplication.jps             # async model: per-env geo-rep worker
   syncClusterManager.jps         # sync model: forms one stretched volume across all regions
 addons/
-  management.jps                 # operational buttons (status/heal/rebalance), auto-installed on primary
-  addRegion.jps                  # day-2: add a new region
-  forgetRegion.jps               # day-2: remove a region (heal by forgetting)
+  management.jps                 # operational buttons (status/heal/rebalance), installed on every region
+  addRegion.jps                  # day-2: add a new region (mode-aware: async or sync)
+  forgetRegion.jps               # day-2: remove a region (mode-aware)
+  addCapacitySlice.jps           # day-2 (sync only): add a replica set (capacity +1 slice)
+  promoteRegion.jps              # day-2 (async only): failover - promote a secondary to primary
   switchNetworkMode.jps          # day-2: switch internal (GRE) <-> public (WAN)
 success/success.md               # post-install summary
 ```
@@ -138,9 +140,26 @@ group via the platform API (`environment.security.AddRule`):
 
 These are real platform firewall rules (persistent, not in-container iptables),
 and are a no-op when the env firewall feature is disabled (nothing is filtered
-then). The same rules serve both networking modes. *Hardening note:* inbound
-`src` is `ALL`; in public mode you may want to restrict it to the peer regions'
-IPs — actual volume access is still gated by `auth.allow` and geo-rep by SSH keys.
+then). The same rules serve both networking modes.
+
+### Volume access (auth.allow hardening)
+
+At install time the volume is created with `auth.allow '*'` so the geo-rep
+gverify mount and peer probes succeed. **After install/topology change, the
+managers automatically tighten `auth.allow` to the cluster's storage-node IPs
+plus 127.0.0.1** (`hardenAuth` action). Day-2 ops (addRegion, forgetRegion,
+addCapacitySlice, promoteRegion) re-run hardenAuth at the end. Inspect on a
+storage node with:
+
+```
+gluster volume info data | grep auth.allow
+```
+
+Note: firewall `src` is still `ALL` (port-level). `auth.allow` is the gluster-
+level access gate; the open ports without auth simply mean an attacker can
+**connect** but the brick will reject the SETVOLUME handshake. In **public**
+networkMode you should also consider restricting the platform firewall `src` to
+the peer IPs as a follow-up.
 
 **Geo-rep account:** sessions connect as the `jelastic` user via the GlusterFS
 mountbroker (upstream `jelastic-jps/wordpress-multiregions` recipe). If a session
@@ -172,10 +191,20 @@ stretched* cluster (which changes the replica count) is a planned follow-up.
 - **Add a region** (`addons/addRegion.jps`): pick a new region; it creates the
   regional cluster and extends geo-replication to it (same cluster, new slice of
   geography).
-- **Forget a region** (`addons/forgetRegion.jps`): "heal by forgetting" — stops and
-  deletes the geo-replication session to a region that is down or being
-  decommissioned (optionally deletes its environment). Combine forget + add to
-  move a cluster off a bad region onto a new one.
+- **Forget a region** (`addons/forgetRegion.jps`): mode-aware. **Async:** stop+delete
+  the geo-replication session to the target region. **Sync:** remove the target's
+  bricks (replica count −1), peer-detach. Optionally also deletes the environment.
+- **Add capacity slice — sync only** (`addons/addCapacitySlice.jps`): grow usable
+  capacity in the synchronous stretched cluster by 1 replica set. First scale
+  each region's storage layer up by the same count via the topology UI, then
+  run this addon against the primary — it auto-detects new nodes, peer-probes,
+  `add-brick` (replica unchanged), then `rebalance start` + `heal full`.
+- **Promote region — async failover** (`addons/promoteRegion.jps`): promote a
+  surviving secondary to become the new primary if the original primary is
+  lost. Run **against the new primary env**. Best-effort tears down the old
+  primary's sessions, then bootstraps fresh SSH + gsec on the new primary and
+  re-establishes geo-rep sessions to all other secondaries. Use `forgetRegion`
+  afterward to clean up the old primary's env.
 - **Switch network mode** (`addons/switchNetworkMode.jps`): flip the whole
   deployment between internal (GRE) and public (WAN) — adds/removes public IPs and
   re-establishes geo-replication in the new mode.
@@ -196,13 +225,17 @@ stretched* cluster (which changes the replica count) is a planned follow-up.
 
 ## Status / known gaps
 
-- **Async model:** geo-replication is one-directional (primary → secondaries);
-  **master promotion / failover is not automated** — if the primary region is
-  lost, recover manually with *Forget a region* + *Add a region*.
-- **Sync model:** day-2 region add/remove (changes the replica count) and online
-  capacity scaling (add one node per region as a new replica set) are planned
-  follow-ups; v1 sets the stretched topology at deploy time. Remember writes are
-  synchronous — size regions/latency accordingly.
-- **Guided scale-in add-on** (async) is pending (see *Scaling*).
+- **Async master promotion (`promoteRegion`)** is best-effort: it brings up
+  geo-rep from a chosen surviving secondary to the rest. It does NOT reconcile
+  data drift between the dead primary's last state and the surviving secondaries
+  — that's a manual decision.
+- **Sync day-2 ops** (`addRegion`/`forgetRegion` in sync mode, `addCapacitySlice`)
+  change live volume topology. For `addCapacitySlice` you must scale each
+  region by the same number of nodes via the topology UI before running the
+  addon, or it aborts (refuses to add a partial replica set).
+- **Firewall src is still `ALL`** at the port level; `auth.allow` is the real
+  protection layer (now restricted to peer IPs after `hardenAuth`). For public
+  networkMode in production, tighten the platform firewall to peer IPs as a
+  follow-up.
 - Cannot be validated off-platform; the items under *Networking* and the geo-rep
   mountbroker are the most likely to need tuning on a real Virtuozzo platform.

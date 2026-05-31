@@ -41,6 +41,8 @@ onInstall:
       - generateSSHkey
       - setupGeoGlusterFS
       - addSlaveGlusterFS
+  # After geo-rep is up, tighten auth.allow from '*' to the peer node IPs.
+  - hardenAuth
   # Persist the deployment parameters on the primary env so day-2 add-ons
   # (e.g. addRegion) can recover them later.
   - persistGlobals
@@ -165,6 +167,40 @@ actions:
                 echo "--- gverify-mastermnt.log ---";    tail -n 30 /var/log/glusterfs/geo-replication/gverify-mastermnt.log 2>/dev/null;
               fi;
               gluster volume geo-replication ${globals.volumeName} jelastic@${@slave}::${globals.volumeName} start 2>&1 || true;
+
+  # Tighten each region's volume `auth.allow` from '*' to the peer storage-node
+  # IPs (+ 127.0.0.1). Runs on every region's master since each region has its
+  # own local volume in async mode. Master->slave geo-rep traffic still works
+  # because the master's IP is in the allowed list.
+  hardenAuth:
+    - script: |
+        function extIp(node){ if(node.extIPs&&node.extIPs.length){var e=node.extIPs[0];return (e&&e.address)?e.address:e;} if(node.extIP)return node.extIP; if(node.externalIp)return node.externalIp; return node.address; }
+        var envs = '${globals.clusterEnvs}'.split(','), pub = ('${globals.networkMode}' == 'public');
+        var ips = ['127.0.0.1'], execs = [];
+        for (var i = 0; i < envs.length; i++) {
+          var r = jelastic.env.control.GetEnvInfo(envs[i], session);
+          if (r.result != 0) continue;
+          var masterId = null;
+          for (var l = 0; l < r.nodes.length; l++) {
+            if (r.nodes[l].nodeGroup == 'storage') {
+              var iIp = r.nodes[l].address, eIp = extIp(r.nodes[l]);
+              if (iIp && ips.indexOf(iIp) < 0) ips.push(iIp);
+              if (pub && eIp && ips.indexOf(eIp) < 0) ips.push(eIp);
+              if (r.nodes[l].ismaster) masterId = r.nodes[l].id;
+            }
+          }
+          if (masterId) execs.push({ env: envs[i], id: masterId });
+        }
+        return { result: 0, onAfterReturn: { setGlobals: { allowedIPs: ips.join(','), hardenList: execs } } };
+    - forEach (e:globals.hardenList):
+      - api: env.control.ExecCmdById
+        envName: ${@e.env}
+        nodeId: ${@e.id}
+        commandList:
+          - command: |-
+              gluster volume set ${globals.volumeName} auth.allow '${globals.allowedIPs}' 2>&1 || true;
+              echo "auth.allow on ${globals.volumeName} now: $(gluster volume info ${globals.volumeName} | grep auth.allow)";
+        user: root
 
   # Save deployment parameters as node-group globals on the primary env, so the
   # addRegion add-on can recover volumeName / replicaCount / nodesPerRegion /

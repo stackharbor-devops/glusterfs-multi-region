@@ -1,17 +1,19 @@
 type: update
-version: 1.0
+version: 1.1
 id: glusterfs-forget-region
 name: Forget GlusterFS Region
 baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
 description:
-  short: Remove a region from the cluster (stop/delete its geo-replication session).
+  short: Remove a region from the cluster.
 
 # ---------------------------------------------------------------------------
 # Day-2 reconfiguration. RUN AGAINST THE PRIMARY ENVIRONMENT (envName-1).
-# Use it to "heal by forgetting" a region that is down or being decommissioned:
-# it stops and deletes the geo-replication session from the primary to that
-# region's volume, so the primary stops trying to replicate to it. Optionally
-# deletes the region's environment too.
+#
+# Mode-aware:
+#   async (geo-rep): stop+delete the geo-replication session to the target
+#                    region, optionally delete the env.
+#   sync (stretched): remove the target region's bricks (replica count -1),
+#                     peer-detach its nodes, optionally delete the env.
 #
 # After forgetting, you can add a fresh region with addRegion.jps and keep the
 # same cluster.
@@ -34,8 +36,11 @@ onBeforeInit: |
 
 onInstall:
   - importGlobalsFromNodeGroup: storage
-  - resolveTargetIP
-  - stopAndDeleteGeoRep
+  - if ('${globals.replicationModel}' == 'sync'):
+      - finalizeForSync
+  - if ('${globals.replicationModel}' != 'sync'):
+      - resolveTargetIP
+      - stopAndDeleteGeoRep
   - if ('${settings.deleteEnv}' == 'true'):
       - deleteTargetEnv
 
@@ -53,6 +58,8 @@ actions:
         if (!globals) return { result: 1, error: "No persisted GlusterFS globals found. Run this add-on against the primary environment." };
         return { result: 0, onAfterReturn: { setGlobals: globals } };
 
+  # ---- async path ---------------------------------------------------------
+
   # Resolve the target region's storage-master IP (the geo-rep slave address).
   resolveTargetIP:
     - script: |
@@ -67,7 +74,7 @@ actions:
         return { result: 0, onAfterReturn: { setGlobals: { targetSlaveIP: ip } } };
 
   # Stop + delete the geo-replication session on the primary master. If the IP
-  # could not be resolved (env already gone), list and delete any matching session.
+  # could not be resolved (env already gone), list any remaining session.
   stopAndDeleteGeoRep:
     - cmd[${nodes.storage.master.id}]: |-
         VOL="${globals.volumeName}"; IP="${globals.targetSlaveIP}";
@@ -79,6 +86,30 @@ actions:
           gluster volume geo-replication ${VOL} status || true;
         fi;
       user: root
+
+  # ---- sync path ----------------------------------------------------------
+
+  # Sync: run syncClusterManager with action=removeRegion against the primary.
+  finalizeForSync:
+    - script: |
+        var actions = [{
+          jps: "${baseUrl}/scripts/syncClusterManager.jps?_r=${fn.random}",
+          envName: "${globals.master_env_name}",
+          settings: {
+            "master_env_name": "${globals.master_env_name}",
+            "volumeName": "${globals.volumeName}",
+            "mountPoint": "${globals.replicatedPath}",
+            "networkMode": "${globals.networkMode}",
+            "envNamePrefix": "${globals.envNamePrefix}",
+            "nodesPerRegion": "${globals.nodesPerRegion}",
+            "regionsCount": "${globals.regionsCount}",
+            "action": "removeRegion",
+            "removeEnvName": "${settings.targetEnv}"
+          }
+        }];
+        return { result: 0, onAfterReturn: { 'marketplace.jps.install': actions } };
+
+  # ---- shared: optional env delete ----------------------------------------
 
   deleteTargetEnv:
     - api: env.control.DeleteEnv

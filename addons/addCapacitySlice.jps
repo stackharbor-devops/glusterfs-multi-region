@@ -1,0 +1,80 @@
+type: update
+version: 1.0
+id: glusterfs-add-capacity-slice
+name: Add GlusterFS Capacity Slice (sync)
+baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
+description:
+  short: Grow capacity in the synchronous stretched cluster (replica unchanged, sets +1).
+
+# ---------------------------------------------------------------------------
+# Day-2 addon for the SYNCHRONOUS stretched cluster only. Adds a new replica
+# set to the volume — capacity grows by ~1 brick's worth of usable space while
+# every file is still stored in every region.
+#
+# Procedure:
+#   1) Scale each regional env up by `slicesToAdd` storage nodes via the
+#      Jelastic UI (Topology / +). This addon does NOT scale envs itself; it
+#      only stitches the new nodes into the cluster.
+#   2) Run this addon AGAINST THE PRIMARY ENV. It detects the new nodes
+#      (those not yet part of the volume), peer-probes them, runs
+#      `gluster volume add-brick` with the new bricks (replica unchanged), then
+#      starts rebalance + heal full, and re-hardens auth.allow.
+#
+# Requirements:
+#   - replicationModel must be 'sync'.
+#   - The number of new nodes must be a multiple of replica count = #regions
+#     (i.e., scale every region by the same count, so each new replica set is
+#     complete). Otherwise the addon aborts without changing the volume.
+# ---------------------------------------------------------------------------
+
+onInstall:
+  - importGlobalsFromNodeGroup: storage
+  - assertSyncMode
+  - getClusterEnvs
+  - finalize
+
+actions:
+  importGlobalsFromNodeGroup:
+    - script: |
+        var resp = api.env.control.GetNodeGroups("${env.name}", session);
+        if (resp.result != 0) return resp;
+        var groups = resp.object, globals;
+        for (var i = 0, n = groups.length; i < n; i++)
+          if (groups[i].name == "${this}" && groups[i].globals) {
+            globals = new org.yaml.snakeyaml.Yaml().load(groups[i].globals);
+            break;
+          }
+        if (!globals) return { result: 1, error: "No persisted GlusterFS globals found. Run this add-on against the primary environment." };
+        return { result: 0, onAfterReturn: { setGlobals: globals } };
+
+  assertSyncMode:
+    - script: |
+        if ('${globals.replicationModel}' != 'sync')
+          return { result: 1, error: "This addon is for the synchronous stretched cluster only. The current deployment is in '${globals.replicationModel}' mode. To grow capacity in async mode, scale each region's `storage` layer in multiples of the replica count via the topology UI - the cluster-logic addon handles that automatically." };
+        return { result: 0 };
+
+  getClusterEnvs:
+    - script: ${baseUrl}/scripts/getClusterEnvs.js
+      envName: ${env.envName}
+    - setGlobals:
+        clusterEnvsCSV: ${response.items.join(,)}
+
+  # Delegate to syncClusterManager: action=addCapacitySlice does the brick math
+  # at command time, so we only need to invoke it.
+  finalize:
+    - script: |
+        var actions = [{
+          jps: "${baseUrl}/scripts/syncClusterManager.jps?_r=${fn.random}",
+          envName: "${globals.master_env_name}",
+          settings: {
+            "master_env_name": "${globals.master_env_name}",
+            "volumeName": "${globals.volumeName}",
+            "mountPoint": "${globals.replicatedPath}",
+            "networkMode": "${globals.networkMode}",
+            "envNamePrefix": "${globals.envNamePrefix}",
+            "nodesPerRegion": "${globals.nodesPerRegion}",
+            "regionsCount": "${globals.regionsCount}",
+            "action": "addCapacitySlice"
+          }
+        }];
+        return { result: 0, onAfterReturn: { 'marketplace.jps.install': actions } };

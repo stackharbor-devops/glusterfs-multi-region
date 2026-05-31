@@ -1,21 +1,25 @@
 type: update
-version: 1.0
+version: 1.1
 id: glusterfs-sync-cluster-manager
 name: GlusterFS Synchronous Stretched Cluster Manager
 baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
 description:
-  short: Forms ONE synchronous GlusterFS volume spanning all regions (write-anywhere).
+  short: Forms / maintains ONE synchronous GlusterFS volume spanning all regions.
 
 # ---------------------------------------------------------------------------
-# Runs once in the PRIMARY env. Joins every storage node across every region into
-# one trusted pool and creates a single volume with replica = number of regions
-# and bricks interleaved one-per-region per replica set. The result is a
-# multi-master "stretched" cluster: write to any node in any region and it
-# replicates synchronously to all regions. More bricks per region => more replica
-# sets => distributed-replicated (capacity scales while every file stays in every
-# region). Requires an ODD region count for quorum (validated in the orchestrator).
+# Sync stretched-cluster manager (joins every storage node across every region
+# into one trusted pool, one replicated volume).
 #
-# Tradeoff: writes are synchronous, so write latency reflects cross-region RTT.
+# Dispatched by settings.action (default: install):
+#   install            - initial setup (peer all, create stretched volume, mount)
+#   addRegion          - bring a newly-created region's master into the volume
+#                         (increases replica count from N to N+1, one brick per slice)
+#   removeRegion       - take a region out of the volume
+#                         (decreases replica count from N to N-1, removes its bricks)
+#   addCapacitySlice   - take already-scaled nodes (one new node per region) and
+#                         add them as a new replica set (capacity grows by ~1 brick)
+#   hardenAuth         - tighten the volume's auth.allow to the peer node IPs
+# Every successful day-2 action ends with hardenAuth + persistGlobals.
 # ---------------------------------------------------------------------------
 
 globals:
@@ -27,14 +31,41 @@ globals:
   nodesPerRegion: ${settings.nodesPerRegion:1}
   regionsCount: ${settings.regionsCount:3}
   replicationModel: sync
+  action: ${settings.action:install}
+  # day-2 inputs:
+  newEnvName: ${settings.newEnvName:}
+  removeEnvName: ${settings.removeEnvName:}
 
 onInstall:
   - getClusterEnvs
-  - gatherNodes
-  - peerProbeAll
-  - createStretchedVolume
-  - mountAllNodes
-  - persistGlobals
+  - if ('${globals.action}' == 'install'):
+      - gatherNodes
+      - peerProbeAll
+      - createStretchedVolume
+      - mountAllNodes
+      - hardenAuth
+      - persistGlobals
+  - if ('${globals.action}' == 'addRegion'):
+      - gatherNodes
+      - addRegionToVolume
+      - mountNewRegionNodes
+      - hardenAuth
+      - persistGlobals
+  - if ('${globals.action}' == 'removeRegion'):
+      - gatherNodes
+      - removeRegionFromVolume
+      - hardenAuth
+      - persistGlobals
+  - if ('${globals.action}' == 'addCapacitySlice'):
+      - gatherNodes
+      - addCapacitySliceToVolume
+      - mountAllNodes
+      - rebalanceAndHeal
+      - hardenAuth
+      - persistGlobals
+  - if ('${globals.action}' == 'hardenAuth'):
+      - gatherNodes
+      - hardenAuth
 
 actions:
   getClusterEnvs:
@@ -43,9 +74,8 @@ actions:
     - setGlobals:
         clusterEnvs: ${response.items.join(,)}
 
-  # Build the interleaved brick list (one brick per region per replica set), the
-  # full node list (for peering + mounting), and pick the primary master. The
-  # cross-region IP is the external IP (public mode) or internal/GRE IP (internal).
+  # Discover every storage node across all regional envs, build the interleaved
+  # brick list, and pick the primary master. perRegion[r][j] = jth node of region r.
   gatherNodes:
     - script: |
         function extIp(node){ if(node.extIPs&&node.extIPs.length){var e=node.extIPs[0];return (e&&e.address)?e.address:e;} if(node.extIP)return node.extIP; if(node.externalIp)return node.externalIp; return node.address; }
@@ -53,23 +83,26 @@ actions:
         var envs = '${globals.clusterEnvs}'.split(',');
         envs.sort(function(a, b){ return parseInt(a.split('-').pop(), 10) - parseInt(b.split('-').pop(), 10); });
 
-        var perRegion = [], maxK = 0, primaryMaster = null;
+        var perRegion = [], maxK = 0, primaryMaster = null, allIPs = [];
         for (var r = 0; r < envs.length; r++) {
           var resp = jelastic.env.control.GetEnvInfo(envs[r], session);
           if (resp.result != 0) return resp;
           var nodes = [];
           for (var l = 0, k = resp.nodes; l < k.length; l++)
-            if (k[l].nodeGroup == 'storage')
-              nodes.push({ env: envs[r], id: k[l].id, ip: (pub ? extIp(k[l]) : k[l].address), ismaster: !!k[l].ismaster });
+            if (k[l].nodeGroup == 'storage') {
+              var iIp = k[l].address, eIp = extIp(k[l]);
+              nodes.push({ env: envs[r], id: k[l].id, ip: (pub ? eIp : iIp), intIP: iIp, extIP: eIp, ismaster: !!k[l].ismaster });
+              if (iIp && allIPs.indexOf(iIp) < 0) allIPs.push(iIp);
+              if (pub && eIp && allIPs.indexOf(eIp) < 0) allIPs.push(eIp);
+            }
           nodes.sort(function(a, b){ return a.id - b.id; });
           perRegion.push(nodes);
           if (nodes.length > maxK) maxK = nodes.length;
           if (envs[r] == "${globals.master_env_name}")
             for (var m = 0; m < nodes.length; m++) if (nodes[m].ismaster) primaryMaster = nodes[m];
         }
-        if (!primaryMaster) primaryMaster = perRegion[0][0];
+        if (!primaryMaster && perRegion[0] && perRegion[0][0]) primaryMaster = perRegion[0][0];
 
-        // interleave bricks: replica set j = one brick from each region
         var bricks = [], allNodes = [];
         for (var j = 0; j < maxK; j++)
           for (var r2 = 0; r2 < perRegion.length; r2++)
@@ -78,13 +111,39 @@ actions:
           for (var j3 = 0; j3 < perRegion[r3].length; j3++)
             allNodes.push(perRegion[r3][j3]);
 
+        // For day-2 actions: keep full {env,id,ip} objects for forEach (so
+        // commands can target the right env+node), and pre-compute IP-only
+        // CSVs (string-safe to interpolate into script bodies).
+        var newRegionNodes = [], removeRegionNodes = [];
+        var newEnv = '${globals.newEnvName}', remEnv = '${globals.removeEnvName}';
+        for (var r4 = 0; r4 < perRegion.length; r4++) {
+          for (var j4 = 0; j4 < perRegion[r4].length; j4++) {
+            var n = perRegion[r4][j4];
+            if (newEnv && n.env == newEnv) newRegionNodes.push(n);
+            if (remEnv && n.env == remEnv) removeRegionNodes.push(n);
+          }
+        }
+        var allIPsCSV = allIPs.join(',');
+        var newIPs = newRegionNodes.map(function(n){ return n.ip; }).join(',');
+        var remIPs = removeRegionNodes.map(function(n){ return n.ip; }).join(',');
+
         return { result: 0, onAfterReturn: { setGlobals: {
           replicaCount: envs.length,
           bricksOrdered: bricks.join(' '),
-          allNodes: allNodes,
-          primaryMasterEnv: primaryMaster.env,
-          primaryMasterId: primaryMaster.id
+          allNodes: allNodes,                              // for forEach (works on arrays)
+          allIPsCSV: allIPsCSV,                            // for ${} interpolation in scripts
+          allowedIPs: ['127.0.0.1'].concat(allIPs).join(','),
+          primaryMasterEnv: primaryMaster ? primaryMaster.env : '',
+          primaryMasterId:  primaryMaster ? primaryMaster.id : '',
+          primaryMasterIP:  primaryMaster ? primaryMaster.ip : '',
+          newRegionNodes: newRegionNodes,
+          newRegionIPsCSV: newIPs,
+          removeRegionNodes: removeRegionNodes,
+          removeRegionIPsCSV: remIPs,
+          regionsCountCurrent: envs.length
         } } };
+
+  # ---- INSTALL: initial topology ------------------------------------------
 
   # Probe every node (across all regions) into one pool, from the primary master.
   peerProbeAll:
@@ -148,7 +207,173 @@ actions:
               echo "localhost:/${globals.volumeName}  ${globals.replicatedPath}   glusterfs   defaults,_netdev,noauto,x-systemd.automount  0 0" >> /etc/fstab;
         user: root
 
+  # ---- DAY-2: addRegion (replica N -> N+1) --------------------------------
+
+  # Peer the new region's nodes, then add one brick per slice from the new region
+  # to the volume, bumping replica count to (N+1).
+  addRegionToVolume:
+    - forEach (n:globals.newRegionNodes):
+      - api: env.control.ExecCmdById
+        envName: ${globals.primaryMasterEnv}
+        nodeId: ${globals.primaryMasterId}
+        commandList:
+          - command: |-
+              counter=0;
+              while true; do
+                gluster peer probe ${@n.ip} && break;
+                [ "$counter" -gt 10 ] && { echo "peer probe ${@n.ip} failed"; break; }
+                counter=$((counter+1)); sleep 2;
+              done;
+        user: root
+    - script: |
+        var ipsCSV = '${globals.newRegionIPsCSV}';
+        if (!ipsCSV) return { result: 1, error: "No new region nodes found - was settings.newEnvName set correctly?" };
+        var bricks = ipsCSV.split(',').filter(function(ip){return ip;}).map(function(ip){ return ip + ":/glustervolume"; }).join(' ');
+        var newReplica = parseInt('${globals.replicaCount}', 10);  // already includes the new env in this run's gather
+        return { result: 0, onAfterReturn: { setGlobals: { addBricksList: bricks, addBricksReplica: newReplica } } };
+    - api: env.control.ExecCmdById
+      envName: ${globals.primaryMasterEnv}
+      nodeId: ${globals.primaryMasterId}
+      commandList:
+        - command: |-
+            set +e;
+            echo "Adding region to volume: replica -> ${globals.addBricksReplica}, bricks: ${globals.addBricksList}";
+            gluster volume add-brick ${globals.volumeName} replica ${globals.addBricksReplica} ${globals.addBricksList} force 2>&1;
+            RC=$?;
+            if [ "$RC" -ne 0 ]; then echo "add-brick failed (rc=$RC); volume info:"; gluster volume info ${globals.volumeName}; exit $RC; fi;
+            gluster volume heal ${globals.volumeName} full || true;
+      user: root
+
+  mountNewRegionNodes:
+    - forEach (n:globals.newRegionNodes):
+      - api: env.control.ExecCmdById
+        envName: ${@n.env}
+        nodeId: ${@n.id}
+        commandList:
+          - command: |-
+              mkdir -p ${globals.replicatedPath};
+              if ! mountpoint -q ${globals.replicatedPath}; then
+                mount.glusterfs localhost:/${globals.volumeName} ${globals.replicatedPath} || { sleep 5; mount.glusterfs localhost:/${globals.volumeName} ${globals.replicatedPath} || true; }
+              fi;
+              chmod 777 ${globals.replicatedPath};
+              sed -i '/glusterfs/d' /etc/fstab;
+              echo "localhost:/${globals.volumeName}  ${globals.replicatedPath}   glusterfs   defaults,_netdev,noauto,x-systemd.automount  0 0" >> /etc/fstab;
+        user: root
+
+  # ---- DAY-2: removeRegion (replica N -> N-1) -----------------------------
+
+  removeRegionFromVolume:
+    - script: |
+        var ipsCSV = '${globals.removeRegionIPsCSV}';
+        if (!ipsCSV) return { result: 1, error: "No nodes found in target removeEnvName - was it spelled correctly?" };
+        var ips = ipsCSV.split(',').filter(function(ip){return ip;});
+        var bricks = ips.map(function(ip){ return ip + ":/glustervolume"; }).join(' ');
+        // gatherNodes ran against all current envs INCLUDING the one we're removing,
+        // so newReplica = current replica count - 1
+        var newReplica = parseInt('${globals.replicaCount}', 10) - 1;
+        if (newReplica < 1) return { result: 1, error: "Cannot reduce replica count below 1." };
+        return { result: 0, onAfterReturn: { setGlobals: {
+          removeBricksList: bricks, removeBricksReplica: newReplica,
+          peerDetachIPs: ips.join(',')
+        } } };
+    - api: env.control.ExecCmdById
+      envName: ${globals.primaryMasterEnv}
+      nodeId: ${globals.primaryMasterId}
+      commandList:
+        - command: |-
+            set +e;
+            echo "Removing region from volume: replica -> ${globals.removeBricksReplica}, bricks: ${globals.removeBricksList}";
+            yes 2>/dev/null | gluster volume remove-brick ${globals.volumeName} replica ${globals.removeBricksReplica} ${globals.removeBricksList} force 2>&1;
+            IFS=',' read -ra DROP <<< "${globals.peerDetachIPs}";
+            for ip in "${DROP[@]}"; do [ -z "$ip" ] && continue; gluster peer detach $ip force 2>&1 || true; done;
+      user: root
+
+  # ---- DAY-2: addCapacitySlice (replica unchanged, sets +1) ----------------
+  #
+  # Assumes the user has already scaled each regional env up by 1 storage node
+  # (via the Jelastic UI). This step probes the new nodes, adds them all as one
+  # new replica set, then rebalances + heals.
+
+  addCapacitySliceToVolume:
+    - api: env.control.ExecCmdById
+      envName: ${globals.primaryMasterEnv}
+      nodeId: ${globals.primaryMasterId}
+      commandList:
+        - command: |-
+            set +e;
+            # Existing brick hosts (one per line). Strip whitespace from awk output.
+            EXISTING=$(gluster volume info ${globals.volumeName} | awk '/^Brick[0-9]+:/ {print $2}' | awk -F: '{print $1}');
+            NEW_BRICKS="";
+            # Iterate candidate IPs (all storage nodes across all regions). For
+            # each not-yet-a-brick, peer-probe and add to the new-brick list.
+            IFS=',' read -ra CANDS <<< "${globals.allIPsCSV}";
+            for ip in "${CANDS[@]}"; do
+              [ -z "$ip" ] && continue;
+              if ! grep -qxF "$ip" <<< "$EXISTING"; then
+                gluster peer probe $ip 2>/dev/null || true;
+                NEW_BRICKS="${NEW_BRICKS} ${ip}:/glustervolume";
+              fi;
+            done;
+            NEW_COUNT=$(echo "$NEW_BRICKS" | wc -w);
+            if [ "$NEW_COUNT" -eq 0 ]; then echo "No new nodes detected; nothing to add."; exit 0; fi;
+            REPLICA=${globals.replicaCount};
+            if [ $((NEW_COUNT % REPLICA)) -ne 0 ]; then
+              echo "WARNING: $NEW_COUNT new node(s) found, not a multiple of replica $REPLICA.";
+              echo "Sync stretched cluster needs 1 new node per region (so new bricks = $REPLICA at a time).";
+              echo "Bricks NOT added. Scale each region by the same count, then re-run.";
+              exit 1;
+            fi;
+            sleep 3;
+            echo "Adding $NEW_COUNT new brick(s) as $((NEW_COUNT / REPLICA)) new replica set(s):${NEW_BRICKS}";
+            gluster volume add-brick ${globals.volumeName} ${NEW_BRICKS} force 2>&1; RC=$?;
+            if [ "$RC" -ne 0 ]; then echo "add-brick failed (rc=$RC); volume info:"; gluster volume info ${globals.volumeName}; exit $RC; fi;
+      user: root
+
+  rebalanceAndHeal:
+    - api: env.control.ExecCmdById
+      envName: ${globals.primaryMasterEnv}
+      nodeId: ${globals.primaryMasterId}
+      commandList:
+        - command: |-
+            gluster volume rebalance ${globals.volumeName} start 2>&1 || true;
+            gluster volume heal ${globals.volumeName} full 2>&1 || true;
+      user: root
+
+  # ---- SECURITY: tighten auth.allow to peer IPs only ----------------------
+  #
+  # Sets the volume's auth.allow to the comma-separated list of all storage node
+  # IPs across all regions (plus 127.0.0.1). Replaces the install-time '*' value.
+  # In sync mode all peers see the same volume, so setting it from each region's
+  # master is redundant but harmless. In async mode each region has its own
+  # volume, so this is run per-master too.
+  hardenAuth:
+    - script: |
+        var envs = '${globals.clusterEnvs}'.split(','), execs = [];
+        for (var i = 0; i < envs.length; i++) {
+          var r = jelastic.env.control.GetEnvInfo(envs[i], session);
+          if (r.result != 0) continue;
+          for (var l = 0; l < r.nodes.length; l++) {
+            if (r.nodes[l].nodeGroup == 'storage' && r.nodes[l].ismaster) {
+              execs.push({ env: envs[i], id: r.nodes[l].id });
+              break;
+            }
+          }
+        }
+        return { result: 0, onAfterReturn: { setGlobals: { hardenList: execs } } };
+    - forEach (e:globals.hardenList):
+      - api: env.control.ExecCmdById
+        envName: ${@e.env}
+        nodeId: ${@e.id}
+        commandList:
+          - command: |-
+              gluster volume set ${globals.volumeName} auth.allow '${globals.allowedIPs}' 2>&1 || true;
+              echo "auth.allow on ${globals.volumeName} now: $(gluster volume info ${globals.volumeName} | grep auth.allow)";
+        user: root
+
   # Persist parameters on the primary env for day-2 add-ons / management.
+  # The manager always runs IN the primary env's context (it is installed there
+  # by the orchestrator and by every day-2 addon), so writing to the current
+  # env's storage node-group data is what we want.
   persistGlobals:
     - env.control.ApplyNodeGroupData[storage]:
         data:
