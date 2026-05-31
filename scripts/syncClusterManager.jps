@@ -128,7 +128,7 @@ actions:
             gluster volume set ${globals.volumeName} cluster.server-quorum-type server;
             gluster volume set ${globals.volumeName} network.ping-timeout 30;
             gluster volume set ${globals.volumeName} cluster.choose-local on;
-            gluster volume set ${globals.volumeName} auth.allow 127.0.0.1;
+            gluster volume set ${globals.volumeName} auth.allow '*';
       user: root
 
   # FUSE-mount the stretched volume locally on every node, with systemd automount.

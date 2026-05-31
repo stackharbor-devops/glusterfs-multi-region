@@ -234,7 +234,7 @@ actions:
         done
         gluster volume start ${globals.replicatedVolume};
         gluster volume set ${globals.replicatedVolume} network.ping-timeout 10;
-        if [ -f /etc/jelastic/clients/${globals.replicatedVolume} ]; then gluster volume set ${globals.replicatedVolume} auth.allow $(cat /etc/jelastic/clients/${globals.replicatedVolume}|tr ' ' ','); else gluster volume set ${globals.replicatedVolume} auth.allow 127.0.0.1; fi;
+        gluster volume set ${globals.replicatedVolume} auth.allow '*';
       user: root
 
   mountDirectoryToVolume:
