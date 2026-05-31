@@ -1,0 +1,94 @@
+type: update
+version: 1.0
+id: glusterfs-add-region
+name: Add GlusterFS Region
+baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
+description:
+  short: Adds a new region to an existing multi-region GlusterFS deployment.
+
+# ---------------------------------------------------------------------------
+# Day-2 add-on. IMPORT / RUN THIS AGAINST THE PRIMARY ENVIRONMENT (envName-1),
+# where the deployment parameters were persisted at install time. It creates a
+# new regional storage env at the next free index and re-runs the geo-replication
+# manager (add_new_cluster) to extend SSH/geo-rep trust and start a new session.
+#
+# Note: day-2 add-on, less battle-tested than the install path. Verify on a
+# staging deployment before using in production.
+# ---------------------------------------------------------------------------
+
+settings:
+  fields:
+    - type: regionlist
+      name: newRegion
+      caption: New Region
+      multiSelect: false
+      required: true
+      min: 1
+      max: 1
+      disableInactive: true
+      selectFirstAvailable: false
+
+onInstall:
+  - importGlobalsFromNodeGroup: storage
+  - getClusterEnvs
+  - createNewEnv
+  - setupGeoForNewEnv
+
+actions:
+  # Recover volumeName / replicaCount / nodesPerRegion / envNamePrefix /
+  # master_env_name / replicatedPath that the manager persisted at install.
+  importGlobalsFromNodeGroup:
+    - script: |
+        var resp = api.env.control.GetNodeGroups("${env.name}", session);
+        if (resp.result != 0) return resp;
+        var groups = resp.object, globals;
+        for (var i = 0, n = groups.length; i < n; i++)
+          if (groups[i].name == "${this}" && groups[i].globals) {
+            globals = new org.yaml.snakeyaml.Yaml().load(groups[i].globals);
+            break;
+          }
+        if (!globals) return { result: 1, error: "No persisted GlusterFS globals found on this env. Run this add-on against the primary environment." };
+        return { result: 0, onAfterReturn: { setGlobals: globals } };
+
+  getClusterEnvs:
+    - script: ${baseUrl}/scripts/getClusterEnvs.js
+      envName: ${env.envName}
+    - setGlobals:
+        nextIndex: ${response.nextIndex}
+
+  # Create the new regional storage env at <prefix>-<nextIndex>, region-pinned.
+  createNewEnv:
+    - script: |
+        var actions = [{
+          jps: "${baseUrl}/scripts/storage-region.jps?_r=${fn.random}",
+          envName: "${globals.envNamePrefix}-${globals.nextIndex}",
+          loggerName: "${globals.envNamePrefix}-${globals.nextIndex}",
+          envGroups: "GlusterFS Cluster ${globals.envNamePrefix}",
+          region: "${settings.newRegion}",
+          settings: {
+            "nodes": "${globals.nodesPerRegion}",
+            "replicaCount": "${globals.replicaCount}",
+            "volumeName": "${globals.volumeName}",
+            "mountPoint": "${globals.replicatedPath}"
+          }
+        }];
+        return { result: 0, onAfterReturn: { 'marketplace.jps.install': actions } };
+
+  # Re-run the manager to extend trust/firewall and add the new geo-rep session.
+  setupGeoForNewEnv:
+    - script: |
+        var actions = [{
+          jps: "${baseUrl}/scripts/geoReplicationManager.jps?_r=${fn.random}",
+          envName: "${globals.master_env_name}",
+          settings: {
+            "master_env_name": "${globals.master_env_name}",
+            "volumeName": "${globals.volumeName}",
+            "networkMode": "public",
+            "envNamePrefix": "${globals.envNamePrefix}",
+            "replicaCount": "${globals.replicaCount}",
+            "nodesPerRegion": "${globals.nodesPerRegion}",
+            "mountPoint": "${globals.replicatedPath}",
+            "add_new_cluster": "true"
+          }
+        }];
+        return { result: 0, onAfterReturn: { 'marketplace.jps.install': actions } };

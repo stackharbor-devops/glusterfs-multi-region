@@ -1,0 +1,168 @@
+type: install
+version: 1.0
+id: glusterfs-multiregion
+name: Multi-Region GlusterFS Cluster
+baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
+homepage: https://github.com/stackharbor-devops/glusterfs-multi-region
+description:
+  text: |
+    Deploys an independent GlusterFS storage cluster in each of several cloud
+    regions and connects them with native GlusterFS geo-replication. Each region
+    can be a single node (geo-replication only) or a multi-node cluster using
+    replicated or distributed-replicated volumes, so capacity scales by adding
+    replica sets ("slices") while redundancy is preserved.
+  short: Multi-region GlusterFS with distributed-replicated volumes and geo-replication.
+categories:
+  - apps/clusters
+
+# ---------------------------------------------------------------------------
+# Install dialog. Built dynamically so the "replica sets" range can be capped to
+# the account's node quota. The volume model is expressed as two dimensions:
+#   replicaCount  = copies per file (redundancy)
+#   replicaSets   = number of replica sets (capacity slices / distribution width)
+#   nodesPerRegion = replicaCount * replicaSets   (computed in initGlobals)
+# replicaSets = 1            -> pure replicated (mirror)
+# replicaSets > 1            -> distributed-replicated (scales capacity)
+# topology = single          -> 1 node/region, single-brick volume, geo-rep only
+# ---------------------------------------------------------------------------
+onBeforeInit: |
+  var minPerSet = 2, maxSame = 0, maxTotal = 0;
+  var hasCollaboration = (parseInt('${fn.compareEngine(7.0)}', 10) >= 0);
+  try {
+    if (hasCollaboration) {
+      maxSame  = parseInt('${quota.environment.maxsamenodescount}', 10) || 0;
+      maxTotal = parseInt('${quota.environment.maxnodescount}', 10) || 0;
+    } else {
+      maxSame  = jelastic.billing.account.GetQuotas('environment.maxsamenodescount').array[0].value;
+      maxTotal = jelastic.billing.account.GetQuotas('environment.maxnodescount').array[0].value;
+    }
+  } catch (e) { maxSame = 0; maxTotal = 0; }
+
+  var maxSets = (maxSame >= minPerSet) ? Math.floor(maxSame / minPerSet) : 1;
+  if (maxSets < 1) maxSets = 1;
+
+  var fields = [
+    { type: "regionlist", name: "regions", caption: "Regions", multiSelect: true,
+      required: true, min: 2, max: 5, disableInactive: true, selectFirstAvailable: false },
+    { type: "string", name: "volumeName", caption: "Volume name", "default": "data", required: true },
+    { type: "string", name: "mountPoint", caption: "Mount point", "default": "/data", required: true },
+    { type: "list", name: "topology", caption: "Per-region topology", "default": "cluster",
+      values: [
+        { value: "single",  caption: "Single node per region (geo-replication only)" },
+        { value: "cluster", caption: "Cluster per region (replicated / distributed-replicated)" }
+      ] },
+    { type: "list", name: "replicaCount", caption: "Replica count - redundancy (cluster only)", "default": "3",
+      values: [ { value: "2", caption: "2 copies" }, { value: "3", caption: "3 copies (recommended)" } ] },
+    { type: "spinner", name: "replicaSets", caption: "Replica sets - capacity slices (cluster only)",
+      min: 1, max: maxSets, "default": 1 },
+    { type: "envname", name: "envName", caption: "Environment", required: true, randomName: true }
+  ];
+
+  if (maxSame > 0 && maxSame < 3) {
+    fields.unshift({ type: "displayfield", cls: "warning", hideLabel: true, height: 45,
+      markup: "Your account allows max " + maxSame + " nodes of the same type per environment. " +
+              "'Cluster per region' with replica 3 needs at least 3 nodes - only 'Single node per region' " +
+              "will fit. Upgrade your account for in-region clustering." });
+  }
+
+  return { result: 0, settings: { fields: fields } };
+
+onInstall:
+  - initGlobals
+  - env.group.CreateGroup:
+      envGroup: GlusterFS Cluster ${settings.envName}
+  - createEnvs
+  - getClusterEnvs
+  - setupGeoReplication
+
+actions:
+  # Resolve regions -> domains, derive node counts, set primary = region 1.
+  initGlobals:
+    - script: |
+        var regions = '${settings.regions}'.split(','), index, resp,
+            onAfterReturn = { setGlobals: {} }, glbs = onAfterReturn.setGlobals;
+
+        if (regions.length < 2)
+          return { result: 1, error: "Select at least 2 regions for multi-region geo-replication." };
+
+        var topology = '${settings.topology}';
+        var replica  = (topology == 'single') ? 1 : parseInt('${settings.replicaCount}', 10);
+        var sets     = (topology == 'single') ? 1 : parseInt('${settings.replicaSets}', 10);
+        var nodesPerRegion = (topology == 'single') ? 1 : (replica * sets);
+
+        glbs["replicaCount"]    = replica;
+        glbs["nodesPerRegion"]  = nodesPerRegion;
+        glbs["regionsCount"]    = regions.length;
+        glbs["volumeName"]      = '${settings.volumeName}';
+        glbs["replicatedPath"]  = '${settings.mountPoint}';
+        glbs["topologyDescription"] = (topology == 'single')
+          ? "1 node per region (single-brick volume, geo-replicated)"
+          : (nodesPerRegion + " nodes per region = replica " + replica + " x " + sets + " set(s)");
+
+        resp = jelastic.env.control.GetRegions(appid, session);
+        if (resp.result != 0) return resp;
+        resp = resp.array;
+        for (var i = 0, n = regions.length; i < n; i++) {
+          index = i + 1;
+          glbs["region-" + index] = regions[i];
+          for (var a = 0, b = resp.length; a < b; a++) {
+            for (var k = 0, l = resp[a].hardNodeGroups.length; k < l; k++) {
+              if (resp[a].hardNodeGroups[k].uniqueName == regions[i]) {
+                glbs["domain-" + index]     = resp[a].domain;
+                glbs["regionName-" + index] = resp[a].displayName;
+              }
+            }
+          }
+        }
+        return { result: 0, onAfterReturn: onAfterReturn };
+
+  # Create one Certified-Storage environment per region, pinned via region:.
+  createEnvs:
+    - script: |
+        var regions = '${settings.regions}'.split(','), actions = [];
+        for (var cluster = 1, n = regions.length + 1; cluster < n; cluster++) {
+          actions.push({
+            jps: "${baseUrl}/scripts/storage-region.jps?_r=${fn.random}",
+            envName: "${settings.envName}-" + cluster,
+            loggerName: "${settings.envName}-" + cluster,
+            envGroups: "GlusterFS Cluster ${settings.envName}",
+            region: "${globals.region-" + cluster + "}",
+            settings: {
+              "nodes": "${globals.nodesPerRegion}",
+              "replicaCount": "${globals.replicaCount}",
+              "volumeName": "${settings.volumeName}",
+              "mountPoint": "${settings.mountPoint}"
+            }
+          });
+        }
+        return { result: 0, onAfterReturn: { 'marketplace.jps.install': actions } };
+
+  # Discover the freshly-created regional envs (prefix match on envName-N).
+  getClusterEnvs:
+    - script: ${baseUrl}/scripts/getClusterEnvs.js
+      envName: ${settings.envName}-1
+    - setGlobals:
+        clusterEnvs: ${response.items.join(,)}
+
+  # Install the geo-replication manager into the primary env; it wires the rest.
+  setupGeoReplication:
+    - script: |
+        var actions = [{
+          jps: "${baseUrl}/scripts/geoReplicationManager.jps?_r=${fn.random}",
+          envName: "${settings.envName}-1",
+          settings: {
+            "master_env_name": "${settings.envName}-1",
+            "volumeName": "${settings.volumeName}",
+            "networkMode": "public",
+            "envNamePrefix": "${settings.envName}",
+            "replicaCount": "${globals.replicaCount}",
+            "nodesPerRegion": "${globals.nodesPerRegion}",
+            "mountPoint": "${settings.mountPoint}",
+            "install_gluster_cluster": "true"
+          }
+        }];
+        return { result: 0, onAfterReturn: { 'marketplace.jps.install': actions } };
+
+success:
+  text: /success/success.md?_r=${fn.random}
+  email: /success/success.md?_r=${fn.random}

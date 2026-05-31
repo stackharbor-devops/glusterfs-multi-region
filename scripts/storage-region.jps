@@ -1,0 +1,45 @@
+type: install
+version: 1.0
+id: glusterfs-storage-region
+name: GlusterFS Storage Region
+baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
+description:
+  short: A single-region GlusterFS cluster on Jelastic Certified Storage nodes.
+
+# ---------------------------------------------------------------------------
+# This is the per-region child environment. The top-level manifest.jps installs
+# it once per selected region (region-pinned via the `region:` install param)
+# and passes the volume parameters down through `settings`.
+#
+# Node foundation: Jelastic Certified Storage (nodeType: storage). glusterd ships
+# preinstalled on this image, so there is nothing to yum/apt-install here.
+# ---------------------------------------------------------------------------
+
+globals:
+  replicatedVolume: ${settings.volumeName:data}
+  replicatedPath: ${settings.mountPoint:/data}
+  replicaCount: ${settings.replicaCount:3}
+
+nodes:
+  - nodeType: storage
+    nodeGroup: storage
+    count: ${settings.nodes:3}
+    cluster: true
+    fixedCloudlets: 1
+    flexibleCloudlets: 8
+    extip: true            # public IPv4 per node -> enables cross-region geo-replication
+    displayName: GlusterFS Storage
+
+onInstall:
+  - installClusterLogic
+
+actions:
+  # Install the permanent in-region cluster logic (volume create / mount / scale).
+  installClusterLogic:
+    install:
+      jps: ${baseUrl}/scripts/cluster-logic.jps?_r=${fn.random}
+      settings:
+        nodeGroup: storage
+        replicatedVolume: ${globals.replicatedVolume}
+        replicatedPath: ${globals.replicatedPath}
+        replicaCount: ${globals.replicaCount}
