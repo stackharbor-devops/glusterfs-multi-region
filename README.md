@@ -55,7 +55,9 @@ scripts/
   geoReplicationManager.jps      # cross-region geo-rep orchestrator (update, runs in primary)
   geoReplication.jps             # per-env geo-rep worker (update)
 addons/
+  management.jps                 # operational buttons (status/heal/rebalance), auto-installed on primary
   addRegion.jps                  # day-2: add a new region
+  forgetRegion.jps               # day-2: remove a region (heal by forgetting)
 success/success.md               # post-install summary
 ```
 
@@ -115,16 +117,46 @@ All scripts are fetched at install time from `baseUrl` (currently
 will fail to fetch `scripts/*`. Import `manifest.jps` via the Jelastic dashboard
 ("Import" → URL or local file).
 
-## Day-2: add a region
+## Day-2 operations
 
-Import `addons/addRegion.jps` **against the primary environment** (`envName-1`),
-pick the new region, and it will create the new regional cluster and extend
-geo-replication to it.
+All day-2 add-ons run **against the primary environment** (`envName-1`), where the
+deployment parameters are persisted.
+
+- **Management buttons** (`addons/management.jps`, auto-installed on the primary —
+  shown in the env's Add-ons panel):
+  - *Cluster Status* — peer/volume/status on every region's master.
+  - *Geo-Replication Status* — `geo-replication … status` on the primary.
+  - *Heal Volumes* — `heal … full` on every region.
+  - *Rebalance Volumes* — `rebalance … start` on every region.
+- **Add a region** (`addons/addRegion.jps`): pick a new region; it creates the
+  regional cluster and extends geo-replication to it (same cluster, new slice of
+  geography).
+- **Forget a region** (`addons/forgetRegion.jps`): "heal by forgetting" — stops and
+  deletes the geo-replication session to a region that is down or being
+  decommissioned (optionally deletes its environment). Combine forget + add to
+  move a cluster off a bad region onto a new one.
+
+## Scaling
+
+- **Scale out (add capacity):** use the native topology UI to add `storage` nodes
+  **in multiples of the replica count**. `cluster-logic.jps` automatically
+  peer-probes them, runs `add-brick … replica N`, and `rebalance` + `heal`. Each
+  group of `replicaCount` nodes is a new capacity slice.
+- **Scale in (remove capacity):** automatic scale-in is gated (`onBeforeScaleIn`
+  stopEvent) because removing bricks from a distributed-replicated volume without
+  migrating data first loses it. Remove a full replica set safely with the
+  controlled `remove-brick start → status → commit` procedure (see *Scaling in*
+  above), then detach the peers and scale the layer down. A guided scale-in
+  add-on is a planned follow-up (deferred because safe data migration is async
+  and doesn't fit a blocking event handler).
 
 ## Status / known gaps
 
 - Geo-replication is **asynchronous and one-directional** (primary → secondaries).
-- **Failover / master promotion is not implemented** (no automatic re-pointing of
-  geo-rep if the primary region is lost) — a planned follow-up.
+- **Master promotion / true failover is not implemented** — if the *primary*
+  region is lost, geo-rep is not auto-repointed. Reconfiguration is manual today:
+  use *Forget a region* + *Add a region* to recover. Automatic promotion of a
+  secondary to primary is the main remaining feature.
+- **Guided scale-in add-on** is pending (see *Scaling*).
 - Cannot be validated off-platform; the items under *Networking & firewall* are
   the most likely to need tuning on a real Virtuozzo Application Platform.

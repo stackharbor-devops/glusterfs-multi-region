@@ -1,0 +1,85 @@
+type: update
+version: 1.0
+id: glusterfs-forget-region
+name: Forget GlusterFS Region
+baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
+description:
+  short: Remove a region from the cluster (stop/delete its geo-replication session).
+
+# ---------------------------------------------------------------------------
+# Day-2 reconfiguration. RUN AGAINST THE PRIMARY ENVIRONMENT (envName-1).
+# Use it to "heal by forgetting" a region that is down or being decommissioned:
+# it stops and deletes the geo-replication session from the primary to that
+# region's volume, so the primary stops trying to replicate to it. Optionally
+# deletes the region's environment too.
+#
+# After forgetting, you can add a fresh region with addRegion.jps and keep the
+# same cluster.
+# ---------------------------------------------------------------------------
+
+# Populate a dropdown of candidate secondary environments (name ends in -N, N>=2).
+onBeforeInit: |
+  var resp = jelastic.environment.control.GetEnvs(appid, session), vals = [];
+  if (resp && resp.result == 0) {
+    for (var i = 0, n = resp.infos.length; i < n; i++) {
+      var nm = resp.infos[i].env.envName, m = nm.match(/^(.*)-(\d+)$/);
+      if (m && parseInt(m[2], 10) >= 2) vals.push({ value: nm, caption: nm });
+    }
+  }
+  if (!vals.length) vals.push({ value: "", caption: "(no secondary regions found)" });
+  return { result: 0, settings: { fields: [
+    { type: "list", name: "targetEnv", caption: "Region environment to forget", required: true, values: vals },
+    { type: "checkbox", name: "deleteEnv", caption: "Also delete the environment (destructive)", value: false }
+  ] } };
+
+onInstall:
+  - importGlobalsFromNodeGroup: storage
+  - resolveTargetIP
+  - stopAndDeleteGeoRep
+  - if ('${settings.deleteEnv}' == 'true'):
+      - deleteTargetEnv
+
+actions:
+  importGlobalsFromNodeGroup:
+    - script: |
+        var resp = api.env.control.GetNodeGroups("${env.name}", session);
+        if (resp.result != 0) return resp;
+        var groups = resp.object, globals;
+        for (var i = 0, n = groups.length; i < n; i++)
+          if (groups[i].name == "${this}" && groups[i].globals) {
+            globals = new org.yaml.snakeyaml.Yaml().load(groups[i].globals);
+            break;
+          }
+        if (!globals) return { result: 1, error: "No persisted GlusterFS globals found. Run this add-on against the primary environment." };
+        return { result: 0, onAfterReturn: { setGlobals: globals } };
+
+  # Resolve the target region's storage-master IP (the geo-rep slave address).
+  resolveTargetIP:
+    - script: |
+        function extIp(node){ if(node.extIPs&&node.extIPs.length){var e=node.extIPs[0];return (e&&e.address)?e.address:e;} if(node.extIP)return node.extIP; if(node.externalIp)return node.externalIp; return node.address; }
+        var resp = jelastic.env.control.GetEnvInfo('${settings.targetEnv}', session);
+        if (resp.result != 0)
+          return { result: 0, onAfterReturn: { setGlobals: { targetSlaveIP: "" } } };
+        var ip = "";
+        for (var l = 0, k = resp.nodes; l < k.length; l++)
+          if (k[l].nodeGroup == 'storage' && k[l].ismaster)
+            ip = ('${globals.networkMode}' == 'public') ? extIp(k[l]) : k[l].address;
+        return { result: 0, onAfterReturn: { setGlobals: { targetSlaveIP: ip } } };
+
+  # Stop + delete the geo-replication session on the primary master. If the IP
+  # could not be resolved (env already gone), list and delete any matching session.
+  stopAndDeleteGeoRep:
+    - cmd[${nodes.storage.master.id}]: |-
+        VOL="${globals.volumeName}"; IP="${globals.targetSlaveIP}";
+        if [ -n "$IP" ]; then
+          gluster volume geo-replication ${VOL} jelastic@${IP}::${VOL} stop force || true;
+          gluster volume geo-replication ${VOL} jelastic@${IP}::${VOL} delete force || true;
+        else
+          echo "Target IP not resolvable; listing remaining geo-replication sessions for manual cleanup:";
+          gluster volume geo-replication ${VOL} status || true;
+        fi;
+      user: root
+
+  deleteTargetEnv:
+    - api: env.control.DeleteEnv
+      envName: ${settings.targetEnv}

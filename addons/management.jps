@@ -1,0 +1,107 @@
+type: update
+version: 1.0
+id: glusterfs-management
+name: GlusterFS Cluster Management
+baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
+description:
+  short: Operational buttons for the multi-region GlusterFS cluster.
+
+# ---------------------------------------------------------------------------
+# Installed automatically onto the PRIMARY env by the orchestrator. Adds buttons
+# (Add-ons panel) that fan operational commands across every region by
+# rediscovering the cluster with getClusterEnvs and targeting each region's
+# storage master. Volume name etc. are recovered from the globals the
+# geo-replication manager persisted at install time.
+# ---------------------------------------------------------------------------
+
+onInstall:
+  - script: |
+      return { result: 0 };
+
+addons:
+  - id: glusterfs-mgmt
+    name: GlusterFS Cluster
+    description: Status and maintenance for the multi-region GlusterFS cluster.
+    buttons:
+      - caption: Cluster Status
+        action: clusterStatus
+        loadingText: Gathering cluster status...
+        successText: Status collected - open the env Tasks/log to view the output.
+      - caption: Geo-Replication Status
+        action: geoRepStatus
+        loadingText: Querying geo-replication...
+        successText: Geo-replication status collected - see the log.
+      - caption: Heal Volumes
+        action: healVolumes
+        confirmText: Trigger a full heal on every region's volume?
+        loadingText: Starting heal...
+        successText: Heal started on all regions.
+      - caption: Rebalance Volumes
+        action: rebalanceVolumes
+        confirmText: Start a rebalance (redistribute data) on every region's volume?
+        loadingText: Starting rebalance...
+        successText: Rebalance started on all regions.
+
+actions:
+  importGlobalsFromNodeGroup:
+    - script: |
+        var resp = api.env.control.GetNodeGroups("${env.name}", session);
+        if (resp.result != 0) return resp;
+        var groups = resp.object, globals;
+        for (var i = 0, n = groups.length; i < n; i++)
+          if (groups[i].name == "${this}" && groups[i].globals) {
+            globals = new org.yaml.snakeyaml.Yaml().load(groups[i].globals);
+            break;
+          }
+        return { result: 0, onAfterReturn: { setGlobals: globals || {} } };
+
+  getClusterEnvs:
+    - script: ${baseUrl}/scripts/getClusterEnvs.js
+      envName: ${env.envName}
+    - setGlobals:
+        clusterEnvs: ${response.items.join(,)}
+
+  # Build a list of {env, id} for every region's storage master, then run the
+  # given command on each. command is passed via ${this.command} (JPS-level, so
+  # it is not re-parsed as JS - safe for quotes/semicolons).
+  runOnEachMaster:
+    - script: |
+        var envs = '${globals.clusterEnvs}'.split(','), list = [];
+        for (var i = 0, n = envs.length; i < n; i++) {
+          var resp = jelastic.env.control.GetEnvInfo(envs[i], session);
+          if (resp.result != 0) return resp;
+          for (var l = 0, k = resp.nodes; l < k.length; l++)
+            if (k[l].nodeGroup == 'storage' && k[l].ismaster)
+              list.push({ env: envs[i], id: k[l].id });
+        }
+        return { result: 0, onAfterReturn: { setGlobals: { masterList: list } } };
+    - forEach(m:globals.masterList):
+        - api: env.control.ExecCmdById
+          envName: ${@m.env}
+          nodeId: ${@m.id}
+          commandList:
+            - command: ${this.command}
+
+  clusterStatus:
+    - importGlobalsFromNodeGroup: storage
+    - getClusterEnvs
+    - runOnEachMaster:
+        command: echo ===== PEERS =====; gluster peer status; echo ===== INFO =====; gluster volume info ${globals.volumeName}; echo ===== STATUS =====; gluster volume status ${globals.volumeName}
+
+  geoRepStatus:
+    - importGlobalsFromNodeGroup: storage
+    - cmd[${nodes.storage.master.id}]: |-
+        gluster volume geo-replication ${globals.volumeName} status || echo "No geo-replication sessions configured.";
+      user: root
+
+  healVolumes:
+    - importGlobalsFromNodeGroup: storage
+    - getClusterEnvs
+    - runOnEachMaster:
+        command: gluster volume heal ${globals.volumeName} full
+
+  rebalanceVolumes:
+    - importGlobalsFromNodeGroup: storage
+    - getClusterEnvs
+    - runOnEachMaster:
+        command: gluster volume rebalance ${globals.volumeName} start

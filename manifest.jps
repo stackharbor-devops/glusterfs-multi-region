@@ -74,6 +74,7 @@ onInstall:
   - createEnvs
   - getClusterEnvs
   - setupGeoReplication
+  - installManagement
 
 actions:
   # Resolve regions -> domains, derive node counts, set primary = region 1.
@@ -160,6 +161,15 @@ actions:
             "mountPoint": "${settings.mountPoint}",
             "install_gluster_cluster": "true"
           }
+        }];
+        return { result: 0, onAfterReturn: { 'marketplace.jps.install': actions } };
+
+  # Install the management buttons add-on onto the primary env.
+  installManagement:
+    - script: |
+        var actions = [{
+          jps: "${baseUrl}/addons/management.jps?_r=${fn.random}",
+          envName: "${settings.envName}-1"
         }];
         return { result: 0, onAfterReturn: { 'marketplace.jps.install': actions } };
 
