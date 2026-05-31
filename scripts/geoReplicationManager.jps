@@ -27,6 +27,7 @@ globals:
   replicaCount: ${settings.replicaCount:3}
   nodesPerRegion: ${settings.nodesPerRegion:3}
   replicatedPath: ${settings.mountPoint:/data}
+  replicationModel: ${settings.replicationModel:async}
 
 onInstall:
   - getClusterEnvs

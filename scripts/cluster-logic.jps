@@ -30,10 +30,17 @@ globals:
   replicatedPath: ${settings.replicatedPath:/data}
   replicatedVolume: ${settings.replicatedVolume:data}
   replicaCount: ${settings.replicaCount:3}
+  replicationModel: ${settings.replicationModel:async}
 
 onInstall:
   - setupFirewall
-  - initiateGlusterFSCluster
+  # async: build this region's local volume here.
+  # sync: only prepare nodes (glusterd + dirs); syncClusterManager builds the
+  #       single stretched volume spanning all regions.
+  - if ('${globals.replicationModel}' == 'sync'):
+      - prepNodesForSync
+  - if ('${globals.replicationModel}' != 'sync'):
+      - initiateGlusterFSCluster
 
 onAfterStart:
   - cmd[storage]: mount -a; exportfs -ra;
@@ -41,23 +48,27 @@ onAfterStart:
 # Scale-out = add capacity. New nodes are peered; when they complete a replica
 # set (count multiple of replicaCount) they are added as new bricks and the
 # volume is rebalanced + healed. Otherwise they stay peered but idle (warned).
+# async only: add the new node(s) as a capacity slice to this region's volume.
+# (sync stretched-cluster scaling must add one node per region at once and is
+#  handled out-of-band - see README; this handler no-ops in sync mode.)
 onAfterServiceScaleOut[storage]:
-  - forEach(newnode:event.response.nodes):
-      - enableGlusterFS:
-          id: ${@newnode.id}
-      - addPeer:
-          address: ${@newnode.address}
-  - addReplicaSet:
-      newnodes: ${event.response.nodes.join(address,)}
-  - forEach(newnode:event.response.nodes):
-      - mountDirectoryToVolume:
-          id: ${@newnode.id}
-          address: ${@newnode.address}
-      - addAutoMount:
-          id: ${@newnode.id}
-          address: ${@newnode.address}
-      - fixExistingMounts:
-          id: ${@newnode.id}
+  - if ('${globals.replicationModel}' != 'sync'):
+      - forEach(newnode:event.response.nodes):
+          - enableGlusterFS:
+              id: ${@newnode.id}
+          - addPeer:
+              address: ${@newnode.address}
+      - addReplicaSet:
+          newnodes: ${event.response.nodes.join(address,)}
+      - forEach(newnode:event.response.nodes):
+          - mountDirectoryToVolume:
+              id: ${@newnode.id}
+              address: ${@newnode.address}
+          - addAutoMount:
+              id: ${@newnode.id}
+              address: ${@newnode.address}
+          - fixExistingMounts:
+              id: ${@newnode.id}
 
 # Scale-in of a distributed-replicated volume risks data loss; gate it and point
 # the operator at the controlled remove-brick procedure (see README).
@@ -97,7 +108,8 @@ onBeforeMigrate:
   - cmd[storage]: sed -i '/glusterfs/d' /etc/fstab; rm -rf ${globals.replicatedPath}
 
 onAfterMigrate:
-  initiateGlusterFSCluster
+  - if ('${globals.replicationModel}' != 'sync'):
+      - initiateGlusterFSCluster
 
 onBeforeStop:
   - umountFuze: ${nodes.storage.join(id,)}
@@ -124,6 +136,13 @@ actions:
           }
         }
         return { result: 0 };
+
+  # sync mode: enable glusterd + create brick/mount dirs on every node in this
+  # region. The cross-region stretched volume is created by syncClusterManager.
+  prepNodesForSync:
+    - forEach(clusternode:nodes.storage):
+        enableGlusterFS:
+          id: ${@clusternode.id}
 
   initiateGlusterFSCluster:
     - umountFuze: ${nodes.storage.join(id,)}

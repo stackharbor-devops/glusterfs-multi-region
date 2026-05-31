@@ -51,7 +51,12 @@ onBeforeInit: |
         { value: "internal", caption: "Internal - platform GRE routing (no public IPs)" },
         { value: "public",   caption: "Public WAN - adds a public IP to every storage node" }
       ] },
-    { type: "list", name: "topology", caption: "Per-region topology", "default": "cluster",
+    { type: "list", name: "replicationModel", caption: "Replication model", "default": "async",
+      values: [
+        { value: "async", caption: "Async geo-replication - one-way primary->secondaries (fast local writes, DR)" },
+        { value: "sync",  caption: "Synchronous stretched cluster - write to ANY region (odd #regions; WAN write latency)" }
+      ] },
+    { type: "list", name: "topology", caption: "Per-region topology (async model)", "default": "cluster",
       values: [
         { value: "single",  caption: "Single node per region (geo-replication only)" },
         { value: "cluster", caption: "Cluster per region (replicated / distributed-replicated)" }
@@ -78,7 +83,10 @@ onInstall:
       envGroup: GlusterFS Cluster ${settings.envName}
   - createEnvs
   - getClusterEnvs
-  - setupGeoReplication
+  - if ('${settings.replicationModel}' == 'sync'):
+      - setupSyncCluster
+  - if ('${settings.replicationModel}' != 'sync'):
+      - setupGeoReplication
   - installManagement
 
 actions:
@@ -87,23 +95,39 @@ actions:
     - script: |
         var regions = '${settings.regions}'.split(','), index, resp,
             onAfterReturn = { setGlobals: {} }, glbs = onAfterReturn.setGlobals;
+        var model = '${settings.replicationModel}';
 
         if (regions.length < 2)
-          return { result: 1, error: "Select at least 2 regions for multi-region geo-replication." };
+          return { result: 1, error: "Select at least 2 regions." };
 
-        var topology = '${settings.topology}';
-        var replica  = (topology == 'single') ? 1 : parseInt('${settings.replicaCount}', 10);
-        var sets     = (topology == 'single') ? 1 : parseInt('${settings.replicaSets}', 10);
-        var nodesPerRegion = (topology == 'single') ? 1 : (replica * sets);
+        var replica, sets, nodesPerRegion, desc, modelDesc;
+        if (model == 'sync') {
+          if (regions.length < 3 || (regions.length % 2) == 0)
+            return { result: 1, error: "Synchronous stretched cluster (write-anywhere) requires an ODD number of regions (3, 5, ...) for quorum. You selected " + regions.length + "." };
+          sets = parseInt('${settings.replicaSets}', 10) || 1;   // nodes/region = capacity slices
+          replica = regions.length;                              // one replica per region
+          nodesPerRegion = sets;
+          desc = regions.length + "-region synchronous stretched cluster, " + sets + " slice(s) = " + nodesPerRegion + " node(s)/region, replica " + replica;
+          modelDesc = "All regions form ONE synchronous stretched volume - write to any node in any region and it replicates to every region. Writes are synchronous, so write latency reflects cross-region round-trips.";
+        } else {
+          var topology = '${settings.topology}';
+          replica = (topology == 'single') ? 1 : parseInt('${settings.replicaCount}', 10);
+          sets    = (topology == 'single') ? 1 : parseInt('${settings.replicaSets}', 10);
+          nodesPerRegion = (topology == 'single') ? 1 : (replica * sets);
+          desc = (topology == 'single')
+            ? "1 node per region (single-brick volume, geo-replicated)"
+            : (nodesPerRegion + " nodes per region = replica " + replica + " x " + sets + " set(s)");
+          modelDesc = "The primary region (${settings.envName}-1) asynchronously geo-replicates the volume to every secondary region (one-directional).";
+        }
 
         glbs["replicaCount"]    = replica;
         glbs["nodesPerRegion"]  = nodesPerRegion;
         glbs["regionsCount"]    = regions.length;
         glbs["volumeName"]      = '${settings.volumeName}';
         glbs["replicatedPath"]  = '${settings.mountPoint}';
-        glbs["topologyDescription"] = (topology == 'single')
-          ? "1 node per region (single-brick volume, geo-replicated)"
-          : (nodesPerRegion + " nodes per region = replica " + replica + " x " + sets + " set(s)");
+        glbs["replicationModel"]= model;
+        glbs["topologyDescription"] = desc;
+        glbs["modelDescription"]    = modelDesc;
 
         resp = jelastic.env.control.GetRegions(appid, session);
         if (resp.result != 0) return resp;
@@ -138,7 +162,8 @@ actions:
               "replicaCount": "${globals.replicaCount}",
               "volumeName": "${settings.volumeName}",
               "mountPoint": "${settings.mountPoint}",
-              "networkMode": "${settings.networkMode}"
+              "networkMode": "${settings.networkMode}",
+              "replicationModel": "${settings.replicationModel}"
             }
           });
         }
@@ -165,7 +190,26 @@ actions:
             "replicaCount": "${globals.replicaCount}",
             "nodesPerRegion": "${globals.nodesPerRegion}",
             "mountPoint": "${settings.mountPoint}",
+            "replicationModel": "async",
             "install_gluster_cluster": "true"
+          }
+        }];
+        return { result: 0, onAfterReturn: { 'marketplace.jps.install': actions } };
+
+  # Form one synchronous volume spanning all regions (write-anywhere multi-master).
+  setupSyncCluster:
+    - script: |
+        var actions = [{
+          jps: "${baseUrl}/scripts/syncClusterManager.jps?_r=${fn.random}",
+          envName: "${settings.envName}-1",
+          settings: {
+            "master_env_name": "${settings.envName}-1",
+            "volumeName": "${settings.volumeName}",
+            "mountPoint": "${settings.mountPoint}",
+            "networkMode": "${settings.networkMode}",
+            "envNamePrefix": "${settings.envName}",
+            "nodesPerRegion": "${globals.nodesPerRegion}",
+            "regionsCount": "${globals.regionsCount}"
           }
         }];
         return { result: 0, onAfterReturn: { 'marketplace.jps.install': actions } };

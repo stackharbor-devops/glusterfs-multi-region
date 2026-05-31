@@ -1,0 +1,155 @@
+type: update
+version: 1.0
+id: glusterfs-sync-cluster-manager
+name: GlusterFS Synchronous Stretched Cluster Manager
+baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
+description:
+  short: Forms ONE synchronous GlusterFS volume spanning all regions (write-anywhere).
+
+# ---------------------------------------------------------------------------
+# Runs once in the PRIMARY env. Joins every storage node across every region into
+# one trusted pool and creates a single volume with replica = number of regions
+# and bricks interleaved one-per-region per replica set. The result is a
+# multi-master "stretched" cluster: write to any node in any region and it
+# replicates synchronously to all regions. More bricks per region => more replica
+# sets => distributed-replicated (capacity scales while every file stays in every
+# region). Requires an ODD region count for quorum (validated in the orchestrator).
+#
+# Tradeoff: writes are synchronous, so write latency reflects cross-region RTT.
+# ---------------------------------------------------------------------------
+
+globals:
+  master_env_name: ${settings.master_env_name}
+  volumeName: ${settings.volumeName:data}
+  replicatedPath: ${settings.mountPoint:/data}
+  networkMode: ${settings.networkMode:internal}
+  envNamePrefix: ${settings.envNamePrefix:}
+  nodesPerRegion: ${settings.nodesPerRegion:1}
+  regionsCount: ${settings.regionsCount:3}
+  replicationModel: sync
+
+onInstall:
+  - getClusterEnvs
+  - gatherNodes
+  - peerProbeAll
+  - createStretchedVolume
+  - mountAllNodes
+  - persistGlobals
+
+actions:
+  getClusterEnvs:
+    - script: ${baseUrl}/scripts/getClusterEnvs.js
+      envName: ${env.envName}
+    - setGlobals:
+        clusterEnvs: ${response.items.join(,)}
+
+  # Build the interleaved brick list (one brick per region per replica set), the
+  # full node list (for peering + mounting), and pick the primary master. The
+  # cross-region IP is the external IP (public mode) or internal/GRE IP (internal).
+  gatherNodes:
+    - script: |
+        function extIp(node){ if(node.extIPs&&node.extIPs.length){var e=node.extIPs[0];return (e&&e.address)?e.address:e;} if(node.extIP)return node.extIP; if(node.externalIp)return node.externalIp; return node.address; }
+        var pub  = ('${globals.networkMode}' == 'public');
+        var envs = '${globals.clusterEnvs}'.split(',');
+        envs.sort(function(a, b){ return parseInt(a.split('-').pop(), 10) - parseInt(b.split('-').pop(), 10); });
+
+        var perRegion = [], maxK = 0, primaryMaster = null;
+        for (var r = 0; r < envs.length; r++) {
+          var resp = jelastic.env.control.GetEnvInfo(envs[r], session);
+          if (resp.result != 0) return resp;
+          var nodes = [];
+          for (var l = 0, k = resp.nodes; l < k.length; l++)
+            if (k[l].nodeGroup == 'storage')
+              nodes.push({ env: envs[r], id: k[l].id, ip: (pub ? extIp(k[l]) : k[l].address), ismaster: !!k[l].ismaster });
+          nodes.sort(function(a, b){ return a.id - b.id; });
+          perRegion.push(nodes);
+          if (nodes.length > maxK) maxK = nodes.length;
+          if (envs[r] == "${globals.master_env_name}")
+            for (var m = 0; m < nodes.length; m++) if (nodes[m].ismaster) primaryMaster = nodes[m];
+        }
+        if (!primaryMaster) primaryMaster = perRegion[0][0];
+
+        // interleave bricks: replica set j = one brick from each region
+        var bricks = [], allNodes = [];
+        for (var j = 0; j < maxK; j++)
+          for (var r2 = 0; r2 < perRegion.length; r2++)
+            if (perRegion[r2][j]) bricks.push(perRegion[r2][j].ip + ":/glustervolume");
+        for (var r3 = 0; r3 < perRegion.length; r3++)
+          for (var j3 = 0; j3 < perRegion[r3].length; j3++)
+            allNodes.push(perRegion[r3][j3]);
+
+        return { result: 0, onAfterReturn: { setGlobals: {
+          replicaCount: envs.length,
+          bricksOrdered: bricks.join(' '),
+          allNodes: allNodes,
+          primaryMasterEnv: primaryMaster.env,
+          primaryMasterId: primaryMaster.id
+        } } };
+
+  # Probe every node (across all regions) into one pool, from the primary master.
+  peerProbeAll:
+    - forEach (node:globals.allNodes):
+      - if ('${@node.id}' != '${globals.primaryMasterId}'):
+        - api: env.control.ExecCmdById
+          envName: ${globals.primaryMasterEnv}
+          nodeId: ${globals.primaryMasterId}
+          commandList:
+            - command: |-
+                counter=0;
+                while true; do
+                  gluster peer probe ${@node.ip} && break;
+                  [ "$counter" -gt 10 ] && { echo "peer probe ${@node.ip} failed"; break; }
+                  counter=$((counter+1)); sleep 2;
+                done;
+          user: root
+
+  # Create the single stretched volume (replica = #regions) and tune for WAN +
+  # split-brain protection (quorum). Idempotent: skips if the volume exists.
+  createStretchedVolume:
+    - api: env.control.ExecCmdById
+      envName: ${globals.primaryMasterEnv}
+      nodeId: ${globals.primaryMasterId}
+      commandList:
+        - command: |-
+            if gluster volume info ${globals.volumeName} 2>/dev/null | grep -q 'Volume Name:'; then
+              echo "volume ${globals.volumeName} already exists, skipping create";
+            else
+              REPLICA=${globals.replicaCount}; counter=1;
+              while true; do
+                echo "Stretched volume create - attempt ${counter}" | tee -a /var/log/glusterfs/glusterd.log;
+                gluster volume create ${globals.volumeName} replica ${REPLICA} transport tcp ${globals.bricksOrdered} force 2>&1 | tee -a /var/log/glusterfs/glusterd.log; res=$?;
+                [ "$res" -eq 0 ] && { echo "created"; break; }
+                [ "$counter" -gt 3 ] && { echo "volume create failed"; exit 1; }
+                sleep 2; counter=$((counter+1));
+              done;
+              gluster volume start ${globals.volumeName};
+            fi;
+            gluster volume set ${globals.volumeName} cluster.quorum-type auto;
+            gluster volume set ${globals.volumeName} cluster.server-quorum-type server;
+            gluster volume set ${globals.volumeName} network.ping-timeout 30;
+            gluster volume set ${globals.volumeName} cluster.choose-local on;
+            gluster volume set ${globals.volumeName} auth.allow 127.0.0.1;
+      user: root
+
+  # FUSE-mount the stretched volume locally on every node, with systemd automount.
+  mountAllNodes:
+    - forEach (node:globals.allNodes):
+      - api: env.control.ExecCmdById
+        envName: ${@node.env}
+        nodeId: ${@node.id}
+        commandList:
+          - command: |-
+              mkdir -p ${globals.replicatedPath};
+              if ! mountpoint -q ${globals.replicatedPath}; then
+                mount.glusterfs localhost:/${globals.volumeName} ${globals.replicatedPath} || { sleep 5; mount.glusterfs localhost:/${globals.volumeName} ${globals.replicatedPath} || true; }
+              fi;
+              chmod 777 ${globals.replicatedPath};
+              sed -i '/glusterfs/d' /etc/fstab;
+              echo "localhost:/${globals.volumeName}  ${globals.replicatedPath}   glusterfs   defaults,_netdev,noauto,x-systemd.automount  0 0" >> /etc/fstab;
+        user: root
+
+  # Persist parameters on the primary env for day-2 add-ons / management.
+  persistGlobals:
+    - env.control.ApplyNodeGroupData[storage]:
+        data:
+          globals: ${globals.toJSON()}

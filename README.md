@@ -25,7 +25,26 @@ layers — modelled on `jelastic-jps/galera-multiregion` but for storage.
   public IPs — default) or **public** (WAN, one public IP per node). See
   *Networking* below.
 
-## Volume model (the two options + slicing)
+## Replication models
+
+Chosen at deploy via **Replication model**:
+
+- **Async geo-replication (default)** — an independent GlusterFS cluster per
+  region; the **primary** region pushes the volume to every secondary via native
+  geo-replication. One-directional (write primary, read secondaries),
+  asynchronous, efficient over WAN. Best for read-heavy / DR / high-latency.
+- **Synchronous stretched cluster** — **all regions form one volume** with
+  `replica = number of regions` (one brick per region per replica set). **Write to
+  any node in any region and it replicates to every region**, synchronously
+  (multi-master). Requires an **odd region count** (3, 5, …) for split-brain
+  quorum. Slicing still applies: more nodes per region ⇒ more replica sets ⇒
+  distributed-replicated capacity. **Tradeoff:** writes wait for all regions, so
+  write latency ≈ cross-region round-trip.
+
+> GlusterFS geo-replication is one-directional by design, so true write-anywhere
+> requires the synchronous model — there is no async multi-master option for files.
+
+## Volume model (async model — single / cluster / slicing)
 
 The install dialog expresses the volume as two dimensions:
 
@@ -54,8 +73,9 @@ scripts/
   getClusterEnvs.js              # discover sibling regional envs by name prefix
   storage-region.jps             # per-region Certified-Storage env (install)
   cluster-logic.jps              # in-region volume lifecycle + elastic scaling (update, permanent)
-  geoReplicationManager.jps      # cross-region geo-rep orchestrator (update, runs in primary)
-  geoReplication.jps             # per-env geo-rep worker (update)
+  geoReplicationManager.jps      # async model: cross-region geo-rep orchestrator (runs in primary)
+  geoReplication.jps             # async model: per-env geo-rep worker
+  syncClusterManager.jps         # sync model: forms one stretched volume across all regions
 addons/
   management.jps                 # operational buttons (status/heal/rebalance), auto-installed on primary
   addRegion.jps                  # day-2: add a new region
@@ -138,7 +158,10 @@ will fail to fetch `scripts/*`. Import `manifest.jps` via the Jelastic dashboard
 ## Day-2 operations
 
 All day-2 add-ons run **against the primary environment** (`envName-1`), where the
-deployment parameters are persisted.
+deployment parameters are persisted. The **management** buttons work in both
+models; **addRegion / forgetRegion / switchNetworkMode** currently target the
+**async (geo-replication)** model — adding/removing a region from a *synchronous
+stretched* cluster (which changes the replica count) is a planned follow-up.
 
 - **Management buttons** (`addons/management.jps`, auto-installed on the primary —
   shown in the env's Add-ons panel):
@@ -173,11 +196,13 @@ deployment parameters are persisted.
 
 ## Status / known gaps
 
-- Geo-replication is **asynchronous and one-directional** (primary → secondaries).
-- **Master promotion / true failover is not implemented** — if the *primary*
-  region is lost, geo-rep is not auto-repointed. Reconfiguration is manual today:
-  use *Forget a region* + *Add a region* to recover. Automatic promotion of a
-  secondary to primary is the main remaining feature.
-- **Guided scale-in add-on** is pending (see *Scaling*).
-- Cannot be validated off-platform; the items under *Networking & firewall* are
-  the most likely to need tuning on a real Virtuozzo Application Platform.
+- **Async model:** geo-replication is one-directional (primary → secondaries);
+  **master promotion / failover is not automated** — if the primary region is
+  lost, recover manually with *Forget a region* + *Add a region*.
+- **Sync model:** day-2 region add/remove (changes the replica count) and online
+  capacity scaling (add one node per region as a new replica set) are planned
+  follow-ups; v1 sets the stretched topology at deploy time. Remember writes are
+  synchronous — size regions/latency accordingly.
+- **Guided scale-in add-on** (async) is pending (see *Scaling*).
+- Cannot be validated off-platform; the items under *Networking* and the geo-rep
+  mountbroker are the most likely to need tuning on a real Virtuozzo platform.

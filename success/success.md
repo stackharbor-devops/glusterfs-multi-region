@@ -7,10 +7,9 @@ Your distributed GlusterFS storage is now running across **${globals.regionsCoun
 - **Primary region (geo-replication source):** `${settings.envName}-1`
 - **Volume name:** `${globals.volumeName}`
 - **Mount point (on every storage node):** `${globals.replicatedPath}`
-- **Per-region layout:** `${globals.topologyDescription}`
+- **Layout:** `${globals.topologyDescription}`
 
-The primary region asynchronously geo-replicates the `${globals.volumeName}` volume
-to every secondary region over GlusterFS native geo-replication (push-pem, SSH).
+${globals.modelDescription}
 
 ## Mounting from your application nodes
 
