@@ -42,7 +42,8 @@ actions:
   # (root's copy is kept too, harmless, in case root@ is ever used).
   appendMasterSSHKey:
     - cmd[storage]: |-
-        JHOME=$(getent passwd jelastic | cut -d: -f6); JHOME=${JHOME:-/home/jelastic};
+        JHOME=$(getent passwd jelastic | cut -d: -f6);
+        [ -z "$JHOME" ] && JHOME=/home/jelastic;
         for H in "$JHOME" /root; do
           mkdir -p "$H/.ssh"; chmod 700 "$H/.ssh";
           echo "${settings.sshPubKey}" >> "$H/.ssh/authorized_keys";
@@ -70,7 +71,8 @@ actions:
   # jelastic user's authorized_keys (root copy kept too).
   addCommonPubKey:
     - cmd[storage]: |-
-        JHOME=$(getent passwd jelastic | cut -d: -f6); JHOME=${JHOME:-/home/jelastic};
+        JHOME=$(getent passwd jelastic | cut -d: -f6);
+        [ -z "$JHOME" ] && JHOME=/home/jelastic;
         for H in "$JHOME" /root; do
           mkdir -p "$H/.ssh"; chmod 700 "$H/.ssh";
           echo '${settings.commonPubKey}' >> "$H/.ssh/authorized_keys";
