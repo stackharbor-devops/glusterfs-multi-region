@@ -145,6 +145,8 @@ actions:
         return { result: 0, onAfterReturn: { install: actions } };
 
   # Create + start one geo-replication session: primary volume -> each secondary.
+  # On failure, dump the gverify logs and probe the jelastic@slave SSH path so the
+  # next run is diagnosable. Non-fatal (|| true) so one bad slave doesn't abort all.
   addSlaveGlusterFS:
     - forEach (slave:globals.glusterfs_slaves_address):
       - api: env.control.ExecCmdById
@@ -152,8 +154,17 @@ actions:
         nodeId: ${nodes.storage.master.id}
         commandList:
           - command: |-
+              set +e;
               gluster volume geo-replication ${globals.volumeName} jelastic@${@slave}::${globals.volumeName} create push-pem force;
-              gluster volume geo-replication ${globals.volumeName} jelastic@${@slave}::${globals.volumeName} start;
+              RC=$?;
+              if [ "$RC" -ne 0 ]; then
+                echo "=== geo-rep create failed (rc=$RC) for ${@slave}; diagnostics ===";
+                echo "--- ssh jelastic@${@slave} test (as root, using /root/.ssh/id_rsa) ---";
+                ssh -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=10 jelastic@${@slave} 'echo SSH_OK; id; ls -ld $HOME/.ssh' 2>&1 | head -10;
+                echo "--- gverify-secondarymnt.log ---"; tail -n 50 /var/log/glusterfs/geo-replication/gverify-secondarymnt.log 2>/dev/null;
+                echo "--- gverify-mastermnt.log ---";    tail -n 30 /var/log/glusterfs/geo-replication/gverify-mastermnt.log 2>/dev/null;
+              fi;
+              gluster volume geo-replication ${globals.volumeName} jelastic@${@slave}::${globals.volumeName} start 2>&1 || true;
 
   # Save deployment parameters as node-group globals on the primary env, so the
   # addRegion add-on can recover volumeName / replicaCount / nodesPerRegion /

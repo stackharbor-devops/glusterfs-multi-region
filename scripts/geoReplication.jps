@@ -37,12 +37,18 @@ actions:
         usermod -a -G geogroup jelastic;
       user: root
 
-  # Trust the primary master's SSH key (all nodes of every env).
+  # Trust the primary master's SSH key. Geo-replication connects as jelastic@slave
+  # via the mountbroker, so the key MUST be in the jelastic user's authorized_keys
+  # (root's copy is kept too, harmless, in case root@ is ever used).
   appendMasterSSHKey:
     - cmd[storage]: |-
-        mkdir -p /root/.ssh; chmod 700 /root/.ssh;
-        echo "${settings.sshPubKey}" >> /root/.ssh/authorized_keys;
-        chmod 600 /root/.ssh/authorized_keys;
+        JHOME=$(getent passwd jelastic | cut -d: -f6); JHOME=${JHOME:-/home/jelastic};
+        for H in "$JHOME" /root; do
+          mkdir -p "$H/.ssh"; chmod 700 "$H/.ssh";
+          echo "${settings.sshPubKey}" >> "$H/.ssh/authorized_keys";
+          chmod 600 "$H/.ssh/authorized_keys";
+        done;
+        chown -R jelastic: "$JHOME/.ssh";
       user: root
 
   # On a slave region: configure the non-root mountbroker for the geo-rep user.
@@ -59,10 +65,16 @@ actions:
         gluster system:: execute gsec_create;
       user: root
 
-  # Trust the geo-replication common secret (all nodes of every env).
+  # Trust the geo-replication common secret (the gsyncd-restricted keys). These
+  # are used by the actual sync connection as jelastic@slave, so they go in the
+  # jelastic user's authorized_keys (root copy kept too).
   addCommonPubKey:
     - cmd[storage]: |-
-        mkdir -p /root/.ssh; chmod 700 /root/.ssh;
-        echo '${settings.commonPubKey}' >> /root/.ssh/authorized_keys;
-        chmod 600 /root/.ssh/authorized_keys;
+        JHOME=$(getent passwd jelastic | cut -d: -f6); JHOME=${JHOME:-/home/jelastic};
+        for H in "$JHOME" /root; do
+          mkdir -p "$H/.ssh"; chmod 700 "$H/.ssh";
+          echo '${settings.commonPubKey}' >> "$H/.ssh/authorized_keys";
+          chmod 600 "$H/.ssh/authorized_keys";
+        done;
+        chown -R jelastic: "$JHOME/.ssh";
       user: root
