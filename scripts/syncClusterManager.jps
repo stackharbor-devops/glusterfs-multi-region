@@ -131,7 +131,7 @@ actions:
           replicaCount: envs.length,
           bricksOrdered: bricks.join(' '),
           allNodes: allNodes,                              // for forEach (works on arrays)
-          allIPsCSV: allIPsCSV,                            // for ${} interpolation in scripts
+          allIPsCSV: allIPsCSV,                            // for string interpolation in scripts
           allowedIPs: ['127.0.0.1'].concat(allIPs).join(','),
           primaryMasterEnv: primaryMaster ? primaryMaster.env : '',
           primaryMasterId:  primaryMaster ? primaryMaster.id : '',
