@@ -20,13 +20,18 @@ globals:
   master_env_name: ${settings.master_env_name:}
 
 onInstall:
-  - script: |
-      return { result: 0 };
+  # Bind the addon card (defined under `addons:` below) to the storage node-
+  # group's Add-Ons panel. Without this call, the addon installs but has no UI
+  # surface — Jelastic only renders addons that an installAddon call has
+  # attached to a node group. (Putting `nodeGroup:` inside the addon block
+  # itself does NOTHING; the binding lives in this action.)
+  - installAddon:
+    - id: glusterfs-mgmt
+      nodeGroup: storage
 
 addons:
   - id: glusterfs-mgmt
     name: GlusterFS Cluster
-    nodeGroup: storage         # show under "GlusterFS Storage : Add-Ons", not just env-level
     description: Status and maintenance for the multi-region GlusterFS cluster.
     buttons:
       - caption: Cluster Status
