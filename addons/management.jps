@@ -26,6 +26,7 @@ onInstall:
 addons:
   - id: glusterfs-mgmt
     name: GlusterFS Cluster
+    nodeGroup: storage         # show under "GlusterFS Storage : Add-Ons", not just env-level
     description: Status and maintenance for the multi-region GlusterFS cluster.
     buttons:
       - caption: Cluster Status
