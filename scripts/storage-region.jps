@@ -26,7 +26,11 @@ nodes:
   - nodeType: storage
     nodeGroup: storage
     count: ${settings.nodes:3}
-    cluster: true
+    # cluster: false -> do NOT use Jelastic's built-in Shared-Storage auto-clustering
+    # (which always makes a pure replica = node-count volume per region). Our
+    # cluster-logic / syncClusterManager owns the volume instead, so we get
+    # distributed-replicated slicing (async) and the stretched volume (sync).
+    cluster: false
     fixedCloudlets: 1
     flexibleCloudlets: 8
     displayName: GlusterFS Storage

@@ -119,22 +119,26 @@ actions:
   # on the storage node group, via the platform firewall API. No-op when the env
   # firewall feature is disabled (nothing is filtered in that case). Works for both
   # internal (GRE) and public (WAN) networking - src ALL covers either source.
+  # Best-effort: the firewall API takes ONE port or ONE range per rule (no comma
+  # lists), so add the GlusterFS/SSH inbound ports as separate rules. Never fail
+  # the install on a firewall hiccup - the cluster + geo-rep are what matter.
   setupFirewall:
     - script: |
         var envName = "${env.name}";
-        var inputRule  = { direction: "INPUT",  name: "glusterfs-in",  protocol: "TCP", ports: "22,24007-24008,49152-49251", src: "ALL", priority: 1080, action: "ALLOW" };
-        var outputRule = { direction: "OUTPUT", name: "glusterfs-out", protocol: "ALL", ports: "1-65535", dst: "ALL", priority: 1000, action: "ALLOW" };
-        if (jelastic.environment.security) {
-          var q = jelastic.billing.account.GetOwnerQuotas(appid, session, "firewall.enabled");
-          if (!q || q.result !== 0) return q;
-          var enabled = (q.array && q.array[0]) ? q.array[0].value : 0;
-          if (enabled) {
-            var r = jelastic.environment.security.AddRule(envName, session, inputRule, "storage");
-            if (!r || r.result !== 0) return r;
-            r = jelastic.environment.security.AddRule(envName, session, outputRule, "storage");
-            if (!r || r.result !== 0) return r;
+        try {
+          if (jelastic.environment.security) {
+            var q = jelastic.billing.account.GetOwnerQuotas(appid, session, "firewall.enabled");
+            var enabled = (q && q.array && q.array[0]) ? q.array[0].value : 0;
+            if (enabled) {
+              var inbound = [["glusterfs-ssh", "22"], ["glusterfs-mgmt", "24007-24008"], ["glusterfs-bricks", "49152-49251"]];
+              for (var i = 0; i < inbound.length; i++)
+                jelastic.environment.security.AddRule(envName, session,
+                  { direction: "INPUT", name: inbound[i][0], protocol: "TCP", ports: inbound[i][1], src: "ALL", priority: 1080, action: "ALLOW" }, "storage");
+              jelastic.environment.security.AddRule(envName, session,
+                { direction: "OUTPUT", name: "glusterfs-out", protocol: "ALL", ports: "", dst: "ALL", priority: 1000, action: "ALLOW" }, "storage");
+            }
           }
-        }
+        } catch (e) { /* firewall is best-effort - never block the install */ }
         return { result: 0 };
 
   # sync mode: enable glusterd + create brick/mount dirs on every node in this
