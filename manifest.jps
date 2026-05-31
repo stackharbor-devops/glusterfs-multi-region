@@ -214,13 +214,22 @@ actions:
         }];
         return { result: 0, onAfterReturn: { 'marketplace.jps.install': actions } };
 
-  # Install the management buttons add-on onto the primary env.
+  # Install the management buttons add-on onto EVERY regional env, so the buttons
+  # are visible and work from any region. Each copy gets the params it needs.
   installManagement:
     - script: |
-        var actions = [{
-          jps: "${baseUrl}/addons/management.jps?_r=${fn.random}",
-          envName: "${settings.envName}-1"
-        }];
+        var envs = '${globals.clusterEnvs}'.split(','), actions = [];
+        for (var i = 0, n = envs.length; i < n; i++) {
+          actions.push({
+            jps: "${baseUrl}/addons/management.jps?_r=${fn.random}",
+            envName: envs[i],
+            settings: {
+              volumeName: "${settings.volumeName}",
+              replicationModel: "${settings.replicationModel}",
+              master_env_name: "${settings.envName}-1"
+            }
+          });
+        }
         return { result: 0, onAfterReturn: { 'marketplace.jps.install': actions } };
 
 success:

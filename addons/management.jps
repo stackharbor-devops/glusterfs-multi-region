@@ -7,12 +7,17 @@ description:
   short: Operational buttons for the multi-region GlusterFS cluster.
 
 # ---------------------------------------------------------------------------
-# Installed automatically onto the PRIMARY env by the orchestrator. Adds buttons
-# (Add-ons panel) that fan operational commands across every region by
-# rediscovering the cluster with getClusterEnvs and targeting each region's
-# storage master. Volume name etc. are recovered from the globals the
-# geo-replication manager persisted at install time.
+# Installed onto EVERY regional env by the orchestrator, so the management
+# buttons are visible and usable from any region. The volume name / model /
+# primary-env are passed in as settings (captured into globals) so each copy is
+# self-sufficient; the cluster's env list is rediscovered at button-press time
+# with getClusterEnvs, so the buttons fan out across all regions from anywhere.
 # ---------------------------------------------------------------------------
+
+globals:
+  volumeName: ${settings.volumeName:data}
+  replicationModel: ${settings.replicationModel:async}
+  master_env_name: ${settings.master_env_name:}
 
 onInstall:
   - script: |
@@ -31,39 +36,27 @@ addons:
         action: geoRepStatus
         loadingText: Querying geo-replication...
         successText: Geo-replication status collected - see the log.
-      - caption: Heal Volumes
+      - caption: Heal Volume(s)
         action: healVolumes
-        confirmText: Trigger a full heal on every region's volume?
+        confirmText: Trigger a full heal on the GlusterFS volume(s)?
         loadingText: Starting heal...
-        successText: Heal started on all regions.
-      - caption: Rebalance Volumes
+        successText: Heal started.
+      - caption: Rebalance Volume(s)
         action: rebalanceVolumes
-        confirmText: Start a rebalance (redistribute data) on every region's volume?
+        confirmText: Start a rebalance (redistribute data) on the GlusterFS volume(s)?
         loadingText: Starting rebalance...
-        successText: Rebalance started on all regions.
+        successText: Rebalance started.
 
 actions:
-  importGlobalsFromNodeGroup:
-    - script: |
-        var resp = api.env.control.GetNodeGroups("${env.name}", session);
-        if (resp.result != 0) return resp;
-        var groups = resp.object, globals;
-        for (var i = 0, n = groups.length; i < n; i++)
-          if (groups[i].name == "${this}" && groups[i].globals) {
-            globals = new org.yaml.snakeyaml.Yaml().load(groups[i].globals);
-            break;
-          }
-        return { result: 0, onAfterReturn: { setGlobals: globals || {} } };
-
+  # Rediscover all regional envs from the current env-name prefix (works anywhere).
   getClusterEnvs:
     - script: ${baseUrl}/scripts/getClusterEnvs.js
       envName: ${env.envName}
     - setGlobals:
         clusterEnvs: ${response.items.join(,)}
 
-  # Build a list of {env, id} for every region's storage master, then run the
-  # given command on each. command is passed via ${this.command} (JPS-level, so
-  # it is not re-parsed as JS - safe for quotes/semicolons).
+  # Run a command on every region's storage master. command is passed via
+  # ${this.command} (already-resolved string - safe for quotes/semicolons).
   runOnEachMaster:
     - script: |
         var envs = '${globals.clusterEnvs}'.split(','), list = [];
@@ -83,25 +76,33 @@ actions:
             - command: ${this.command}
 
   clusterStatus:
-    - importGlobalsFromNodeGroup: storage
     - getClusterEnvs
     - runOnEachMaster:
         command: echo ===== PEERS =====; gluster peer status; echo ===== INFO =====; gluster volume info ${globals.volumeName}; echo ===== STATUS =====; gluster volume status ${globals.volumeName}
 
+  # Geo-replication only exists in async mode and only on the primary env - always
+  # target it so the button is meaningful from any region.
   geoRepStatus:
-    - importGlobalsFromNodeGroup: storage
-    - cmd[${nodes.storage.master.id}]: |-
-        gluster volume geo-replication ${globals.volumeName} status || echo "No geo-replication sessions configured.";
+    - script: |
+        var resp = jelastic.env.control.GetEnvInfo('${globals.master_env_name}', session);
+        if (resp.result != 0) return resp;
+        var mid = null;
+        for (var l = 0, k = resp.nodes; l < k.length; l++)
+          if (k[l].nodeGroup == 'storage' && k[l].ismaster) mid = k[l].id;
+        return { result: 0, onAfterReturn: { setGlobals: { masterNodeId: mid } } };
+    - api: env.control.ExecCmdById
+      envName: ${globals.master_env_name}
+      nodeId: ${globals.masterNodeId}
+      commandList:
+        - command: gluster volume geo-replication ${globals.volumeName} status || echo "No geo-replication sessions (synchronous mode, or none configured)."
       user: root
 
   healVolumes:
-    - importGlobalsFromNodeGroup: storage
     - getClusterEnvs
     - runOnEachMaster:
         command: gluster volume heal ${globals.volumeName} full
 
   rebalanceVolumes:
-    - importGlobalsFromNodeGroup: storage
     - getClusterEnvs
     - runOnEachMaster:
         command: gluster volume rebalance ${globals.volumeName} start
