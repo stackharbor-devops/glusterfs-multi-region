@@ -142,58 +142,61 @@ settings:
         value: false
 
     onBeforeInit: |
-      // If the orchestrator pre-configured us (deployBackupServer flow), short-
-      // circuit the dialog and use the inlined settings as-is. The values
-      // arrive via `settings.preconfigured == 'true'` and full settings keys.
-      if ('${settings.preconfigured:false}' == 'true') {
-        return { result: 0, settings: settings };
-      }
-      // Populate the storageName dropdown with the user's existing envs.
-      var resp = jelastic.environment.control.GetEnvs(appid, session), vals = {};
-      if (resp && resp.result == 0) {
-        for (var i = 0; i < resp.infos.length; i++) {
-          var info = resp.infos[i];
-          if (!info || !info.env || info.env.envName == '${env.envName}') continue;
-          var nm = info.env.envName, dn = info.env.displayName || nm;
-          vals[nm] = dn + " (" + nm + ")";
+      var vals = {};
+      try {
+        var resp = jelastic.environment.control.GetEnvs(appid, session);
+        if (resp && resp.result == 0 && resp.infos) {
+          for (var i = 0; i < resp.infos.length; i++) {
+            var info = resp.infos[i];
+            if (!info || !info.env) continue;
+            if (info.env.envName == '${env.envName}') continue;
+            vals[info.env.envName] = info.env.displayName || info.env.envName;
+          }
         }
-      }
-      if (!Object.keys(vals).length) {
-        return { result: 0, settings: { fields: [
-          { type: "displayfield", cls: "warning", hideLabel: true, height: 50,
-            markup: "No other environments found. Either redeploy the cluster with 'Deploy a backup server' ticked, or create a Jelastic Backup Storage env first then re-import this addon." }
-        ] } };
-      }
+      } catch (e) { /* leave vals empty; dropdown stays empty but form renders */ }
       for (var f = 0; f < settings.fields.length; f++) {
-        if (settings.fields[f].name == 'storageName') settings.fields[f].values = vals;
+        if (settings.fields[f] && settings.fields[f].name == 'storageName') {
+          settings.fields[f].values = vals;
+        }
       }
       return { result: 0, settings: settings };
 
   restore:
     fields: []
     onBeforeInit: |
-      // List restic snapshots on the master node so the user can pick one.
-      var resp = api.env.control.ExecCmdById({
-        envName: '${env.envName}', session: session,
-        nodeId: '${nodes.storage.master.id}',
-        commandList: toJSON([{ command: "[ -x /root/glusterfs-backup-run.sh ] && /root/glusterfs-backup-list.sh 2>/dev/null || echo '[]'" }])
-      });
       var snapshots = [];
-      try { snapshots = JSON.parse(resp.responses[0].out || '[]'); } catch(e) {}
-      var values = {};
+      try {
+        var resp = api.env.control.ExecCmdById({
+          envName: '${env.envName}', session: session,
+          nodeId: '${nodes.storage.master.id}',
+          commandList: toJSON([{ command: "[ -x /root/glusterfs-backup-list.sh ] && /root/glusterfs-backup-list.sh 2>/dev/null || echo '[]'" }])
+        });
+        snapshots = JSON.parse(resp.responses[0].out || '[]');
+      } catch (e) { snapshots = []; }
       if (!snapshots.length) {
         return { result: 0, settings: { fields: [
           { type: "displayfield", cls: "warning", hideLabel: true, height: 60,
-            markup: "No restic snapshots found. Run 'Backup Now' first to create one." }
+            markup: "No restic snapshots found. Run Backup first to create one." }
         ] } };
       }
+      // Canonical array-of-{value,caption} form — same pattern the official
+      // jelastic-jps/kubernetes addons use. The map-form values: {k:v} can
+      // render but the platform does not always bind the user's selection to
+      // settings.<name> at submit, which caused the restore command to run
+      // with the placeholder literally.
+      var snapList = [];
       for (var i = 0; i < snapshots.length; i++) {
         var s = snapshots[i];
-        values[s.id] = (s.time || '').slice(0, 19).replace('T', ' ') + "  " + (s.short_id || s.id.slice(0, 8)) + "  " + (s.hostname || '');
+        var when = (s.time || '').slice(0, 19).replace('T', ' ');
+        var sid = (s.short_id || (s.id || '').slice(0, 8));
+        snapList.push({ value: s.id, caption: when + "  " + sid });
       }
       return { result: 0, settings: { fields: [
-        { type: "list", name: "snapshotId", caption: "Snapshot to restore", required: true, values: values },
-        { type: "string", name: "restorePath", caption: "Restore target", default: "/data", required: true,
+        { type: "list", name: "snapshotId", caption: "Snapshot to restore",
+          required: true, editable: false, forceSelection: true,
+          values: snapList },
+        { type: "string", name: "restorePath", caption: "Restore target",
+          default: "/data", required: true,
           regex: "^/[a-zA-Z0-9/_-]+$",
           regexText: "Must start with / and contain only letters/digits/dash/underscore." },
         { type: "displayfield", hideLabel: true, cls: "warning", height: 60,
@@ -231,28 +234,28 @@ addons:
     permanent: true
     description: Scheduled restic backups of the GlusterFS volume, with one-click restore.
     buttons:
-      - caption: Backup Now
+      - caption: Backup
         action: backupNow
-        confirmText: "Run a backup now? (Uses the configured schedule's storage + path.)"
+        confirmText: "Run a backup now?"
         loadingText: Backing up...
-        successText: "Backup completed - check the env Tasks log for restic output."
-      - caption: Configure
+        successText: "Backup completed - see Tasks log."
+      - caption: Config
         action: configure
         settings: main
         submitButtonText: Save
-        loadingText: Configuring...
+        loadingText: Saving...
         successText: "Schedule + storage updated."
       - caption: Restore
         action: restore
         settings: restore
         submitButtonText: Restore
         title: Restore Backup
-        confirmText: "Restore the selected snapshot to the target path? Overwrites files at the target, and replicates to every region."
+        confirmText: "Restore the selected snapshot? Overwrites files at the target and replicates to every region."
         loadingText: Restoring...
         successText: "Restore complete."
-      - caption: Verify Backups
+      - caption: Verify
         action: verifyBackups
-        confirmText: "Run restic check to verify backup integrity? This reads the entire repo."
+        confirmText: "Run restic check on the backup repo?"
         loadingText: Verifying...
         successText: "Restic check complete - see Tasks log."
 
@@ -489,8 +492,10 @@ actions:
         EOF
         chmod +x /root/glusterfs-backup-locked.sh;
 
-        # Restore runner.
-        cat > /root/glusterfs-backup-restore.sh <<EOF
+        # Restore runners.
+        #   glusterfs-backup-restore-by-id.sh <snap-id> [target]  - CLI style
+        #   glusterfs-backup-restore-by-files.sh                  - reads /root/.restore-{snap,path}
+        cat > /root/glusterfs-backup-restore-by-id.sh <<EOF
         #!/bin/bash
         set -e
         SNAP_ID="\$1"; TARGET="\$2"
@@ -498,14 +503,29 @@ actions:
         REPO=\$REPO_ROOT/${env.envName}
         export RESTIC_PASSWORD='${globals.resticPassword}'
         export RESTIC_REPOSITORY="\$REPO"
-        [ -z "\$SNAP_ID" ] && { echo "usage: \$0 <snapshot-id> <target-path>"; exit 1; }
+        [ -z "\$SNAP_ID" ] && { echo "usage: \$0 <snapshot-id> [target-path]"; exit 1; }
         [ -z "\$TARGET" ] && TARGET=${globals.sourcePath}
         mountpoint -q "\$REPO_ROOT" || mount -t nfs4 -o vers=4,nolock,bg,intr "${settings.storageName}":/data /opt/backup || true
         if ! mountpoint -q "\$REPO_ROOT"; then echo "ERROR: backup repo \$REPO_ROOT is not mounted"; exit 1; fi
         echo "Restoring snapshot \$SNAP_ID to \$TARGET"
         restic restore "\$SNAP_ID" --target "\$TARGET" --verbose
         EOF
-        chmod +x /root/glusterfs-backup-restore.sh;
+        chmod +x /root/glusterfs-backup-restore-by-id.sh;
+
+        cat > /root/glusterfs-backup-restore-by-files.sh <<EOF
+        #!/bin/bash
+        set -e
+        SNAP_ID=\$(cat /root/.restore-snap 2>/dev/null)
+        TARGET=\$(cat /root/.restore-path 2>/dev/null)
+        [ -z "\$TARGET" ] && TARGET=${globals.sourcePath}
+        exec /root/glusterfs-backup-restore-by-id.sh "\$SNAP_ID" "\$TARGET"
+        EOF
+        chmod +x /root/glusterfs-backup-restore-by-files.sh;
+
+        # Backwards compat: the old positional-args restore runner. Some
+        # versions of the addon (or the platform) pass the args via the
+        # action body's placeholders; keep working if they do.
+        ln -sf /root/glusterfs-backup-restore-by-id.sh /root/glusterfs-backup-restore.sh;
 
         # JSON snapshot lister for the Restore button's onBeforeInit.
         cat > /root/glusterfs-backup-list.sh <<EOF
@@ -565,9 +585,27 @@ actions:
         /root/glusterfs-backup-locked.sh
       user: root
 
+  # Restore: stash the user's form selections to files via the same pattern
+  # the official jelastic-jps/backup-addon (wp-backup) uses — write them out
+  # in a separate cmd, then call the runner which reads from them. This
+  # decouples placeholder interpolation from the runner's argv parsing and
+  # gives us a clear, debuggable failure mode if interpolation misbehaves.
   restore:
     - cmd[${nodes.storage.master.id}]: |-
-        /root/glusterfs-backup-restore.sh '${settings.snapshotId}' '${settings.restorePath}'
+        printf '%s' '${settings.snapshotId}' > /root/.restore-snap
+        printf '%s' '${settings.restorePath}' > /root/.restore-path
+        # Sanity: if the placeholders didn't get bound (form value not
+        # transmitted), refuse to call restic with bogus input.
+        SNAP=$(cat /root/.restore-snap)
+        if [ -z "$SNAP" ] || [ "${SNAP#\$\{}" != "$SNAP" ]; then
+          echo "ERROR: snapshot ID was not transmitted by the form (got: '$SNAP')." >&2
+          echo "Workaround: list snapshots manually and run restore from CLI:" >&2
+          echo "  /root/glusterfs-backup-list.sh   # find your snapshot id" >&2
+          echo "  /root/glusterfs-backup-restore-by-id.sh <snap-id> /data" >&2
+          exit 2
+        fi
+      user: root
+    - cmd[${nodes.storage.master.id}]: /root/glusterfs-backup-restore-by-files.sh
       user: root
 
   verifyBackups:
