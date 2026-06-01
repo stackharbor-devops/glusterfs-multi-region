@@ -1,108 +1,53 @@
 type: install
-version: 1.0
+version: 2.0
 id: glusterfs-multiregion
-name: Multi-Region GlusterFS Cluster
+name: Multi-Region GlusterFS Cluster (Write-Anywhere)
 baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
 homepage: https://github.com/stackharbor-devops/glusterfs-multi-region
 description:
   text: |
-    Deploys an independent GlusterFS storage cluster in each of several cloud
-    regions and connects them with native GlusterFS geo-replication. Each region
-    can be a single node (geo-replication only) or a multi-node cluster using
-    replicated or distributed-replicated volumes, so capacity scales by adding
-    replica sets ("slices") while redundancy is preserved.
-  short: Multi-region GlusterFS with distributed-replicated volumes and geo-replication.
+    Deploys ONE synchronous GlusterFS volume spanning every selected region.
+    Every node in every region can take writes, all data replicates synchronously
+    to all regions. Requires an odd number of regions (3, 5, 7) for split-brain
+    quorum. Add more nodes per region to grow capacity (distributed-replicated).
+    Writes wait for cross-region acknowledgement, so size regions for the latency
+    your workload tolerates.
+  short: Write-anywhere multi-region GlusterFS (synchronous stretched cluster).
 categories:
   - apps/clusters
 
 # ---------------------------------------------------------------------------
-# Install dialog (rendered dynamically by onBeforeInit). Volume model:
-#   replicaCount  = copies per file in a region (redundancy)
-#   replicaSets   = capacity slices / distribution width
-#   nodesPerRegion = replicaCount * replicaSets   (computed in initGlobals)
-# replicaSets = 1            -> pure replicated (mirror)
-# replicaSets > 1            -> distributed-replicated (scales capacity)
-# topology = single          -> 1 node/region, single-brick volume, geo-rep only
+# Install dialog. Sync-only (write-anywhere multi-master) — every node in every
+# region can take writes, all regions stay in sync via GlusterFS replica = N.
 #
-# UX uses showIf to hide irrelevant fields based on the chosen model:
-#   - replicationModel = async -> reveals topology + replica config
-#       - topology = cluster -> reveals replicaCount + capacity slices
-#       - topology = single  -> no extra fields
-#   - replicationModel = sync  -> reveals only "nodes per region" spinner
-#                                 (replica = number of regions, auto)
+# Volume model:
+#   replicaCount  = number of regions (1 brick per region per replica set)
+#   replicaSets   = nodes per region (= capacity slices)
+#   nodesPerRegion = replicaSets
+#   total bricks  = regions * replicaSets
+#
+# Requirements: odd number of regions (3, 5, 7) for split-brain quorum.
+#
+# IMPORTANT: `markup:` in displayfield does NOT parse HTML on this platform
+# version - use plain text only (no <p>/<b>/etc., they render as literal text).
 # ---------------------------------------------------------------------------
 onBeforeInit: |
-  var minPerSet = 2, maxSame = 0, maxTotal = 0;
+  var maxSame = 0;
   var hasCollaboration = (parseInt('${fn.compareEngine(7.0)}', 10) >= 0);
   try {
     if (hasCollaboration) {
-      maxSame  = parseInt('${quota.environment.maxsamenodescount}', 10) || 0;
-      maxTotal = parseInt('${quota.environment.maxnodescount}', 10) || 0;
+      maxSame = parseInt('${quota.environment.maxsamenodescount}', 10) || 0;
     } else {
-      maxSame  = jelastic.billing.account.GetQuotas('environment.maxsamenodescount').array[0].value;
-      maxTotal = jelastic.billing.account.GetQuotas('environment.maxnodescount').array[0].value;
+      maxSame = jelastic.billing.account.GetQuotas('environment.maxsamenodescount').array[0].value;
     }
-  } catch (e) { maxSame = 0; maxTotal = 0; }
-
-  // Async cluster: total nodes/region = replicaCount * replicaSets, so the max
-  // # of slices is maxSame / minReplicaCount(2). Sync: nodes/region is bounded
-  // only by maxSame (replica is fixed at #regions).
-  var maxSetsAsync = (maxSame >= minPerSet) ? Math.floor(maxSame / minPerSet) : 1;
-  if (maxSetsAsync < 1) maxSetsAsync = 1;
-  var maxNodesSync = (maxSame > 0) ? maxSame : 16;
-
-  // Topology block revealed only when async + cluster. replicaCount default 3,
-  // capacity slices default 1 (= pure replicated; bump to >1 for distributed-rep).
-  var asyncClusterFields = [
-    { type: "list", name: "replicaCount", caption: "Replica count (copies of every file)",
-      "default": "3", required: true, editable: false,
-      values: [
-        { value: "2", caption: "2 copies" },
-        { value: "3", caption: "3 copies (recommended)" }
-      ] },
-    { type: "spinner", name: "replicaSets",
-      caption: "Capacity slices (distributed-replicated)",
-      min: 1, max: maxSetsAsync, "default": 1 }
-  ];
-
-  // Block revealed for async model: topology choice + (if cluster) the above.
-  var asyncFields = [
-    { type: "list", name: "topology", caption: "Per-region topology",
-      "default": "cluster", required: true, editable: false,
-      values: [
-        { value: "single",  caption: "Single node per region (geo-replication only)" },
-        { value: "cluster", caption: "Cluster per region (replicated / distributed-replicated)" }
-      ],
-      showIf: { "cluster": asyncClusterFields } }
-  ];
-
-  // Block revealed for sync model: a single nodes/region spinner. The
-  // replica count is auto-set to the number of regions, so it does not appear.
-  var syncFields = [
-    { type: "displayfield", hideLabel: true, cls: "info", height: 50,
-      markup: "<p>Synchronous stretched cluster requires an <b>odd</b> number of regions (3, 5, 7) for quorum. Replica count is automatic (= number of regions). Writes are synchronous, so write latency reflects cross-region round-trip time.</p>" },
-    { type: "spinner", name: "replicaSets",
-      caption: "Nodes per region (each adds a capacity slice)",
-      min: 1, max: maxNodesSync, "default": 1 }
-  ];
+  } catch (e) { maxSame = 0; }
+  var maxNodes = (maxSame > 0) ? maxSame : 16;
 
   var fields = [
-    // Intro / one-line context
-    { type: "displayfield", hideLabel: true, height: 30, markup:
-      "<p>Pick the replication model first, then regions. Topology fields below adapt to your choices.</p>" },
-
-    // The biggest decision — model — comes first, reveals mode-specific fields.
-    { type: "list", name: "replicationModel", caption: "Replication model",
-      "default": "async", required: true, editable: false,
-      values: [
-        { value: "async", caption: "Async geo-replication - one-way primary->secondaries (fast local writes, DR)" },
-        { value: "sync",  caption: "Synchronous stretched cluster - write to ANY region (write-anywhere; WAN latency)" }
-      ],
-      showIf: { "async": asyncFields, "sync": syncFields } },
-
-    // Regions
-    { type: "regionlist", name: "regions", caption: "Regions", multiSelect: true,
-      required: true, min: 2, max: 7, disableInactive: true, selectFirstAvailable: false },
+    // Regions — odd count required for quorum
+    { type: "regionlist", name: "regions", caption: "Regions",
+      multiSelect: true, required: true, min: 3, max: 7,
+      disableInactive: true, selectFirstAvailable: false },
 
     // Networking
     { type: "list", name: "networkMode", caption: "Cross-region networking",
@@ -112,27 +57,31 @@ onBeforeInit: |
         { value: "public",   caption: "Public WAN - attaches a public IPv4 to every storage node" }
       ] },
 
+    // Capacity — sync mode: one node per region = baseline; each extra node per
+    // region adds another replica set / capacity slice.
+    { type: "spinner", name: "replicaSets",
+      caption: "Nodes per region (capacity slices)",
+      min: 1, max: maxNodes, "default": 1 },
+
     // Volume
-    { type: "string", name: "volumeName", caption: "Volume name", "default": "data", required: true,
-      regex: "^[a-zA-Z0-9_-]+$", regexText: "Volume name: letters, digits, dash, underscore only." },
-    { type: "string", name: "mountPoint", caption: "Mount point", "default": "/data", required: true,
-      regex: "^/[a-zA-Z0-9/_-]+$", regexText: "Mount point must start with / and use letters/digits/dash/underscore." },
+    { type: "string", name: "volumeName", caption: "Volume name",
+      "default": "data", required: true,
+      regex: "^[a-zA-Z0-9_-]+$",
+      regexText: "Volume name: letters, digits, dash, underscore only." },
+    { type: "string", name: "mountPoint", caption: "Mount point",
+      "default": "/data", required: true,
+      regex: "^/[a-zA-Z0-9/_-]+$",
+      regexText: "Mount point must start with / and use letters/digits/dash/underscore." },
 
     // Env name
-    { type: "envname", name: "envName", caption: "Environment", required: true, randomName: true }
+    { type: "envname", name: "envName", caption: "Environment",
+      required: true, randomName: true }
   ];
 
-  // Quota warning if cluster mode is impossible (< 3 nodes/env allowed).
-  if (maxSame > 0 && maxSame < 3) {
-    fields.unshift({ type: "displayfield", cls: "warning", hideLabel: true, height: 50,
-      markup: "<p>Your account allows max <b>" + maxSame + "</b> nodes of the same type per environment - only 'Single node per region' (async) will fit; cluster modes need at least 3 same-type nodes. Upgrade your account for in-region clustering.</p>" });
-  }
-
-  if (maxSame > 0 && maxSame < 3) {
-    fields.unshift({ type: "displayfield", cls: "warning", hideLabel: true, height: 45,
-      markup: "Your account allows max " + maxSame + " nodes of the same type per environment. " +
-              "'Cluster per region' with replica 3 needs at least 3 nodes - only 'Single node per region' " +
-              "will fit. Upgrade your account for in-region clustering." });
+  // Quota warning if cluster cannot fit (need 1 node/region minimum, regions >= 3).
+  if (maxSame > 0 && maxSame < 1) {
+    fields.unshift({ type: "displayfield", cls: "warning", hideLabel: true, height: 40,
+      markup: "Your account has no storage-node quota. Upgrade to deploy this package." });
   }
 
   return { result: 0, settings: { fields: fields } };
@@ -143,49 +92,32 @@ onInstall:
       envGroup: GlusterFS Cluster ${settings.envName}
   - createEnvs
   - getClusterEnvs
-  - if ('${settings.replicationModel}' == 'sync'):
-      - setupSyncCluster
-  - if ('${settings.replicationModel}' != 'sync'):
-      - setupGeoReplication
+  - setupSyncCluster
   - installManagement
 
 actions:
-  # Resolve regions -> domains, derive node counts, set primary = region 1.
+  # Resolve regions -> domains, derive node counts. Sync-only: replica = #regions,
+  # nodes/region = settings.replicaSets (capacity slices), total bricks = product.
   initGlobals:
     - script: |
         var regions = '${settings.regions}'.split(','), index, resp,
             onAfterReturn = { setGlobals: {} }, glbs = onAfterReturn.setGlobals;
-        var model = '${settings.replicationModel}';
 
-        if (regions.length < 2)
-          return { result: 1, error: "Select at least 2 regions." };
+        if (regions.length < 3 || (regions.length % 2) == 0)
+          return { result: 1, error: "Synchronous stretched cluster (write-anywhere) requires an ODD number of regions (3, 5, 7) for split-brain quorum. You selected " + regions.length + "." };
 
-        var replica, sets, nodesPerRegion, desc, modelDesc;
-        if (model == 'sync') {
-          if (regions.length < 3 || (regions.length % 2) == 0)
-            return { result: 1, error: "Synchronous stretched cluster (write-anywhere) requires an ODD number of regions (3, 5, ...) for quorum. You selected " + regions.length + "." };
-          sets = parseInt('${settings.replicaSets}', 10) || 1;   // nodes/region = capacity slices
-          replica = regions.length;                              // one replica per region
-          nodesPerRegion = sets;
-          desc = regions.length + "-region synchronous stretched cluster, " + sets + " slice(s) = " + nodesPerRegion + " node(s)/region, replica " + replica;
-          modelDesc = "All regions form ONE synchronous stretched volume - write to any node in any region and it replicates to every region. Writes are synchronous, so write latency reflects cross-region round-trips.";
-        } else {
-          var topology = '${settings.topology}';
-          replica = (topology == 'single') ? 1 : parseInt('${settings.replicaCount}', 10);
-          sets    = (topology == 'single') ? 1 : parseInt('${settings.replicaSets}', 10);
-          nodesPerRegion = (topology == 'single') ? 1 : (replica * sets);
-          desc = (topology == 'single')
-            ? "1 node per region (single-brick volume, geo-replicated)"
-            : (nodesPerRegion + " nodes per region = replica " + replica + " x " + sets + " set(s)");
-          modelDesc = "The primary region (${settings.envName}-1) asynchronously geo-replicates the volume to every secondary region (one-directional).";
-        }
+        var sets    = parseInt('${settings.replicaSets}', 10) || 1;
+        var replica = regions.length;
+        var nodesPerRegion = sets;
+        var desc = regions.length + "-region synchronous stretched cluster, " + sets + " slice(s) = " + nodesPerRegion + " node(s)/region, replica " + replica;
+        var modelDesc = "All regions form ONE synchronous stretched volume. Write to any node in any region and it replicates synchronously to every other region. Writes pay cross-region round-trip latency.";
 
-        glbs["replicaCount"]    = replica;
-        glbs["nodesPerRegion"]  = nodesPerRegion;
-        glbs["regionsCount"]    = regions.length;
-        glbs["volumeName"]      = '${settings.volumeName}';
-        glbs["replicatedPath"]  = '${settings.mountPoint}';
-        glbs["replicationModel"]= model;
+        glbs["replicaCount"]        = replica;
+        glbs["nodesPerRegion"]      = nodesPerRegion;
+        glbs["regionsCount"]        = regions.length;
+        glbs["volumeName"]          = '${settings.volumeName}';
+        glbs["replicatedPath"]      = '${settings.mountPoint}';
+        glbs["replicationModel"]    = 'sync';
         glbs["topologyDescription"] = desc;
         glbs["modelDescription"]    = modelDesc;
 
@@ -223,7 +155,7 @@ actions:
               "volumeName": "${settings.volumeName}",
               "mountPoint": "${settings.mountPoint}",
               "networkMode": "${settings.networkMode}",
-              "replicationModel": "${settings.replicationModel}"
+              "replicationModel": "sync"
             }
           });
         }
@@ -235,26 +167,6 @@ actions:
       envName: ${settings.envName}-1
     - setGlobals:
         clusterEnvs: ${response.items.join(,)}
-
-  # Install the geo-replication manager into the primary env; it wires the rest.
-  setupGeoReplication:
-    - script: |
-        var actions = [{
-          jps: "${baseUrl}/scripts/geoReplicationManager.jps?_r=${fn.random}",
-          envName: "${settings.envName}-1",
-          settings: {
-            "master_env_name": "${settings.envName}-1",
-            "volumeName": "${settings.volumeName}",
-            "networkMode": "${settings.networkMode}",
-            "envNamePrefix": "${settings.envName}",
-            "replicaCount": "${globals.replicaCount}",
-            "nodesPerRegion": "${globals.nodesPerRegion}",
-            "mountPoint": "${settings.mountPoint}",
-            "replicationModel": "async",
-            "install_gluster_cluster": "true"
-          }
-        }];
-        return { result: 0, onAfterReturn: { 'marketplace.jps.install': actions } };
 
   # Form one synchronous volume spanning all regions (write-anywhere multi-master).
   setupSyncCluster:
@@ -285,7 +197,7 @@ actions:
             envName: envs[i],
             settings: {
               volumeName: "${settings.volumeName}",
-              replicationModel: "${settings.replicationModel}",
+              replicationModel: "sync",
               master_env_name: "${settings.envName}-1"
             }
           });
