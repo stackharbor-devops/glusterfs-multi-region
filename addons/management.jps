@@ -159,6 +159,17 @@ actions:
           echo ===== INFO  =====; gluster volume info ${globals.volumeName};
           echo ===== STATUS ====; gluster volume status ${globals.volumeName};
           echo ===== AUTH.ALLOW ====; gluster volume info ${globals.volumeName} | grep auth.allow;
+          echo ===== LAST BACKUP =====;
+          if [ -f /var/lib/glusterfs-backup/last-success.json ]; then
+            if command -v jq >/dev/null 2>&1; then
+              jq -r '"started: \(.started_at // "?")\nfinished: \(.finished_at // "?")\nsnapshot: \(.summary.snapshot_id // "?")\nfiles_new: \(.summary.files_new // 0)\nfiles_changed: \(.summary.files_changed // 0)\ndata_added_bytes: \(.summary.data_added // 0)\ntotal_files: \(.summary.total_files_processed // 0)\ntotal_bytes: \(.summary.total_bytes_processed // 0)\nduration_sec: \(.summary.total_duration // 0)"' /var/lib/glusterfs-backup/last-success.json;
+            else
+              cat /var/lib/glusterfs-backup/last-success.json;
+            fi;
+          else
+            echo "(no successful backup recorded on this node)";
+            echo "Backups run only on the PRIMARY env's storage master, so this line will show 'no recorded backup' on every other region — that is expected.";
+          fi;
 
   op_heal:
     - fanOutToMasters:

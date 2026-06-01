@@ -263,6 +263,14 @@ globals:
   # makes our backups discoverable on the storage server via the vendor's
   # getBackups.sh <envName> CLI.
   resticPassword: ${env.envName}
+  # Forensic metadata baked into every snapshot via --tag. Captured at install
+  # time; persisted in node-group globals; written into the runner script.
+  # When orchestrator-installed these come from manifest.jps; when imported
+  # manually, defaults derive sensible values from the env context.
+  cluster_id:          ${settings.cluster_id:${env.envName}}
+  primary_region_name: ${settings.primary_region_name:unknown}
+  backup_region_name:  ${settings.backup_region_name:unknown}
+  volume_name:         ${settings.volume_name:data}
 
 # ---------------------------------------------------------------------------
 # Actions
@@ -397,6 +405,9 @@ actions:
   writeBackupScripts:
     - cmd[storage]: |-
         mkdir -p /opt/backup;
+        # Make sure the status-surfacing dir exists (for last-success.json)
+        mkdir -p /var/lib/glusterfs-backup;
+
         cat > /root/glusterfs-backup-run.sh <<EOF
         #!/bin/bash
         set -e
@@ -405,9 +416,12 @@ actions:
         SRC=${globals.sourcePath}
         KEEP=${globals.backupCount}
         ALWAYS_UMOUNT=${globals.isAlwaysUmount}
+        STATUS_DIR=/var/lib/glusterfs-backup
+        CRON_TAG='${globals.cron}'
         export RESTIC_PASSWORD='${globals.resticPassword}'
         export RESTIC_REPOSITORY="\$REPO"
 
+        mkdir -p "\$STATUS_DIR"
         mountpoint -q "\$REPO_ROOT" || mount -t nfs4 -o vers=4,nolock,bg,intr "${settings.storageName}":/data /opt/backup || true
         if ! mountpoint -q "\$REPO_ROOT"; then echo "ERROR: backup repo \$REPO_ROOT is not mounted"; exit 1; fi
         mkdir -p "\$REPO"
@@ -415,8 +429,28 @@ actions:
         # Initialise repo if empty
         restic snapshots >/dev/null 2>&1 || restic init
 
-        # Backup the FUSE mount (live view of the sync stretched volume)
-        restic backup "\$SRC" --tag glusterfs-multiregion --host "\$(hostname)" --verbose
+        # Backup the FUSE mount (live view of the sync stretched volume) with
+        # forensic metadata so cross-cluster shared storage stays disambiguable.
+        TS_START=\$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        TMP_OUT=\$(mktemp)
+        restic backup "\$SRC" \\
+          --tag glusterfs-multiregion \\
+          --tag cluster=${globals.cluster_id} \\
+          --tag primary-env=${env.envName} \\
+          --tag region-of-runner=${globals.primary_region_name} \\
+          --tag backup-server-region=${globals.backup_region_name} \\
+          --tag volume=${globals.volume_name} \\
+          --tag schedule="\$CRON_TAG" \\
+          --host "\$(hostname)" --json | tee "\$TMP_OUT"
+        TS_END=\$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+        # Record the run's summary for the management addon's status panel.
+        SUMMARY_LINE=\$(grep -E '"message_type":"summary"' "\$TMP_OUT" | tail -1)
+        if [ -n "\$SUMMARY_LINE" ]; then
+          printf '{"started_at":"%s","finished_at":"%s","summary":%s}\\n' "\$TS_START" "\$TS_END" "\$SUMMARY_LINE" > "\$STATUS_DIR/last-success.json"
+        fi
+        rm -f "\$TMP_OUT"
+
         restic forget --keep-last "\$KEEP" --prune
 
         if [ "\$ALWAYS_UMOUNT" = "true" ]; then umount "\$REPO_ROOT" || true; fi
