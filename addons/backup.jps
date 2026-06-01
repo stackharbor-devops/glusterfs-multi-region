@@ -3,20 +3,25 @@ jpsVersion: 6.1.1
 name: GlusterFS Backup/Restore
 id: glusterfs-backup
 targetEditions: any
+logo: https://raw.githubusercontent.com/jelastic-jps/backup-storage/main/images/backup-logo.svg
 description:
-  short: Scheduled restic backups of the multi-region GlusterFS volume, with one-click restore.
+  short: Snapshot the GlusterFS volume to a Jelastic backup-storage env (single backup per cluster).
   text: |
-    One backup per multi-region cluster, run from the primary env's storage
-    master (single writer). Backs up the GlusterFS volume's mount (default
-    `/data`) via restic to a Jelastic backup-storage env over NFS. Uses the
-    vendor backup-storage convention (repo at /data/<envName>, env-name as the
-    restic password), so the storage server's `getBackups.sh` CLI works against
-    these backups.
-    Schedules from every 1 minute to every 24 hours; restore to any snapshot.
+    ONE backup per multi-region cluster - runs only on the primary env's
+    storage master (regardless of how many regions or nodes you have), since
+    the volume is sync-replicated and backing up from every region would
+    duplicate the same dataset. Uses restic on top of an NFS mount to a
+    Jelastic backup-storage env (the same one you can deploy with the
+    orchestrator's "Deploy a backup server" checkbox).
+
+    Repo convention matches the vendor jelastic-jps/backup-storage spec:
+    repo path = /data/<primary-envName>/, password = primary env name. So
+    the storage env's `getBackups.sh <envName>` CLI lists our backups.
 
 baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
 
-# Storage nodeType only — this addon is for GlusterFS clusters.
+# Storage nodeType only - this addon is for GlusterFS clusters built by our
+# orchestrator (Certified Storage nodes).
 targetNodes:
   nodeType:
     - storage
@@ -142,6 +147,10 @@ settings:
         value: false
 
     onBeforeInit: |
+      // Filter to envs that are in the vendor "Backup storage nodes" env
+      // group (jelastic-jps/backup-storage attaches itself to that group on
+      // install, so this is the right way to list backup-storage envs). Falls
+      // back to all sibling envs if the group isn't found.
       var vals = {};
       try {
         var resp = jelastic.environment.control.GetEnvs(appid, session);
@@ -150,7 +159,25 @@ settings:
             var info = resp.infos[i];
             if (!info || !info.env) continue;
             if (info.env.envName == '${env.envName}') continue;
-            vals[info.env.envName] = info.env.displayName || info.env.envName;
+            var isBackupStorage = false;
+            if (info.envGroups && info.envGroups.length) {
+              for (var g = 0; g < info.envGroups.length; g++) {
+                var grp = info.envGroups[g];
+                var nm = (typeof grp === 'string') ? grp : (grp && grp.name);
+                if (nm && nm.indexOf('Backup storage') === 0) { isBackupStorage = true; break; }
+              }
+            }
+            if (isBackupStorage) {
+              vals[info.env.envName] = (info.env.displayName || info.env.envName) + ' (backup-storage)';
+            }
+          }
+          // Fallback: no backup-storage envs found, show all siblings so the user can still pick.
+          if (!Object.keys(vals).length) {
+            for (var j = 0; j < resp.infos.length; j++) {
+              var info2 = resp.infos[j];
+              if (!info2 || !info2.env || info2.env.envName == '${env.envName}') continue;
+              vals[info2.env.envName] = info2.env.displayName || info2.env.envName;
+            }
           }
         }
       } catch (e) { /* leave vals empty; dropdown stays empty but form renders */ }
@@ -289,32 +316,16 @@ actions:
         }
         return { result: 0 };
 
-  # Best-effort: even if every package manager fails, exit 0 so the addon
-  # install itself stays clean. Worst case the user clicks Configure later
-  # and we retry the install via setSchedule -> writeBackupScripts (which
-  # also re-checks for restic on every run).
+  # Install (or self-update) restic on every storage node via the official
+  # vendor helper script. Same one jelastic-jps/backup-addon uses, so we
+  # inherit its distro coverage and `restic self-update` logic for free.
+  # Best-effort: exit 0 even on failure so the addon card itself stays clean.
   installRestic:
     - cmd[storage]: |-
         set +e;
-        if command -v restic >/dev/null 2>&1; then echo "restic already installed: $(restic version)"; exit 0; fi;
-        if command -v dnf >/dev/null 2>&1; then
-          dnf install -y epel-release 2>/dev/null || true;
-          dnf install -y restic 2>/dev/null;
-        elif command -v yum >/dev/null 2>&1; then
-          yum install -y epel-release 2>/dev/null || true;
-          yum install -y restic 2>/dev/null || {
-            yum-config-manager --add-repo https://copr.fedorainfracloud.org/coprs/copart/restic/repo/epel-7/copart-restic-epel-7.repo 2>/dev/null;
-            yum -y install restic 2>/dev/null;
-          };
-        elif command -v apt-get >/dev/null 2>&1; then
-          apt-get update 2>/dev/null; apt-get install -y restic 2>/dev/null;
-        fi;
-        if ! command -v restic >/dev/null 2>&1; then
-          ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/');
-          VER=0.16.4;
-          curl -fsSL "https://github.com/restic/restic/releases/download/v${VER}/restic_${VER}_linux_${ARCH}.bz2" 2>/dev/null | bunzip2 > /usr/local/bin/restic 2>/dev/null;
-          chmod +x /usr/local/bin/restic 2>/dev/null;
-        fi;
+        wget -qO /usr/sbin/installUpdateRestic https://raw.githubusercontent.com/jelastic-jps/backup-storage/main/scripts/installUpdateRestic \
+          && chmod +x /usr/sbin/installUpdateRestic \
+          && /usr/sbin/installUpdateRestic;
         restic version 2>/dev/null || echo "WARNING: restic not installed - install manually and re-run Configure";
         exit 0;
       user: root
