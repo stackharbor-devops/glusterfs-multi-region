@@ -20,7 +20,7 @@ globals:
   replicatedPath: ${settings.mountPoint:/data}
   replicaCount: ${settings.replicaCount:3}
   networkMode: ${settings.networkMode:internal}
-  replicationModel: ${settings.replicationModel:async}
+  replicationModel: ${settings.replicationModel:sync}
 
 nodes:
   - nodeType: storage

@@ -29,7 +29,7 @@ globals:
   # all action bodies that the user can trigger post-install.
   base_path: ${baseUrl}
   volumeName: ${settings.volumeName:data}
-  replicationModel: ${settings.replicationModel:async}
+  replicationModel: ${settings.replicationModel:sync}
   master_env_name: ${settings.master_env_name:}
 
 onInstall:
@@ -68,8 +68,6 @@ addons:
             values:
               - value: status
                 caption: Cluster status (peers, volume, auth.allow)
-              - value: georep
-                caption: Geo-replication status (async mode only)
               - value: heal
                 caption: Heal volume - full
               - value: rebalance
@@ -113,7 +111,6 @@ actions:
   # Single dispatch action: form's `operation` value picks the branch.
   manage:
     - if ('${settings.operation}' == 'status'):       op_status
-    - if ('${settings.operation}' == 'georep'):       op_georep
     - if ('${settings.operation}' == 'heal'):         op_heal
     - if ('${settings.operation}' == 'rebalance'):    op_rebalance
     - if ('${settings.operation}' == 'harden'):       op_harden
@@ -162,21 +159,6 @@ actions:
           echo ===== INFO  =====; gluster volume info ${globals.volumeName};
           echo ===== STATUS ====; gluster volume status ${globals.volumeName};
           echo ===== AUTH.ALLOW ====; gluster volume info ${globals.volumeName} | grep auth.allow;
-
-  op_georep:
-    - script: |
-        var resp = jelastic.env.control.GetEnvInfo('${globals.master_env_name}', session);
-        if (resp.result != 0) return resp;
-        var mid = null;
-        for (var l = 0, k = resp.nodes; l < k.length; l++)
-          if (k[l].nodeGroup == 'storage' && k[l].ismaster) mid = k[l].id;
-        return { result: 0, onAfterReturn: { setGlobals: { masterNodeId: mid } } };
-    - api: env.control.ExecCmdById
-      envName: ${globals.master_env_name}
-      nodeId: ${globals.masterNodeId}
-      commandList:
-        - command: gluster volume geo-replication ${globals.volumeName} status detail 2>&1 || echo "No geo-replication sessions (synchronous mode, or none configured)."
-      user: root
 
   op_heal:
     - fanOutToMasters:

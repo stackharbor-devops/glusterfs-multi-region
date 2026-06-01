@@ -43,6 +43,11 @@ onBeforeInit: |
   } catch (e) { maxSame = 0; }
   var maxNodes = (maxSame > 0) ? maxSame : 16;
 
+  // Cap the cluster-mode slider at the smaller of 9 and the account's
+  // same-type quota. Single node per region needs no quota beyond 1.
+  var clusterMax = (maxSame > 0 && maxSame < 9) ? maxSame : 9;
+  if (clusterMax < 3) clusterMax = 3;  // never let the slider go below 3
+
   var fields = [
     // Regions — odd count required for quorum
     { type: "regionlist", name: "regions", caption: "Regions",
@@ -57,11 +62,23 @@ onBeforeInit: |
         { value: "public",   caption: "Public WAN - attaches a public IPv4 to every storage node" }
       ] },
 
-    // Capacity — sync mode: one node per region = baseline; each extra node per
-    // region adds another replica set / capacity slice.
-    { type: "spinner", name: "replicaSets",
-      caption: "Nodes per region (capacity slices)",
-      min: 1, max: maxNodes, "default": 1 },
+    // Topology — binary choice. Cluster mode reveals a spinner for the
+    // initial nodes-per-region count (3-9). After deploy, scale via the
+    // environment's topology panel + run the "Add Capacity Slice" addon.
+    { type: "list", name: "perRegionTopology",
+      caption: "Per-region topology",
+      "default": "single", required: true, editable: false,
+      values: [
+        { value: "single",  caption: "Single node per region (1 copy of every file per region)" },
+        { value: "cluster", caption: "Cluster per region (3-9 nodes; pick initial count below)" }
+      ],
+      showIf: {
+        "cluster": [
+          { type: "spinner", name: "nodesPerRegionCluster",
+            caption: "Initial nodes per region",
+            min: 3, max: clusterMax, "default": 3 }
+        ]
+      } },
 
     // Volume
     { type: "string", name: "volumeName", caption: "Volume name",
@@ -78,10 +95,10 @@ onBeforeInit: |
       required: true, randomName: true }
   ];
 
-  // Quota warning if cluster cannot fit (need 1 node/region minimum, regions >= 3).
-  if (maxSame > 0 && maxSame < 1) {
+  // Warn if quota would force a smaller cluster than the user might pick.
+  if (maxSame > 0 && maxSame < 3) {
     fields.unshift({ type: "displayfield", cls: "warning", hideLabel: true, height: 40,
-      markup: "Your account has no storage-node quota. Upgrade to deploy this package." });
+      markup: "Your account allows max " + maxSame + " same-type nodes per env. Only 'Single node per region' will fit; upgrade for cluster mode." });
   }
 
   return { result: 0, settings: { fields: fields } };
@@ -106,10 +123,18 @@ actions:
         if (regions.length < 3 || (regions.length % 2) == 0)
           return { result: 1, error: "Synchronous stretched cluster (write-anywhere) requires an ODD number of regions (3, 5, 7) for split-brain quorum. You selected " + regions.length + "." };
 
-        var sets    = parseInt('${settings.replicaSets}', 10) || 1;
-        var replica = regions.length;
-        var nodesPerRegion = sets;
-        var desc = regions.length + "-region synchronous stretched cluster, " + sets + " slice(s) = " + nodesPerRegion + " node(s)/region, replica " + replica;
+        // Topology -> nodes per region.
+        // single  -> 1 node/region (1 brick/region, replica = #regions, 1 set)
+        // cluster -> 3..9 nodes/region (each adds a capacity slice)
+        var topology = '${settings.perRegionTopology}';
+        var nodesPerRegion = (topology == 'cluster')
+          ? (parseInt('${settings.nodesPerRegionCluster}', 10) || 3)
+          : 1;
+        var replica = regions.length;       // one brick per region per replica set
+        var sets    = nodesPerRegion;       // each node-per-region = one set
+        var desc = (topology == 'single')
+          ? regions.length + "-region stretched volume, 1 node/region (replica " + replica + ")"
+          : regions.length + " regions x " + nodesPerRegion + " nodes/region = " + (regions.length * nodesPerRegion) + " bricks, replica " + replica + ", " + sets + " capacity slice(s)";
         var modelDesc = "All regions form ONE synchronous stretched volume. Write to any node in any region and it replicates synchronously to every other region. Writes pay cross-region round-trip latency.";
 
         glbs["replicaCount"]        = replica;

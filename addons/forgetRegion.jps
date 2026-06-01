@@ -1,22 +1,22 @@
 type: update
-version: 1.1
+version: 2.0
 id: glusterfs-forget-region
 name: Forget GlusterFS Region
 baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
 description:
-  short: Remove a region from the cluster.
+  short: Remove a region from the synchronous stretched cluster.
 
 # ---------------------------------------------------------------------------
 # Day-2 reconfiguration. RUN AGAINST THE PRIMARY ENVIRONMENT (envName-1).
+# Removes the target region's bricks from the stretched volume (replica count
+# drops from N to N-1), peer-detaches its nodes, optionally deletes its env.
 #
-# Mode-aware:
-#   async (geo-rep): stop+delete the geo-replication session to the target
-#                    region, optionally delete the env.
-#   sync (stretched): remove the target region's bricks (replica count -1),
-#                     peer-detach its nodes, optionally delete the env.
-#
-# After forgetting, you can add a fresh region with addRegion.jps and keep the
-# same cluster.
+# Use this to:
+#   - Decommission a region.
+#   - "Heal by forgetting" if a region is down and you want to continue
+#     serving the volume from the remaining ones.
+# After forgetting, you can add a fresh region with addRegion.jps to keep
+# the cluster's region count odd (3, 5, 7).
 # ---------------------------------------------------------------------------
 
 # Populate a dropdown of candidate secondary environments (name ends in -N, N>=2).
@@ -36,11 +36,7 @@ onBeforeInit: |
 
 onInstall:
   - importGlobalsFromNodeGroup: storage
-  - if ('${globals.replicationModel}' == 'sync'):
-      - finalizeForSync
-  - if ('${globals.replicationModel}' != 'sync'):
-      - resolveTargetIP
-      - stopAndDeleteGeoRep
+  - finalize
   - if ('${settings.deleteEnv}' == 'true'):
       - deleteTargetEnv
 
@@ -58,39 +54,8 @@ actions:
         if (!globals) return { result: 1, error: "No persisted GlusterFS globals found. Run this add-on against the primary environment." };
         return { result: 0, onAfterReturn: { setGlobals: globals } };
 
-  # ---- async path ---------------------------------------------------------
-
-  # Resolve the target region's storage-master IP (the geo-rep slave address).
-  resolveTargetIP:
-    - script: |
-        function extIp(node){ if(node.extIPs&&node.extIPs.length){var e=node.extIPs[0];return (e&&e.address)?e.address:e;} if(node.extIP)return node.extIP; if(node.externalIp)return node.externalIp; return node.address; }
-        var resp = jelastic.env.control.GetEnvInfo('${settings.targetEnv}', session);
-        if (resp.result != 0)
-          return { result: 0, onAfterReturn: { setGlobals: { targetSlaveIP: "" } } };
-        var ip = "";
-        for (var l = 0, k = resp.nodes; l < k.length; l++)
-          if (k[l].nodeGroup == 'storage' && k[l].ismaster)
-            ip = ('${globals.networkMode}' == 'public') ? extIp(k[l]) : k[l].address;
-        return { result: 0, onAfterReturn: { setGlobals: { targetSlaveIP: ip } } };
-
-  # Stop + delete the geo-replication session on the primary master. If the IP
-  # could not be resolved (env already gone), list any remaining session.
-  stopAndDeleteGeoRep:
-    - cmd[${nodes.storage.master.id}]: |-
-        VOL="${globals.volumeName}"; IP="${globals.targetSlaveIP}";
-        if [ -n "$IP" ]; then
-          gluster volume geo-replication ${VOL} jelastic@${IP}::${VOL} stop force || true;
-          gluster volume geo-replication ${VOL} jelastic@${IP}::${VOL} delete force || true;
-        else
-          echo "Target IP not resolvable; listing remaining geo-replication sessions for manual cleanup:";
-          gluster volume geo-replication ${VOL} status || true;
-        fi;
-      user: root
-
-  # ---- sync path ----------------------------------------------------------
-
-  # Sync: run syncClusterManager with action=removeRegion against the primary.
-  finalizeForSync:
+  # Drive syncClusterManager with action=removeRegion against the primary env.
+  finalize:
     - script: |
         var actions = [{
           jps: "${baseUrl}/scripts/syncClusterManager.jps?_r=${fn.random}",
@@ -108,8 +73,6 @@ actions:
           }
         }];
         return { result: 0, onAfterReturn: { 'marketplace.jps.install': actions } };
-
-  # ---- shared: optional env delete ----------------------------------------
 
   deleteTargetEnv:
     - api: env.control.DeleteEnv

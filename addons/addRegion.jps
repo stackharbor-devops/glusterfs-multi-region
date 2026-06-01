@@ -1,22 +1,20 @@
 type: update
-version: 1.1
+version: 2.0
 id: glusterfs-add-region
 name: Add GlusterFS Region
 baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
 description:
-  short: Adds a new region to an existing multi-region GlusterFS deployment.
+  short: Add a new region to an existing synchronous stretched GlusterFS cluster.
 
 # ---------------------------------------------------------------------------
-# Day-2 add-on. IMPORT / RUN THIS AGAINST THE PRIMARY ENVIRONMENT (envName-1),
-# where the deployment parameters were persisted at install time.
+# Day-2 addon. RUN AGAINST THE PRIMARY ENVIRONMENT (envName-1), where the
+# deployment parameters were persisted at install time. Creates a new regional
+# storage env at the next free index, then runs the sync cluster manager
+# (action=addRegion) to peer-probe it and add-brick into the stretched volume
+# (replica count bumps from N to N+1).
 #
-# Mode-aware:
-#   async (geo-rep model):  creates a new regional env, then re-runs the geo-rep
-#                           manager (add_new_cluster) to extend SSH+geo-rep trust
-#                           and start a new session from the primary to it.
-#   sync (stretched model): creates a new regional env, then runs the sync
-#                           manager (action=addRegion) to peer-probe it and
-#                           add-brick into the volume (replica count +1).
+# NOTE: ideally keep regions count ODD (3, 5, 7) for quorum. Going from 3 -> 4
+# works but split-brain protection is weaker until you reach 5.
 # ---------------------------------------------------------------------------
 
 settings:
@@ -35,15 +33,9 @@ onInstall:
   - importGlobalsFromNodeGroup: storage
   - getClusterEnvs
   - createNewEnv
-  - if ('${globals.replicationModel}' == 'sync'):
-      - finalizeForSync
-  - if ('${globals.replicationModel}' != 'sync'):
-      - finalizeForAsync
+  - finalize
 
 actions:
-  # Recover volumeName / replicaCount / nodesPerRegion / envNamePrefix /
-  # master_env_name / replicatedPath / replicationModel that the manager
-  # persisted at install.
   importGlobalsFromNodeGroup:
     - script: |
         var resp = api.env.control.GetNodeGroups("${env.name}", session);
@@ -78,33 +70,13 @@ actions:
             "volumeName": "${globals.volumeName}",
             "mountPoint": "${globals.replicatedPath}",
             "networkMode": "${globals.networkMode}",
-            "replicationModel": "${globals.replicationModel}"
+            "replicationModel": "sync"
           }
         }];
         return { result: 0, onAfterReturn: { 'marketplace.jps.install': actions } };
 
-  # Async: re-run geoReplicationManager (add_new_cluster) on the primary env.
-  finalizeForAsync:
-    - script: |
-        var actions = [{
-          jps: "${baseUrl}/scripts/geoReplicationManager.jps?_r=${fn.random}",
-          envName: "${globals.master_env_name}",
-          settings: {
-            "master_env_name": "${globals.master_env_name}",
-            "volumeName": "${globals.volumeName}",
-            "networkMode": "${globals.networkMode}",
-            "envNamePrefix": "${globals.envNamePrefix}",
-            "replicaCount": "${globals.replicaCount}",
-            "nodesPerRegion": "${globals.nodesPerRegion}",
-            "mountPoint": "${globals.replicatedPath}",
-            "replicationModel": "async",
-            "add_new_cluster": "true"
-          }
-        }];
-        return { result: 0, onAfterReturn: { 'marketplace.jps.install': actions } };
-
-  # Sync: run syncClusterManager with action=addRegion against the primary env.
-  finalizeForSync:
+  # Drive syncClusterManager with action=addRegion against the primary env.
+  finalize:
     - script: |
         var actions = [{
           jps: "${baseUrl}/scripts/syncClusterManager.jps?_r=${fn.random}",

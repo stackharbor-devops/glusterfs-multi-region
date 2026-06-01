@@ -49,8 +49,8 @@ actions:
 
   assertSyncMode:
     - script: |
-        if ('${globals.replicationModel}' != 'sync')
-          return { result: 1, error: "This addon is for the synchronous stretched cluster only. The current deployment is in '${globals.replicationModel}' mode. To grow capacity in async mode, scale each region's `storage` layer in multiples of the replica count via the topology UI - the cluster-logic addon handles that automatically." };
+        if ('${globals.replicationModel}' && '${globals.replicationModel}' != 'sync')
+          return { result: 1, error: "Persisted replicationModel is not 'sync' (got '${globals.replicationModel}'). This package is sync-only since v2.0 - the cluster you are running was deployed by a pre-v2 manifest. Redeploy with the current manifest to use this addon." };
         return { result: 0 };
 
   getClusterEnvs:

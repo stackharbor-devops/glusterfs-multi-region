@@ -1,24 +1,19 @@
 type: update
-version: 1.0
+version: 2.0
 id: glusterfs_cluster_logic
 name: GlusterFS Cluster Logic
 baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
 description:
-  short: In-region GlusterFS volume lifecycle (create / mount / scale / heal).
+  short: Per-region GlusterFS node prep (sync stretched cluster mode).
 
 # ---------------------------------------------------------------------------
-# Permanent add-on installed into each regional storage environment. It owns the
-# in-region volume: peer probing, volume creation (replicated or
-# distributed-replicated), FUSE mount + NFS re-export, and elastic scaling.
-#
-# Volume type is driven by settings.replicaCount:
-#   replicaCount >= 2  -> "replica N"; bricks beyond N form extra replica sets
-#                         => distributed-replicated (capacity scales with sets)
-#   replicaCount  = 1  -> no replica keyword => single brick (single topology)
-#                         or plain distributed if more than one node
+# Permanent add-on installed into each regional storage environment. In the
+# synchronous stretched-cluster model, the actual volume is OWNED by the cross-
+# region syncClusterManager — this addon just preps the nodes (enable glusterd,
+# create brick + mount dirs, set the firewall). The volume create/start/mount
+# happen at the cluster level.
 #
 # Brick on disk: /glustervolume (one per node). FUSE mount: ${replicatedPath}.
-# Adapted from jelastic-jps/glusterfs replication-logic.jps.
 # ---------------------------------------------------------------------------
 
 permanent: true
@@ -30,56 +25,25 @@ globals:
   replicatedPath: ${settings.replicatedPath:/data}
   replicatedVolume: ${settings.replicatedVolume:data}
   replicaCount: ${settings.replicaCount:3}
-  replicationModel: ${settings.replicationModel:async}
 
 onInstall:
   - setupFirewall
-  # async: build this region's local volume here.
-  # sync: only prepare nodes (glusterd + dirs); syncClusterManager builds the
-  #       single stretched volume spanning all regions.
-  - if ('${globals.replicationModel}' == 'sync'):
-      - prepNodesForSync
-  - if ('${globals.replicationModel}' != 'sync'):
-      - initiateGlusterFSCluster
+  - prepNodesForSync
 
 onAfterStart:
   - cmd[storage]: mount -a; exportfs -ra;
 
-# Scale-out = add capacity. New nodes are peered; when they complete a replica
-# set (count multiple of replicaCount) they are added as new bricks and the
-# volume is rebalanced + healed. Otherwise they stay peered but idle (warned).
-# async only: add the new node(s) as a capacity slice to this region's volume.
-# (sync stretched-cluster scaling must add one node per region at once and is
-#  handled out-of-band - see README; this handler no-ops in sync mode.)
-onAfterServiceScaleOut[storage]:
-  - if ('${globals.replicationModel}' != 'sync'):
-      - forEach(newnode:event.response.nodes):
-          - enableGlusterFS:
-              id: ${@newnode.id}
-          - addPeer:
-              address: ${@newnode.address}
-      - addReplicaSet:
-          newnodes: ${event.response.nodes.join(address,)}
-      - forEach(newnode:event.response.nodes):
-          - mountDirectoryToVolume:
-              id: ${@newnode.id}
-              address: ${@newnode.address}
-          - addAutoMount:
-              id: ${@newnode.id}
-              address: ${@newnode.address}
-          - fixExistingMounts:
-              id: ${@newnode.id}
-
-# Scale-in of a distributed-replicated volume risks data loss; gate it and point
-# the operator at the controlled remove-brick procedure (see README).
+# In-region scale-out is intentionally NOT handled here. Sync stretched cluster
+# scaling needs one new node per region in lock-step (so the brick count stays
+# a multiple of the replica count); use the `addCapacitySlice` addon against
+# the primary env after scaling each region's storage layer.
+# Scaling IN is gated for the same reason: removing bricks from a distributed-
+# replicated volume without migrating data first loses data.
 onBeforeScaleIn[storage]:
   - stopEvent:
       type: warning
       message: |-
-        Automatic scale-in of a distributed-replicated GlusterFS volume can cause data loss.
-        Remove a full replica set (${globals.replicaCount} node(s)) with the controlled procedure:
-        gluster volume remove-brick <vol> <bricks...> start -> status (wait for "completed") -> commit,
-        then detach the peers. See the package README ("Scaling in").
+        Automatic scale-in is disabled in the synchronous stretched cluster: removing bricks without first migrating their data risks data loss. To shrink capacity, use the controlled procedure (gluster volume remove-brick <vol> <bricks...> start -> status -> commit) from the primary env's "Manage Cluster" -> custom command, then peer-detach.
 
 onAfterRedeployContainer[storage]:
   - cmd[storage]: /bin/systemctl start glusterd.service && /bin/systemctl enable glusterd.service;
@@ -108,8 +72,9 @@ onBeforeMigrate:
   - cmd[storage]: sed -i '/glusterfs/d' /etc/fstab; rm -rf ${globals.replicatedPath}
 
 onAfterMigrate:
-  - if ('${globals.replicationModel}' != 'sync'):
-      - initiateGlusterFSCluster
+  # Volume rebuild after a container migration is owned by syncClusterManager;
+  # nothing to do here (the platform will re-mount via the fstab entry).
+  - cmd[storage]: mount -a; exportfs -ra;
 
 onBeforeStop:
   - umountFuze: ${nodes.storage.join(id,)}
@@ -148,93 +113,11 @@ actions:
         enableGlusterFS:
           id: ${@clusternode.id}
 
-  initiateGlusterFSCluster:
-    - umountFuze: ${nodes.storage.join(id,)}
-    - environment.file.read:
-        nodeId: ${nodes.storage.master.id}
-        path: /etc/exports
-        user: root
-    - environment.file.write:
-        nodeGroup: storage
-        path: /etc/exports
-        user: root
-        body: ${response.body}
-    - forEach(clusternode:nodes.storage):
-        cleanupNode:
-          id: ${@clusternode.id}
-    - forEach(clusternode:nodes.storage):
-        enableGlusterFS:
-          id: ${@clusternode.id}
-    - prepareVolumeBricks
-    - initiateVolume
-    - forEach(clusternode:nodes.storage):
-        - mountDirectoryToVolume:
-            id: ${@clusternode.id}
-            address: ${@clusternode.address}
-        - addAutoMount:
-            id: ${@clusternode.id}
-            address: ${@clusternode.address}
-        - fixExistingMounts:
-            id: ${@clusternode.id}
-        - checkStatus:
-            id: ${@clusternode.id}
-
-  cleanupNode:
-    - cmd[${this.id}]: |-
-        service glusterd stop; GLUSTER_PROCESS=$(ps aux|grep gluster|grep -v grep|awk '{print $2}');
-        [ -n "${GLUSTER_PROCESS}" ] && kill -9 ${GLUSTER_PROCESS}; sed -i '/glusterfs/d' /etc/fstab; rm -rf /var/lib/glusterd/{vols,ss_brick,peers};
-      user: root
-
   enableGlusterFS:
     - cmd[${this.id}]: |-
         /bin/systemctl enable glusterd.service; /bin/systemctl start glusterd.service; mkdir -p /glustervolume ${globals.replicatedPath};
         echo -e "/glustervolume\n/var/lib/glusterd/\n/var/log/glusterfs\n${globals.replicatedPath}\n/etc/exports" >> /etc/jelastic/redeploy.conf;
         sed -i '/^$/d' /etc/exports;
-      user: root
-
-  addPeer:
-    - cmd[${nodes.storage.master.id}]: |-
-        counter=0
-        while true
-        do
-            counter2=0
-            while [[ "$counter2" -le 20 ]]; do sleep 1; gluster peer status && break; counter2=$((counter2+1));done
-            set -o pipefail; gluster --log-file=/dev/stdout peer probe ${this.address} | tee -a /var/log/glusterfs/glusterd.log; res=$?
-            [[ "$res" -eq 0 ]] && exit 0
-            [[ "$counter" -gt 10 ]] && { echo "peer is not available"; exit 1; }
-            counter=$((counter+1))
-        done
-      user: root
-
-  prepareVolumeBricks:
-    forEach(clusternode:nodes.storage):
-      if (${@clusternode.id} != ${nodes.storage.master.id}):
-        addPeer:
-          address: ${@clusternode.address}
-
-  # Build the brick list (one /glustervolume brick per node) and create the
-  # volume. "replica N" groups every N consecutive bricks into a replica set;
-  # with more than N bricks this yields a distributed-replicated volume.
-  initiateVolume:
-    - cmd[${nodes.storage.master.id}]: |-
-        let "NUMBER_OF_BRICKS=$(gluster peer status |grep 'Number of Peers'|awk '{print $4}') + 1";
-        BRICKS_ADDRESSES=$(gluster peer status|grep Hostname| awk '{print $2}'); BRICKS_STRING="${nodes.storage.master.address}:/glustervolume";
-        for i in ${BRICKS_ADDRESSES}; do BRICKS_STRING="${BRICKS_STRING} ${i}:/glustervolume"; done;
-        REPLICA=${globals.replicaCount};
-        if [ "${REPLICA}" -ge 2 ]; then REPLICA_OPT="replica ${REPLICA}"; else REPLICA_OPT=""; fi;
-        counter=1
-        while true
-        do
-            echo "Volume create operation - attempt ${counter}" | tee -a /var/log/glusterfs/glusterd.log;
-            gluster volume create ${globals.replicatedVolume} ${REPLICA_OPT} transport tcp ${BRICKS_STRING} force | tee -a /var/log/glusterfs/glusterd.log; res=$?
-            [[ "$res" -eq 0 ]] && { echo "Volume create operation succeeded" | tee -a /var/log/glusterfs/glusterd.log; break; }
-            [[ "$counter" -gt 3 ]] && { echo "Volume create operation failed" | tee -a /var/log/glusterfs/glusterd.log; exit 1; }
-            sleep 1
-            counter=$((counter+1))
-        done
-        gluster volume start ${globals.replicatedVolume};
-        gluster volume set ${globals.replicatedVolume} network.ping-timeout 10;
-        gluster volume set ${globals.replicatedVolume} auth.allow '*';
       user: root
 
   mountDirectoryToVolume:
@@ -251,38 +134,6 @@ actions:
     - cmd[${this.id}]: |-
         sed -i '/glusterfs/d' /etc/fstab;
         echo "localhost:/${globals.replicatedVolume}  ${globals.replicatedPath}   glusterfs   defaults,_netdev,noauto,x-systemd.automount  0 0" >> /etc/fstab;
-
-  # Add one or more complete replica sets (capacity slices) on scale-out.
-  # ${this.newnodes} is a CSV of the new nodes' addresses.
-  addReplicaSet:
-    - cmd[${nodes.storage.master.id}]: |-
-        NEW_NODES="${this.newnodes}";
-        REPLICA=${globals.replicaCount};
-        IFS=',' read -ra ARR <<< "${NEW_NODES}";
-        CLEAN=(); for a in "${ARR[@]}"; do [ -n "$a" ] && CLEAN+=("$a"); done;
-        COUNT=${#CLEAN[@]};
-        if [ "${COUNT}" -eq 0 ]; then echo "No new nodes to add."; exit 0; fi;
-        if [ "${REPLICA}" -ge 2 ] && [ $((COUNT % REPLICA)) -ne 0 ]; then
-            echo "WARNING: added ${COUNT} node(s), which is not a multiple of replica ${REPLICA}. Bricks were NOT added to the volume - scale out in multiples of ${REPLICA} to add a capacity slice. The new node(s) are peered but idle." | tee -a /var/log/glusterfs/glusterd.log;
-            exit 0;
-        fi;
-        BRICKS=""; for a in "${CLEAN[@]}"; do BRICKS="${BRICKS} ${a}:/glustervolume"; done;
-        if [ "${REPLICA}" -ge 2 ]; then REPLICA_OPT="replica ${REPLICA}"; else REPLICA_OPT=""; fi;
-        echo "Adding brick(s):${BRICKS}" | tee -a /var/log/glusterfs/glusterd.log;
-        set -o pipefail; gluster volume add-brick ${globals.replicatedVolume} ${REPLICA_OPT} ${BRICKS} force 2>&1 | tee -a /var/log/glusterfs/glusterd.log;
-        gluster volume rebalance ${globals.replicatedVolume} start;
-        gluster volume heal ${globals.replicatedVolume} full || true;
-      user: root
-
-  fixExistingMounts:
-    - cmd[${this.id}]: |-
-        LINE_NUMBER=0
-        while read LINE; do let LINE_NUMBER++; FSID=$(cat /proc/sys/kernel/random/uuid); grep -q '^\"${globals.replicatedPath}' <<< $LINE && sed -i "${LINE_NUMBER}s/)$/,fsid=${FSID})/" /etc/exports || true; done < /etc/exports;
-        exportfs -ra;
-
-  checkStatus:
-    - cmd[${this.id}]: |-
-        gluster volume status;
 
   umountFuze:
     - cmd[${this}]: systemctl stop $(systemd-escape -p --suffix=automount ${globals.replicatedPath}); umount -l ${globals.replicatedPath} || true;
