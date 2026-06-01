@@ -286,28 +286,34 @@ actions:
         }
         return { result: 0 };
 
+  # Best-effort: even if every package manager fails, exit 0 so the addon
+  # install itself stays clean. Worst case the user clicks Configure later
+  # and we retry the install via setSchedule -> writeBackupScripts (which
+  # also re-checks for restic on every run).
   installRestic:
     - cmd[storage]: |-
-        set -e;
+        set +e;
         if command -v restic >/dev/null 2>&1; then echo "restic already installed: $(restic version)"; exit 0; fi;
         if command -v dnf >/dev/null 2>&1; then
           dnf install -y epel-release 2>/dev/null || true;
-          dnf install -y restic;
+          dnf install -y restic 2>/dev/null;
         elif command -v yum >/dev/null 2>&1; then
           yum install -y epel-release 2>/dev/null || true;
-          yum install -y restic || {
-            yum-config-manager --add-repo https://copr.fedorainfracloud.org/coprs/copart/restic/repo/epel-7/copart-restic-epel-7.repo;
-            yum -y install restic;
+          yum install -y restic 2>/dev/null || {
+            yum-config-manager --add-repo https://copr.fedorainfracloud.org/coprs/copart/restic/repo/epel-7/copart-restic-epel-7.repo 2>/dev/null;
+            yum -y install restic 2>/dev/null;
           };
         elif command -v apt-get >/dev/null 2>&1; then
-          apt-get update; apt-get install -y restic;
-        else
+          apt-get update 2>/dev/null; apt-get install -y restic 2>/dev/null;
+        fi;
+        if ! command -v restic >/dev/null 2>&1; then
           ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/');
           VER=0.16.4;
-          curl -fsSL "https://github.com/restic/restic/releases/download/v${VER}/restic_${VER}_linux_${ARCH}.bz2" | bunzip2 > /usr/local/bin/restic;
-          chmod +x /usr/local/bin/restic;
+          curl -fsSL "https://github.com/restic/restic/releases/download/v${VER}/restic_${VER}_linux_${ARCH}.bz2" 2>/dev/null | bunzip2 > /usr/local/bin/restic 2>/dev/null;
+          chmod +x /usr/local/bin/restic 2>/dev/null;
         fi;
-        restic version;
+        restic version 2>/dev/null || echo "WARNING: restic not installed - install manually and re-run Configure";
+        exit 0;
       user: root
 
   # Persist schedule + storage + path globals, then write runner scripts + cron.
@@ -365,38 +371,56 @@ actions:
         var cron = d2.getMinutes() + ' ' + d2.getHours() + ' * * ' + days.join(',');
         return { result: 0, onAfterReturn: { setGlobals: { cron: cron } } };
 
+  # Resolve the backup-storage env's master node id. Tolerant: returns
+  # empty string instead of erroring out if the env isn't ready yet, so the
+  # addon install survives the race when the orchestrator created the
+  # storage env right before installing this addon.
+  getStorageCtid:
+    - script: |
+        try {
+          var nm = '${settings.storageName}';
+          if (!nm) return { result: 0, storageCtid: '' };
+          var r = jelastic.env.control.GetEnvInfo(nm, session);
+          if (!r || r.result != 0 || !r.nodes) return { result: 0, storageCtid: '' };
+          for (var l = 0; l < r.nodes.length; l++) {
+            if (r.nodes[l].ismaster) return { result: 0, storageCtid: r.nodes[l].id };
+          }
+        } catch (e) { /* fall through */ }
+        return { result: 0, storageCtid: '' };
+
+  # Best-effort mount of the backup storage. Never fails the install: if the
+  # mount can't be created (storage env not ready, IP not reachable yet, etc.),
+  # the runner script's `mount.glusterfs` fallback will try again at backup
+  # time, and the user can re-trigger setup via the Configure button.
   addMount:
     - getStorageCtid
-    - api: env.file.AddMountPointById
-      envName: ${env.envName}
-      nodeId: ${nodes.storage.master.id}
-      path: /opt/backup
-      protocol: nfs4
-      sourceNodeId: ${response.storageCtid}
-      sourcePath: /data/
-      name: GlusterFSBackup
-      readOnly: false
+    - script: |
+        if (!'${response.storageCtid}') {
+          return { result: 0, warning: "Backup storage env not resolvable yet; skipping permanent mount. The runner will mount on demand." };
+        }
+        try {
+          var r = jelastic.env.file.AddMountPointById(
+            '${env.envName}', session, '${nodes.storage.master.id}',
+            '/opt/backup', 'nfs4', null, '/data/', '${response.storageCtid}',
+            'GlusterFSBackup', false
+          );
+          // Tolerate "already mounted" and similar idempotency errors; the
+          // addon should always install cleanly.
+          return { result: 0, addMountResult: r ? r.result : -1, addMountError: r && r.error ? r.error : '' };
+        } catch (e) { return { result: 0, addMountException: String(e) }; }
 
   removeMount:
     - script: |
-        var mp = jelastic.env.file.GetMountPoints('${env.envName}', session, '${nodes.storage.master.id}');
-        if (!mp || mp.result != 0 || !mp.array) return { result: 0 };
-        for (var i = 0; i < mp.array.length; i++) {
-          if (mp.array[i].path == '/opt/backup' && mp.array[i].type == 'INTERNAL') {
-            var r = jelastic.env.file.RemoveMountPointById('${env.envName}', session, '${nodes.storage.master.id}', '/opt/backup');
-            if (r.result != 0) return r;
+        try {
+          var mp = jelastic.env.file.GetMountPoints('${env.envName}', session, '${nodes.storage.master.id}');
+          if (!mp || mp.result != 0 || !mp.array) return { result: 0 };
+          for (var i = 0; i < mp.array.length; i++) {
+            if (mp.array[i].path == '/opt/backup' && mp.array[i].type == 'INTERNAL') {
+              jelastic.env.file.RemoveMountPointById('${env.envName}', session, '${nodes.storage.master.id}', '/opt/backup');
+            }
           }
-        }
+        } catch (e) { /* never fail uninstall on a stale mount */ }
         return { result: 0 };
-
-  getStorageCtid:
-    - script: |
-        var r = jelastic.env.control.GetEnvInfo('${settings.storageName}', session);
-        if (r.result != 0) return r;
-        for (var l = 0; l < r.nodes.length; l++) {
-          if (r.nodes[l].ismaster) return { result: 0, storageCtid: r.nodes[l].id };
-        }
-        return { result: 1, error: "Could not resolve a master node on storage env '${settings.storageName}'." };
 
   # Backup runner: vendor convention is one restic repo per source env, located
   # at /data/<envName>/ on the storage server, with env name as the password.

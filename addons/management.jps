@@ -54,10 +54,8 @@ addons:
           - type: displayfield
             hideLabel: true
             cls: info
-            height: 60
-            markup: |
-              <p><strong>Multi-region GlusterFS cluster manager.</strong> Operations fan out
-              to every region in parallel; results land in the env's Tasks log.</p>
+            height: 50
+            markup: "Multi-region GlusterFS cluster manager. Operations run on this region's storage master (gluster propagates volume-wide); results land in the env's Tasks log."
 
           - type: list
             name: operation
@@ -191,24 +189,53 @@ actions:
         gluster volume info ${globals.volumeName} | grep auth.allow;
       user: root
 
-  # Read-only: list all storage nodes across regions with their IPs (handy for
-  # the security review and for debugging from any region).
+  # Read-only inventory of every storage node across every region. The Java
+  # `return { ..., message: ... }` form doesn't surface to the env Tasks log
+  # (only to popup dialogs, sometimes), so we base64-stash the formatted
+  # table and `cat` it via a cmd on the local master — that prints to the
+  # Tasks log as cmd output, which is what users actually see.
   op_listNodes:
     - getClusterEnvs
     - script: |
         function extIp(node){ if(node.extIPs&&node.extIPs.length){var e=node.extIPs[0];return (e&&e.address)?e.address:e;} if(node.extIP)return node.extIP; if(node.externalIp)return node.externalIp; return node.address; }
-        var envs = '${globals.clusterEnvs}'.split(','), lines = ['Region\tEnv\tNode\tIntIP\tExtIP\tMaster'];
+        var envs = '${globals.clusterEnvs}'.split(',');
+        // Pretty-aligned table (column widths sized for typical Jelastic env names).
+        var rows = [['REGION','ENV','NODE','INT_IP','EXT_IP','MASTER']];
         for (var i = 0; i < envs.length; i++) {
           var r = jelastic.env.control.GetEnvInfo(envs[i], session);
           if (r.result != 0) continue;
           var region = (r.env && r.env.hostGroup && r.env.hostGroup.displayName) ? r.env.hostGroup.displayName : '(unknown)';
           for (var l = 0; l < r.nodes.length; l++) {
             if (r.nodes[l].nodeGroup == 'storage') {
-              lines.push([region, envs[i], r.nodes[l].id, r.nodes[l].address, extIp(r.nodes[l]), r.nodes[l].ismaster ? 'yes' : ''].join('\t'));
+              rows.push([region, envs[i], String(r.nodes[l].id), r.nodes[l].address || '', extIp(r.nodes[l]) || '', r.nodes[l].ismaster ? 'yes' : '']);
             }
           }
         }
-        return { result: 0, type: 'info', message: lines.join('\n') };
+        // Compute column widths
+        var widths = [];
+        for (var c = 0; c < rows[0].length; c++) {
+          var w = 0;
+          for (var rr = 0; rr < rows.length; rr++) w = Math.max(w, rows[rr][c].length);
+          widths.push(w);
+        }
+        // Format aligned rows
+        var lines = [];
+        for (var rr2 = 0; rr2 < rows.length; rr2++) {
+          var parts = [];
+          for (var c2 = 0; c2 < rows[rr2].length; c2++) {
+            var cell = rows[rr2][c2];
+            while (cell.length < widths[c2]) cell = cell + ' ';
+            parts.push(cell);
+          }
+          lines.push(parts.join('  '));
+        }
+        var text = lines.join('\n');
+        var b64 = java.util.Base64.getEncoder().encodeToString(new java.lang.String(text).getBytes('UTF-8'));
+        return { result: 0, onAfterReturn: { setGlobals: { listNodesB64: String(b64) } } };
+    - cmd[${nodes.storage.master.id}]: |-
+        echo ===== STORAGE NODES INVENTORY =====
+        echo '${globals.listNodesB64}' | base64 -d
+      user: root
 
   op_custom:
     - cmd[${nodes.storage.master.id}]: ${settings.customCmd}
