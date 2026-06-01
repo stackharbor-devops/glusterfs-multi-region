@@ -1,36 +1,40 @@
 type: update
-version: 1.2
+version: 1.3
 id: glusterfs-management
 name: GlusterFS Cluster Management
 baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
 description:
-  short: Operational buttons for the multi-region GlusterFS cluster.
+  short: Operational dashboard for the multi-region GlusterFS cluster.
 
 # ---------------------------------------------------------------------------
-# Installed onto EVERY regional env by the orchestrator, so the management
-# buttons are visible and usable from any region. The volume name / model /
-# primary-env are passed in as settings (captured into globals) so each copy is
-# self-sufficient; the cluster's env list is rediscovered at button-press time
-# with getClusterEnvs, so the buttons fan out across all regions from anywhere.
+# Installed onto EVERY regional env. Surfaces a single "Manage Cluster" button
+# in the storage node-group's Add-Ons panel; clicking it opens a form modal
+# (popup overlay) with a dropdown of operations + optional per-op parameters.
+# Submit dispatches to the right action which fans out across all regions.
 #
-# JPS addon-binding fundamentals (learned from jelastic-jps/kubernetes and
-# wordpress-multiregion-standalone references):
-#
-# 1. `addons:` block DEFINES the card (id, name, description, buttons).
-# 2. `installAddon` action ATTACHES it to a node-group's UI panel via nodeGroup.
-# 3. WITHOUT step 2, the addon installs cleanly but has no UI surface
-#    (no error, just silently invisible — what the user hit at first).
-# 4. `permanent: true` makes the card persist across the env lifecycle.
+# Design notes (from the kubernetes-jps and wp-multiregion-standalone refs):
+# - Single addon-card -> single primary action -> rich form modal is the
+#   canonical pattern (cf. gitlab-manifest.jps Configure GitLab button).
+# - `${baseUrl}` is only resolved during initial JPS processing, NOT at
+#   button-click time. So we capture it once in `globals.base_path` (which IS
+#   resolved + persisted at install) and reference that from action bodies.
+# - The fan-out uses `api[]` + `async: true` (canonical wp-events.jps pattern)
+#   so all regions execute concurrently, not sequentially.
 # ---------------------------------------------------------------------------
 
 globals:
+  # Captured at install time as a literal URL string — `${baseUrl}` does NOT
+  # interpolate at button-click time, but `${globals.base_path}` does (because
+  # globals are persisted after install). Use this instead of `${baseUrl}` in
+  # all action bodies that the user can trigger post-install.
+  base_path: ${baseUrl}
   volumeName: ${settings.volumeName:data}
   replicationModel: ${settings.replicationModel:async}
   master_env_name: ${settings.master_env_name:}
 
 onInstall:
-  # Bind the addon card to the storage node-group's Add-Ons panel. THIS is what
-  # makes the card visible — without it, the addon installs but is invisible.
+  # Bind the addon card (defined below) to the storage node-group's Add-Ons
+  # panel. Without `installAddon`, the addon installs but has no UI surface.
   - installAddon:
     - id: glusterfs-mgmt
       nodeGroup: storage
@@ -39,39 +43,96 @@ addons:
   - id: glusterfs-mgmt
     name: GlusterFS Cluster
     permanent: true
-    description: Status and maintenance for the multi-region GlusterFS cluster.
+    description: Open the Cluster Manager to run status, heal, rebalance, and security operations across every region.
+
+    # Settings form — opens as a popup overlay when the button is clicked.
+    # Operation-specific extra fields are revealed via `showIf` on the
+    # operation list, so the form stays compact until needed.
+    settings:
+      main:
+        fields:
+          - type: displayfield
+            hideLabel: true
+            cls: info
+            height: 60
+            markup: |
+              <p><strong>Multi-region GlusterFS cluster manager.</strong> Operations fan out
+              to every region in parallel; results land in the env's Tasks log.</p>
+
+          - type: list
+            name: operation
+            caption: Operation
+            required: true
+            editable: false
+            default: status
+            values:
+              - value: status
+                caption: Cluster status (peers, volume, auth.allow)
+              - value: georep
+                caption: Geo-replication status (async mode only)
+              - value: heal
+                caption: Heal volume - full
+              - value: rebalance
+                caption: Rebalance volume
+              - value: harden
+                caption: Re-tighten auth.allow to peer IPs
+              - value: list_nodes
+                caption: List all storage nodes + IPs
+              - value: custom
+                caption: Run a custom gluster CLI command (advanced)
+
+            # Operation-specific extras
+            showIf:
+              custom:
+                - type: displayfield
+                  hideLabel: true
+                  cls: warning
+                  height: 50
+                  markup: |
+                    <p><strong>Advanced:</strong> command runs on every region's storage master
+                    as root, in parallel. Use with care.</p>
+                - type: string
+                  name: customCmd
+                  caption: Command to run
+                  required: true
+                  default: gluster volume status
+                  regex: "^[^|;&<>$`\\\\]*$"
+                  regexText: "Pipes, semicolons, redirects, command substitution, and backslashes are blocked."
+
+    # Single button on the card. Clicking it opens the `main` settings form
+    # above as a popup overlay; submit dispatches to the `manage` action.
     buttons:
-      - caption: Cluster Status
-        action: clusterStatus
-        loadingText: Gathering cluster status...
-        successText: Status collected - open the env Tasks/log to view the output.
-      - caption: Geo-Replication Status
-        action: geoRepStatus
-        loadingText: Querying geo-replication...
-        successText: Geo-replication status collected - see the log.
-      - caption: Heal Volume(s)
-        action: healVolumes
-        confirmText: Trigger a full heal on the GlusterFS volume(s)?
-        loadingText: Starting heal...
-        successText: Heal started.
-      - caption: Rebalance Volume(s)
-        action: rebalanceVolumes
-        confirmText: Start a rebalance (redistribute data) on the GlusterFS volume(s)?
-        loadingText: Starting rebalance...
-        successText: Rebalance started.
+      - caption: Manage Cluster
+        action: manage
+        settings: main
+        submitButtonText: Run
+        loadingText: Working...
+        successText: Done - results in the env Tasks log.
 
 actions:
-  # Rediscover all regional envs from the current env-name prefix (works anywhere).
+  # Single dispatch action: form's `operation` value picks the branch.
+  manage:
+    - if ('${settings.operation}' == 'status'):       op_status
+    - if ('${settings.operation}' == 'georep'):       op_georep
+    - if ('${settings.operation}' == 'heal'):         op_heal
+    - if ('${settings.operation}' == 'rebalance'):    op_rebalance
+    - if ('${settings.operation}' == 'harden'):       op_harden
+    - if ('${settings.operation}' == 'list_nodes'):   op_listNodes
+    - if ('${settings.operation}' == 'custom'):       op_custom
+
+  # ---- shared helpers ----------------------------------------------------
+
+  # Rediscover all regional envs from the current env-name prefix.
+  # Uses ${globals.base_path} (NOT ${baseUrl}) — see the design note above.
   getClusterEnvs:
-    - script: ${baseUrl}/scripts/getClusterEnvs.js
+    - script: ${globals.base_path}/scripts/getClusterEnvs.js
       envName: ${env.envName}
     - setGlobals:
         clusterEnvs: ${response.items.join(,)}
 
-  # Build a parallel api[] array of ExecCmdById calls, one per region's storage
-  # master, all running the same command. Returns via onAfterReturn.api with
-  # async:true so the calls fan out concurrently across regions (vs a sequential
-  # forEach, which would serialize them).
+  # Build a parallel api[] of ExecCmdById calls (one per region's storage
+  # master) running ${this.command}, then return them with async:true so the
+  # platform executes them concurrently across regions.
   fanOutToMasters:
     - getClusterEnvs
     - script: |
@@ -92,7 +153,9 @@ actions:
         }
         return { result: 0, onAfterReturn: { api: api, async: true } };
 
-  clusterStatus:
+  # ---- operations --------------------------------------------------------
+
+  op_status:
     - fanOutToMasters:
         command: |-
           echo ===== PEERS =====; gluster peer status;
@@ -100,9 +163,7 @@ actions:
           echo ===== STATUS ====; gluster volume status ${globals.volumeName};
           echo ===== AUTH.ALLOW ====; gluster volume info ${globals.volumeName} | grep auth.allow;
 
-  # Geo-replication only exists in async mode and only on the primary env, so
-  # always target it (works from any region; reports "no sessions" in sync mode).
-  geoRepStatus:
+  op_georep:
     - script: |
         var resp = jelastic.env.control.GetEnvInfo('${globals.master_env_name}', session);
         if (resp.result != 0) return resp;
@@ -114,14 +175,72 @@ actions:
       envName: ${globals.master_env_name}
       nodeId: ${globals.masterNodeId}
       commandList:
-        - command: |-
-            gluster volume geo-replication ${globals.volumeName} status detail 2>&1 || echo "No geo-replication sessions (synchronous mode, or none configured).";
+        - command: gluster volume geo-replication ${globals.volumeName} status detail 2>&1 || echo "No geo-replication sessions (synchronous mode, or none configured)."
       user: root
 
-  healVolumes:
+  op_heal:
     - fanOutToMasters:
         command: gluster volume heal ${globals.volumeName} full
 
-  rebalanceVolumes:
+  op_rebalance:
     - fanOutToMasters:
         command: gluster volume rebalance ${globals.volumeName} start
+
+  # Re-compute peer IP list across all regions, then push auth.allow to each
+  # region's volume. Idempotent — safe to run any time topology changes.
+  op_harden:
+    - getClusterEnvs
+    - script: |
+        function extIp(node){ if(node.extIPs&&node.extIPs.length){var e=node.extIPs[0];return (e&&e.address)?e.address:e;} if(node.extIP)return node.extIP; if(node.externalIp)return node.externalIp; return node.address; }
+        var envs = '${globals.clusterEnvs}'.split(','), ips = ['127.0.0.1'], api = [];
+        for (var i = 0; i < envs.length; i++) {
+          var r = jelastic.env.control.GetEnvInfo(envs[i], session);
+          if (r.result != 0) continue;
+          for (var l = 0; l < r.nodes.length; l++) {
+            if (r.nodes[l].nodeGroup == 'storage') {
+              var iIp = r.nodes[l].address, eIp = extIp(r.nodes[l]);
+              if (iIp && ips.indexOf(iIp) < 0) ips.push(iIp);
+              if (eIp && ips.indexOf(eIp) < 0) ips.push(eIp);
+            }
+          }
+        }
+        var allow = ips.join(',');
+        for (var i = 0; i < envs.length; i++) {
+          var r = jelastic.env.control.GetEnvInfo(envs[i], session);
+          if (r.result != 0) continue;
+          for (var l = 0; l < r.nodes.length; l++) {
+            if (r.nodes[l].nodeGroup == 'storage' && r.nodes[l].ismaster) {
+              api.push({
+                method: "env.control.ExecCmdById",
+                envName: envs[i],
+                nodeId: r.nodes[l].id,
+                commandList: [{ command: "gluster volume set ${globals.volumeName} auth.allow '" + allow + "'; gluster volume info ${globals.volumeName} | grep auth.allow;" }]
+              });
+              break;
+            }
+          }
+        }
+        return { result: 0, onAfterReturn: { api: api, async: true } };
+
+  # Read-only: list all storage nodes across regions with their IPs (handy for
+  # the security review and for debugging from any region).
+  op_listNodes:
+    - getClusterEnvs
+    - script: |
+        function extIp(node){ if(node.extIPs&&node.extIPs.length){var e=node.extIPs[0];return (e&&e.address)?e.address:e;} if(node.extIP)return node.extIP; if(node.externalIp)return node.externalIp; return node.address; }
+        var envs = '${globals.clusterEnvs}'.split(','), lines = ['Region\tEnv\tNode\tIntIP\tExtIP\tMaster'];
+        for (var i = 0; i < envs.length; i++) {
+          var r = jelastic.env.control.GetEnvInfo(envs[i], session);
+          if (r.result != 0) continue;
+          var region = (r.env && r.env.hostGroup && r.env.hostGroup.displayName) ? r.env.hostGroup.displayName : '(unknown)';
+          for (var l = 0; l < r.nodes.length; l++) {
+            if (r.nodes[l].nodeGroup == 'storage') {
+              lines.push([region, envs[i], r.nodes[l].id, r.nodes[l].address, extIp(r.nodes[l]), r.nodes[l].ismaster ? 'yes' : ''].join('\t'));
+            }
+          }
+        }
+        return { result: 0, type: 'info', message: lines.join('\n') };
+
+  op_custom:
+    - fanOutToMasters:
+        command: ${settings.customCmd}
