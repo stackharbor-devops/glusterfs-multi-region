@@ -6,55 +6,69 @@ targetEditions: any
 description:
   short: Scheduled restic backups of the multi-region GlusterFS volume, with one-click restore.
   text: |
-    Backs up the GlusterFS volume's mount (`/data` by default) using restic to
-    a Jelastic backup storage environment over NFS. Schedules can be pre-defined
-    (hourly/daily/weekly/monthly), custom (day-of-week + time-of-day), or raw
-    cron. Restore picks any kept snapshot and restores in place. Because the
-    cluster is synchronous write-anywhere, restoring on any storage node
-    propagates to every region.
+    One backup per multi-region cluster, run from the primary env's storage
+    master (single writer). Backs up the GlusterFS volume's mount (default
+    `/data`) via restic to a Jelastic backup-storage env over NFS. Uses the
+    vendor backup-storage convention (repo at /data/<envName>, env-name as the
+    restic password), so the storage server's `getBackups.sh` CLI works against
+    these backups.
+    Schedules from every 1 minute to every 24 hours; restore to any snapshot.
 
 baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
 
-# Restrict installation to environments that have a storage node group, so the
-# addon doesn't show up where it can't run.
+# Storage nodeType only — this addon is for GlusterFS clusters.
 targetNodes:
   nodeType:
     - storage
 
 # ---------------------------------------------------------------------------
-# Settings forms — `main` is the config form (Configure button), `restore` is
-# the restore-from-snapshot form (Restore button).
+# Settings forms
 # ---------------------------------------------------------------------------
 settings:
   main:
     fields:
+      - type: displayfield
+        hideLabel: true
+        height: 30
+        markup: "Schedules under 10 minutes use flock to prevent overlap, but ensure the dataset fits the chosen interval. 1-minute backups are for testing tiny datasets only."
+
       - type: radio-fieldset
         name: scheduleType
         hidden: false
         default: '1'
         values:
           - value: 1
-            caption: Pre-defined
+            caption: Pre-defined frequency
           - value: 2
-            caption: Custom (day + time)
+            caption: Custom (day-of-week + time)
           - value: 3
-            caption: Manual (raw cron)
+            caption: Manual (raw cron expression)
         showIf:
           1:
             - name: cronTime
-              caption: Backup schedule
+              caption: Backup frequency
               type: list
               editable: false
+              default: "0 * * * *"
               values:
-                - value: 0 * * * *
-                  caption: Hourly (at minute 0)
-                - value: 0 0 * * *
-                  caption: Daily (at 00:00 UTC)
-                - value: 0 0 * * 0
-                  caption: Weekly (at 00:00 UTC on Sunday)
-                - value: 0 0 1 * *
-                  caption: Monthly (at 00:00 UTC on day 1)
-              default: 0 0 * * *
+                - value: "* * * * *"
+                  caption: "Every 1 minute  ⚠ test/tiny datasets only"
+                - value: "*/5 * * * *"
+                  caption: "Every 5 minutes"
+                - value: "*/10 * * * *"
+                  caption: "Every 10 minutes"
+                - value: "0 * * * *"
+                  caption: "Every 1 hour (at minute 0)"
+                - value: "0 */2 * * *"
+                  caption: "Every 2 hours"
+                - value: "0 */3 * * *"
+                  caption: "Every 3 hours"
+                - value: "0 */6 * * *"
+                  caption: "Every 6 hours"
+                - value: "0 */12 * * *"
+                  caption: "Every 12 hours"
+                - value: "0 0 * * *"
+                  caption: "Every 24 hours (at 00:00 UTC)"
           2:
             - type: string
               name: backupTime
@@ -94,14 +108,9 @@ settings:
             - name: cronTime
               caption: Crontab expression
               type: string
-              default: 0 2 * * *
+              default: "0 2 * * *"
               regexText: Cron expression looks invalid - five fields separated by spaces.
               regex: "^[ -~]{6,}$"
-
-      - type: displayfield
-        hideLabel: true
-        height: 30
-        markup: "Source path: the GlusterFS mount on this region's storage nodes. Backups run from the master node — the volume is shared with all regions, so one backup covers everything."
 
       - type: string
         name: sourcePath
@@ -114,7 +123,7 @@ settings:
       - type: list
         name: storageName
         caption: Backup storage environment
-        tooltip: "A Jelastic backup-storage env (separate env you have already created) whose /data we will NFS-mount to /opt/backup on this region's master and write restic snapshots into."
+        tooltip: "A Jelastic backup-storage env (created by the orchestrator if you ticked 'Deploy a backup server', or one you created separately via the Marketplace 'Backup Storage' app)."
         dependsOn: region
         required: true
 
@@ -123,25 +132,28 @@ settings:
         caption: Retention (snapshots to keep)
         tooltip: "Older snapshots are pruned via `restic forget --keep-last N`."
         min: 1
-        max: 60
-        default: 7
+        max: 200
+        default: 24
 
       - type: toggle
         name: isAlwaysUmount
         caption: Always unmount backup storage when idle
-        tooltip: "Keep the NFS mount only while backup/restore is running."
-        value: true
+        tooltip: "Auto-disabled for high-frequency schedules (<60 min) to avoid mount churn."
+        value: false
 
     onBeforeInit: |
-      // Populate the storageName dropdown with the user's existing envs that
-      // look like backup-storage envs (any env with a "storage" node-type, but
-      // NOT this one). Same idea as wp-backup configOnBeforeInit.js, inlined.
+      // If the orchestrator pre-configured us (deployBackupServer flow), short-
+      // circuit the dialog and use the inlined settings as-is. The values
+      // arrive via `settings.preconfigured == 'true'` and full settings keys.
+      if ('${settings.preconfigured:false}' == 'true') {
+        return { result: 0, settings: settings };
+      }
+      // Populate the storageName dropdown with the user's existing envs.
       var resp = jelastic.environment.control.GetEnvs(appid, session), vals = {};
       if (resp && resp.result == 0) {
         for (var i = 0; i < resp.infos.length; i++) {
           var info = resp.infos[i];
           if (!info || !info.env || info.env.envName == '${env.envName}') continue;
-          // Match any env whose displayed name says "storage" or whose nodeGroups include "storage" / "vps"
           var nm = info.env.envName, dn = info.env.displayName || nm;
           vals[nm] = dn + " (" + nm + ")";
         }
@@ -149,10 +161,9 @@ settings:
       if (!Object.keys(vals).length) {
         return { result: 0, settings: { fields: [
           { type: "displayfield", cls: "warning", hideLabel: true, height: 50,
-            markup: "No other environments found. Create a Jelastic 'Backup Storage' (or any small env with a /data mount) first, then re-open this dialog." }
+            markup: "No other environments found. Either redeploy the cluster with 'Deploy a backup server' ticked, or create a Jelastic Backup Storage env first then re-import this addon." }
         ] } };
       }
-      // Patch the dropdown's values list in the existing settings.fields.
       for (var f = 0; f < settings.fields.length; f++) {
         if (settings.fields[f].name == 'storageName') settings.fields[f].values = vals;
       }
@@ -165,7 +176,7 @@ settings:
       var resp = api.env.control.ExecCmdById({
         envName: '${env.envName}', session: session,
         nodeId: '${nodes.storage.master.id}',
-        commandList: toJSON([{ command: "[ -d /opt/backup ] && restic -r /opt/backup snapshots --json 2>/dev/null || echo '[]'" }])
+        commandList: toJSON([{ command: "[ -x /root/glusterfs-backup-run.sh ] && /root/glusterfs-backup-list.sh 2>/dev/null || echo '[]'" }])
       });
       var snapshots = [];
       try { snapshots = JSON.parse(resp.responses[0].out || '[]'); } catch(e) {}
@@ -173,7 +184,7 @@ settings:
       if (!snapshots.length) {
         return { result: 0, settings: { fields: [
           { type: "displayfield", cls: "warning", hideLabel: true, height: 60,
-            markup: "No restic snapshots found in /opt/backup. Run 'Backup Now' first, or mount your backup storage env and ensure RESTIC_PASSWORD is set." }
+            markup: "No restic snapshots found. Run 'Backup Now' first to create one." }
         ] } };
       }
       for (var i = 0; i < snapshots.length; i++) {
@@ -190,9 +201,10 @@ settings:
       ] } };
 
 # ---------------------------------------------------------------------------
-# Bind the addon to the storage node-group so the card appears there.
+# Bind the addon card to the storage node-group's Add-Ons panel.
 # ---------------------------------------------------------------------------
 onInstall:
+  - assertPrimary
   - installAddon:
       id: glusterfs-backup-addon
       nodeGroup: storage
@@ -211,7 +223,7 @@ onAfterRedeployContainer[storage]:
   - installRestic
 
 # ---------------------------------------------------------------------------
-# The addon card.
+# Addon card on the storage node-group.
 # ---------------------------------------------------------------------------
 addons:
   - id: glusterfs-backup-addon
@@ -223,7 +235,7 @@ addons:
         action: backupNow
         confirmText: "Run a backup now? (Uses the configured schedule's storage + path.)"
         loadingText: Backing up...
-        successText: "Backup completed — check the env Tasks log for restic output."
+        successText: "Backup completed - check the env Tasks log for restic output."
       - caption: Configure
         action: configure
         settings: main
@@ -235,19 +247,37 @@ addons:
         settings: restore
         submitButtonText: Restore
         title: Restore Backup
-        confirmText: "Restore the selected snapshot to the target path? This overwrites files at the target and replicates to every region."
+        confirmText: "Restore the selected snapshot to the target path? Overwrites files at the target, and replicates to every region."
         loadingText: Restoring...
         successText: "Restore complete."
+      - caption: Verify Backups
+        action: verifyBackups
+        confirmText: "Run restic check to verify backup integrity? This reads the entire repo."
+        loadingText: Verifying...
+        successText: "Restic check complete - see Tasks log."
 
 globals:
   base_path: ${baseUrl}
   resticRepo: /opt/backup
-  resticPassword: ${fn.password(32)}
+  # Restic password = the env name (vendor backup-storage convention). This
+  # makes our backups discoverable on the storage server via the vendor's
+  # getBackups.sh <envName> CLI.
+  resticPassword: ${env.envName}
 
 # ---------------------------------------------------------------------------
 # Actions
 # ---------------------------------------------------------------------------
 actions:
+  # Refuse install on non-primary envs. The "primary" is the env whose name
+  # ends in "-1" (orchestrator naming convention). Single backup per cluster.
+  assertPrimary:
+    - script: |
+        var nm = '${env.envName}';
+        if (!/-1$/.test(nm)) {
+          return { result: 1, error: "This backup addon must be installed on the PRIMARY env (the one ending in '-1'). One backup runs per multi-region cluster; the volume is sync-replicated so backing up from any other region is redundant." };
+        }
+        return { result: 0 };
+
   installRestic:
     - cmd[storage]: |-
         set -e;
@@ -264,7 +294,6 @@ actions:
         elif command -v apt-get >/dev/null 2>&1; then
           apt-get update; apt-get install -y restic;
         else
-          # Fallback: install from official binary
           ARCH=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/');
           VER=0.16.4;
           curl -fsSL "https://github.com/restic/restic/releases/download/v${VER}/restic_${VER}_linux_${ARCH}.bz2" | bunzip2 > /usr/local/bin/restic;
@@ -273,9 +302,9 @@ actions:
         restic version;
       user: root
 
-  # Persist the user-chosen knobs (cron expression, storage env, retention,
-  # source path, mount toggle) on the storage node group's globals for later
-  # actions to read. Also computes the cron expression for the "Custom" mode.
+  # Persist schedule + storage + path globals, then write runner scripts + cron.
+  # High-frequency schedules (<60 min) auto-disable the "always umount" toggle
+  # to avoid mount/umount thrashing.
   setSchedule:
     - if ('${settings.scheduleType}' == '2'):
         - convertCustomToCron
@@ -286,17 +315,26 @@ actions:
         storageEnv: ${settings.storageName}
         sourcePath: ${settings.sourcePath}
         backupCount: ${settings.backupCount}
-        isAlwaysUmount: ${settings.isAlwaysUmount}
-    - if ('${settings.isAlwaysUmount}' == 'true'):
+        # Capture but defer; we'll override for high-frequency below.
+        isAlwaysUmountRequested: ${settings.isAlwaysUmount}
+    - script: |
+        // If the schedule is sub-hourly, force keep-mount-permanent regardless
+        // of the user's umount toggle (avoid churn).
+        var cron = '${globals.cron}', sub = false;
+        if (/^\*\s/.test(cron) || /^\*\/\d+\s/.test(cron)) sub = true;
+        return { result: 0, onAfterReturn: { setGlobals: {
+          isAlwaysUmount: sub ? 'false' : '${globals.isAlwaysUmountRequested}',
+          isHighFrequency: sub ? 'true' : 'false'
+        } } };
+    - if ('${globals.isAlwaysUmount}' == 'true'):
         - removeMount
-    - if ('${settings.isAlwaysUmount}' != 'true'):
+    - if ('${globals.isAlwaysUmount}' != 'true'):
         - removeMount
         - addMount
     - writeBackupScripts
     - writeCronEntry
     - persistConfig
 
-  # Day-of-week + time-of-day → cron expression (UTC-normalised).
   convertCustomToCron:
     - script: |
         var tz = '${settings.tz}' || 'UTC';
@@ -310,8 +348,7 @@ actions:
         for (var i = 0; i < picked.length; i++) {
           if (picked[i]) {
             var day = i + dd;
-            if (day < 0) day += 7;
-            else if (day > 6) day -= 7;
+            if (day < 0) day += 7; else if (day > 6) day -= 7;
             days.push(day);
           }
         }
@@ -320,8 +357,6 @@ actions:
         var cron = d2.getMinutes() + ' ' + d2.getHours() + ' * * ' + days.join(',');
         return { result: 0, onAfterReturn: { setGlobals: { cron: cron } } };
 
-  # Mount the chosen Jelastic storage env's /data to /opt/backup on this env's
-  # storage master, via NFS. The mount is persistent unless isAlwaysUmount=true.
   addMount:
     - getStorageCtid
     - api: env.file.AddMountPointById
@@ -346,8 +381,6 @@ actions:
         }
         return { result: 0 };
 
-  # Resolve the chosen storage env's master node's container id (ctid), needed
-  # for the AddMountPointById call.
   getStorageCtid:
     - script: |
         var r = jelastic.env.control.GetEnvInfo('${settings.storageName}', session);
@@ -357,74 +390,108 @@ actions:
         }
         return { result: 1, error: "Could not resolve a master node on storage env '${settings.storageName}'." };
 
-  # Drop /root/glusterfs-backup-run.sh + /root/glusterfs-backup-restore.sh on
-  # every storage node (so the master always has them — also handy if you ever
-  # want to run them manually from another node). The runner scripts handle
-  # mount-if-needed, restic backup, retention, and unmount-if-toggled.
+  # Backup runner: vendor convention is one restic repo per source env, located
+  # at /data/<envName>/ on the storage server, with env name as the password.
+  # The whole runner is wrapped in flock so concurrent fires (cron drift,
+  # manual click during scheduled run, etc.) cannot collide.
   writeBackupScripts:
     - cmd[storage]: |-
         mkdir -p /opt/backup;
-        cat > /root/glusterfs-backup-run.sh <<'EOF'
+        cat > /root/glusterfs-backup-run.sh <<EOF
         #!/bin/bash
         set -e
-        REPO=${globals.resticRepo}
+        REPO_ROOT=${globals.resticRepo}
+        REPO=\$REPO_ROOT/${env.envName}
         SRC=${globals.sourcePath}
         KEEP=${globals.backupCount}
         ALWAYS_UMOUNT=${globals.isAlwaysUmount}
         export RESTIC_PASSWORD='${globals.resticPassword}'
-        export RESTIC_REPOSITORY="$REPO"
+        export RESTIC_REPOSITORY="\$REPO"
 
-        # If always-umount: NFS-mount the storage env's /data here just for this run.
-        mountpoint -q $REPO || mount -t nfs4 -o vers=4,nolock $(cat /opt/backup-source 2>/dev/null) $REPO || true
-        if ! mountpoint -q $REPO; then echo "ERROR: backup repo $REPO is not mounted"; exit 1; fi
+        mountpoint -q "\$REPO_ROOT" || mount -t nfs4 -o vers=4,nolock,bg,intr "${settings.storageName}":/data /opt/backup || true
+        if ! mountpoint -q "\$REPO_ROOT"; then echo "ERROR: backup repo \$REPO_ROOT is not mounted"; exit 1; fi
+        mkdir -p "\$REPO"
 
         # Initialise repo if empty
         restic snapshots >/dev/null 2>&1 || restic init
 
-        # Backup the mount (live FUSE view of the synchronous volume)
-        restic backup "$SRC" --tag glusterfs-multiregion --host "$(hostname)" --verbose
-        restic forget --keep-last "$KEEP" --prune
+        # Backup the FUSE mount (live view of the sync stretched volume)
+        restic backup "\$SRC" --tag glusterfs-multiregion --host "\$(hostname)" --verbose
+        restic forget --keep-last "\$KEEP" --prune
 
-        # Optional unmount
-        if [ "$ALWAYS_UMOUNT" = "true" ]; then umount $REPO || true; fi
+        if [ "\$ALWAYS_UMOUNT" = "true" ]; then umount "\$REPO_ROOT" || true; fi
         EOF
         chmod +x /root/glusterfs-backup-run.sh;
 
-        cat > /root/glusterfs-backup-restore.sh <<'EOF'
+        # Wrapped runner: flock prevents overlapping invocations (critical for
+        # 1m/5m schedules where a previous run may still be in progress).
+        cat > /root/glusterfs-backup-locked.sh <<'EOF'
+        #!/bin/bash
+        exec /usr/bin/flock -n /var/lock/glusterfs-backup.lock /root/glusterfs-backup-run.sh "$@"
+        EOF
+        chmod +x /root/glusterfs-backup-locked.sh;
+
+        # Restore runner.
+        cat > /root/glusterfs-backup-restore.sh <<EOF
         #!/bin/bash
         set -e
-        SNAP_ID="$1"; TARGET="$2"
-        REPO=${globals.resticRepo}
+        SNAP_ID="\$1"; TARGET="\$2"
+        REPO_ROOT=${globals.resticRepo}
+        REPO=\$REPO_ROOT/${env.envName}
         export RESTIC_PASSWORD='${globals.resticPassword}'
-        export RESTIC_REPOSITORY="$REPO"
-        [ -z "$SNAP_ID" ] && { echo "usage: $0 <snapshot-id> <target-path>"; exit 1; }
-        [ -z "$TARGET" ] && TARGET=${globals.sourcePath}
-        mountpoint -q $REPO || mount -t nfs4 -o vers=4,nolock $(cat /opt/backup-source 2>/dev/null) $REPO || true
-        if ! mountpoint -q $REPO; then echo "ERROR: backup repo $REPO is not mounted"; exit 1; fi
-        echo "Restoring snapshot $SNAP_ID -> $TARGET"
-        restic restore "$SNAP_ID" --target "$TARGET" --verbose
+        export RESTIC_REPOSITORY="\$REPO"
+        [ -z "\$SNAP_ID" ] && { echo "usage: \$0 <snapshot-id> <target-path>"; exit 1; }
+        [ -z "\$TARGET" ] && TARGET=${globals.sourcePath}
+        mountpoint -q "\$REPO_ROOT" || mount -t nfs4 -o vers=4,nolock,bg,intr "${settings.storageName}":/data /opt/backup || true
+        if ! mountpoint -q "\$REPO_ROOT"; then echo "ERROR: backup repo \$REPO_ROOT is not mounted"; exit 1; fi
+        echo "Restoring snapshot \$SNAP_ID to \$TARGET"
+        restic restore "\$SNAP_ID" --target "\$TARGET" --verbose
         EOF
         chmod +x /root/glusterfs-backup-restore.sh;
+
+        # JSON snapshot lister for the Restore button's onBeforeInit.
+        cat > /root/glusterfs-backup-list.sh <<EOF
+        #!/bin/bash
+        REPO_ROOT=${globals.resticRepo}
+        REPO=\$REPO_ROOT/${env.envName}
+        export RESTIC_PASSWORD='${globals.resticPassword}'
+        export RESTIC_REPOSITORY="\$REPO"
+        mountpoint -q "\$REPO_ROOT" || mount -t nfs4 -o vers=4,nolock,bg,intr "${settings.storageName}":/data /opt/backup 2>/dev/null || true
+        restic snapshots --json 2>/dev/null || echo '[]'
+        EOF
+        chmod +x /root/glusterfs-backup-list.sh;
+
+        # Verify runner.
+        cat > /root/glusterfs-backup-verify.sh <<EOF
+        #!/bin/bash
+        set -e
+        REPO_ROOT=${globals.resticRepo}
+        REPO=\$REPO_ROOT/${env.envName}
+        export RESTIC_PASSWORD='${globals.resticPassword}'
+        export RESTIC_REPOSITORY="\$REPO"
+        mountpoint -q "\$REPO_ROOT" || mount -t nfs4 -o vers=4,nolock,bg,intr "${settings.storageName}":/data /opt/backup || true
+        if ! mountpoint -q "\$REPO_ROOT"; then echo "ERROR: backup repo \$REPO_ROOT is not mounted"; exit 1; fi
+        restic check --read-data-subset=5%
+        EOF
+        chmod +x /root/glusterfs-backup-verify.sh;
       user: root
 
   writeCronEntry:
     - cmd[${nodes.storage.master.id}]: |-
-        # Only the storage MASTER node runs the cron — single writer to the
-        # backup repo prevents restic lock contention.
-        crontab -l 2>/dev/null | grep -v 'glusterfs-backup-run.sh' > /tmp/cron.tmp || true
-        echo '${globals.cron} /root/glusterfs-backup-run.sh >> /var/log/glusterfs-backup.log 2>&1' >> /tmp/cron.tmp
+        # ONLY the storage master of the PRIMARY env runs the backup cron -
+        # single writer to the restic repo, prevents lock contention.
+        crontab -l 2>/dev/null | grep -v 'glusterfs-backup-' > /tmp/cron.tmp || true
+        echo '${globals.cron} /root/glusterfs-backup-locked.sh >> /var/log/glusterfs-backup.log 2>&1' >> /tmp/cron.tmp
         crontab /tmp/cron.tmp; rm -f /tmp/cron.tmp;
-        echo "Cron schedule set: ${globals.cron}"
+        echo "Cron schedule set: ${globals.cron} (high-frequency mode: ${globals.isHighFrequency})";
       user: root
 
   removeSchedule:
     - cmd[${nodes.storage.master.id}]: |-
-        crontab -l 2>/dev/null | grep -v 'glusterfs-backup-run.sh' | crontab -;
+        crontab -l 2>/dev/null | grep -v 'glusterfs-backup-' | crontab -;
         echo "Removed scheduled backup cron entry."
       user: root
 
-  # Save the user's choices on the node-group's globals so day-2 buttons can
-  # recover them without re-submitting the settings form.
   persistConfig:
     - env.control.ApplyNodeGroupData[storage]:
         data:
@@ -437,10 +504,15 @@ actions:
 
   backupNow:
     - cmd[${nodes.storage.master.id}]: |-
-        /root/glusterfs-backup-run.sh
+        /root/glusterfs-backup-locked.sh
       user: root
 
   restore:
     - cmd[${nodes.storage.master.id}]: |-
         /root/glusterfs-backup-restore.sh '${settings.snapshotId}' '${settings.restorePath}'
+      user: root
+
+  verifyBackups:
+    - cmd[${nodes.storage.master.id}]: |-
+        /root/glusterfs-backup-verify.sh
       user: root
