@@ -43,6 +43,27 @@ onBeforeInit: |
   } catch (e) { maxSame = 0; }
   var maxNodes = (maxSame > 0) ? maxSame : 16;
 
+  // Compute available regions for the BACKUP SERVER picker. The form already
+  // has a top-level `regionlist` for the cluster's regions; having a SECOND
+  // regionlist in the same form (especially nested in a showIf) makes the
+  // dialog fail to render silently. We avoid that by rendering the backup-
+  // server picker as a plain `list` populated via GetRegions here.
+  var availableRegions = {};
+  try {
+    var rr = jelastic.environment.control.GetRegions(appid, session);
+    if (rr && rr.result == 0 && rr.array) {
+      for (var ra = 0; ra < rr.array.length; ra++) {
+        var hwg = rr.array[ra].hardNodeGroups || [];
+        for (var rh = 0; rh < hwg.length; rh++) {
+          var hg = hwg[rh];
+          if (hg && hg.isActive !== false) {
+            availableRegions[hg.uniqueName] = (rr.array[ra].displayName || '') + (rr.array[ra].displayName ? ' - ' : '') + (hg.displayName || hg.uniqueName);
+          }
+        }
+      }
+    }
+  } catch (e) { /* leave empty; field shows no values, but dialog still renders */ }
+
   // Cap the cluster-mode slider at the smaller of 9 and the account's
   // same-type quota. Single node per region needs no quota beyond 1.
   var clusterMax = (maxSame > 0 && maxSame < 9) ? maxSame : 9;
@@ -94,6 +115,11 @@ onBeforeInit: |
     // auto-configure the backup addon against it. Pick the region explicitly:
     //  - same region as primary  = fastest, simplest, NO DR isolation (avoid)
     //  - a different region      = DR-grade (recommended for production)
+    //
+    // NOTE: backup-server region is a regular `list` (not a second
+    // `regionlist`) because two regionlist fields in one form make the dialog
+    // fail to render silently. We populated `availableRegions` from
+    // GetRegions above.
     { type: "checkbox", name: "deployBackupServer",
       caption: "Deploy a backup server and auto-configure scheduled backups",
       value: false,
@@ -101,10 +127,10 @@ onBeforeInit: |
         "true": [
           { type: "displayfield", hideLabel: true, height: 50, cls: "info",
             markup: "Pick a region for the backup server. DR best practice: pick a region OUTSIDE the cluster's regions. Picking a cluster region works but offers no isolation from a region failure." },
-          { type: "regionlist", name: "backupServerRegion",
+          { type: "list", name: "backupServerRegion",
             caption: "Backup server region",
-            multiSelect: false, required: true, min: 1, max: 1,
-            disableInactive: true, selectFirstAvailable: false },
+            required: true, editable: false,
+            values: availableRegions },
           { type: "spinner", name: "backupStorageSize",
             caption: "Backup storage disk size, GB",
             min: 5, max: 1000, "default": 50 }
