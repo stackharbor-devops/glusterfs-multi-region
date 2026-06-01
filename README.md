@@ -233,10 +233,33 @@ Two steps:
    `rebalance start` + `heal full`. **Aborts cleanly if the new-node count isn't
    a multiple of the replica count** — that would leave a partial replica set.
 
-### Backup (separate addon)
+### Backup / restore
 
-A backup addon is in development; see `addons/backup.jps`. It schedules restic
-backups of the volume to S3 / SFTP, with rotation.
+```
+Import → URL: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main/addons/backup.jps
+```
+
+Install **into any region's env** (the addon runs from the storage master of
+that env, backing up the FUSE mount which is the live synchronous volume — so a
+single backup from any region covers everything). After install you'll see a
+**GlusterFS Backup/Restore** card in the storage node-group's Add-Ons panel
+with three buttons:
+
+| Button | What it does |
+|---|---|
+| Configure | Pick schedule (Pre-defined hourly/daily/weekly/monthly, Custom day+time with timezone, or raw Crontab), backup-storage env, source path (default `/data`), retention count (1–60 snapshots), always-unmount toggle. |
+| Backup Now | Runs the configured restic backup once, immediately. |
+| Restore | Lists existing snapshots in a dropdown; pick one + restore target path. Restores in place; since the volume is sync-replicated, the restore propagates everywhere. |
+
+**Backend:** Restic on top of an NFS mount to a Jelastic backup-storage
+environment. Restic does deduplication + compression + AES-encryption out of
+the box; the password is generated at install via `${fn.password(32)}` and
+persisted on the storage node-group. The `Always unmount` toggle keeps the NFS
+mount only while a backup or restore is running.
+
+**Prerequisite:** a separate Jelastic backup-storage env (Marketplace →
+"Backup Storage" / any small env with `/data`) created beforehand — the
+Configure form's storage dropdown lists your existing envs.
 
 ---
 
@@ -321,6 +344,7 @@ addons/
   addRegion.jps                    day-2: add a new region (replica +1)
   forgetRegion.jps                 day-2: remove a region (replica -1)
   addCapacitySlice.jps             day-2: grow capacity (sets +1; replica unchanged)
+  backup.jps                       scheduled restic backups + restore (mounts a backup-storage env)
 success/success.md                 post-install summary shown to the user
 ```
 
