@@ -16,14 +16,20 @@ categories:
   - apps/clusters
 
 # ---------------------------------------------------------------------------
-# Install dialog. Built dynamically so the "replica sets" range can be capped to
-# the account's node quota. The volume model is expressed as two dimensions:
-#   replicaCount  = copies per file (redundancy)
-#   replicaSets   = number of replica sets (capacity slices / distribution width)
+# Install dialog (rendered dynamically by onBeforeInit). Volume model:
+#   replicaCount  = copies per file in a region (redundancy)
+#   replicaSets   = capacity slices / distribution width
 #   nodesPerRegion = replicaCount * replicaSets   (computed in initGlobals)
 # replicaSets = 1            -> pure replicated (mirror)
 # replicaSets > 1            -> distributed-replicated (scales capacity)
 # topology = single          -> 1 node/region, single-brick volume, geo-rep only
+#
+# UX uses showIf to hide irrelevant fields based on the chosen model:
+#   - replicationModel = async -> reveals topology + replica config
+#       - topology = cluster -> reveals replicaCount + capacity slices
+#       - topology = single  -> no extra fields
+#   - replicationModel = sync  -> reveals only "nodes per region" spinner
+#                                 (replica = number of regions, auto)
 # ---------------------------------------------------------------------------
 onBeforeInit: |
   var minPerSet = 2, maxSame = 0, maxTotal = 0;
@@ -38,35 +44,89 @@ onBeforeInit: |
     }
   } catch (e) { maxSame = 0; maxTotal = 0; }
 
-  var maxSets = (maxSame >= minPerSet) ? Math.floor(maxSame / minPerSet) : 1;
-  if (maxSets < 1) maxSets = 1;
+  // Async cluster: total nodes/region = replicaCount * replicaSets, so the max
+  // # of slices is maxSame / minReplicaCount(2). Sync: nodes/region is bounded
+  // only by maxSame (replica is fixed at #regions).
+  var maxSetsAsync = (maxSame >= minPerSet) ? Math.floor(maxSame / minPerSet) : 1;
+  if (maxSetsAsync < 1) maxSetsAsync = 1;
+  var maxNodesSync = (maxSame > 0) ? maxSame : 16;
 
-  var fields = [
-    { type: "regionlist", name: "regions", caption: "Regions", multiSelect: true,
-      required: true, min: 2, max: 5, disableInactive: true, selectFirstAvailable: false },
-    { type: "string", name: "volumeName", caption: "Volume name", "default": "data", required: true },
-    { type: "string", name: "mountPoint", caption: "Mount point", "default": "/data", required: true },
-    { type: "list", name: "networkMode", caption: "Cross-region networking", "default": "internal",
+  // Topology block revealed only when async + cluster. replicaCount default 3,
+  // capacity slices default 1 (= pure replicated; bump to >1 for distributed-rep).
+  var asyncClusterFields = [
+    { type: "list", name: "replicaCount", caption: "Replica count (copies of every file)",
+      "default": "3", required: true, editable: false,
       values: [
-        { value: "internal", caption: "Internal - platform GRE routing (no public IPs)" },
-        { value: "public",   caption: "Public WAN - adds a public IP to every storage node" }
+        { value: "2", caption: "2 copies" },
+        { value: "3", caption: "3 copies (recommended)" }
       ] },
-    { type: "list", name: "replicationModel", caption: "Replication model", "default": "async",
-      values: [
-        { value: "async", caption: "Async geo-replication - one-way primary->secondaries (fast local writes, DR)" },
-        { value: "sync",  caption: "Synchronous stretched cluster - write to ANY region (odd #regions; WAN write latency)" }
-      ] },
-    { type: "list", name: "topology", caption: "Per-region topology (async model)", "default": "cluster",
+    { type: "spinner", name: "replicaSets",
+      caption: "Capacity slices (distributed-replicated)",
+      min: 1, max: maxSetsAsync, "default": 1 }
+  ];
+
+  // Block revealed for async model: topology choice + (if cluster) the above.
+  var asyncFields = [
+    { type: "list", name: "topology", caption: "Per-region topology",
+      "default": "cluster", required: true, editable: false,
       values: [
         { value: "single",  caption: "Single node per region (geo-replication only)" },
         { value: "cluster", caption: "Cluster per region (replicated / distributed-replicated)" }
+      ],
+      showIf: { "cluster": asyncClusterFields } }
+  ];
+
+  // Block revealed for sync model: a single nodes/region spinner. The
+  // replica count is auto-set to the number of regions, so it does not appear.
+  var syncFields = [
+    { type: "displayfield", hideLabel: true, cls: "info", height: 50,
+      markup: "<p>Synchronous stretched cluster requires an <b>odd</b> number of regions (3, 5, 7) for quorum. Replica count is automatic (= number of regions). Writes are synchronous, so write latency reflects cross-region round-trip time.</p>" },
+    { type: "spinner", name: "replicaSets",
+      caption: "Nodes per region (each adds a capacity slice)",
+      min: 1, max: maxNodesSync, "default": 1 }
+  ];
+
+  var fields = [
+    // Intro / one-line context
+    { type: "displayfield", hideLabel: true, height: 30, markup:
+      "<p>Pick the replication model first, then regions. Topology fields below adapt to your choices.</p>" },
+
+    // The biggest decision — model — comes first, reveals mode-specific fields.
+    { type: "list", name: "replicationModel", caption: "Replication model",
+      "default": "async", required: true, editable: false,
+      values: [
+        { value: "async", caption: "Async geo-replication - one-way primary->secondaries (fast local writes, DR)" },
+        { value: "sync",  caption: "Synchronous stretched cluster - write to ANY region (write-anywhere; WAN latency)" }
+      ],
+      showIf: { "async": asyncFields, "sync": syncFields } },
+
+    // Regions
+    { type: "regionlist", name: "regions", caption: "Regions", multiSelect: true,
+      required: true, min: 2, max: 7, disableInactive: true, selectFirstAvailable: false },
+
+    // Networking
+    { type: "list", name: "networkMode", caption: "Cross-region networking",
+      "default": "internal", required: true, editable: false,
+      values: [
+        { value: "internal", caption: "Internal - platform GRE routing (no public IPs needed)" },
+        { value: "public",   caption: "Public WAN - attaches a public IPv4 to every storage node" }
       ] },
-    { type: "list", name: "replicaCount", caption: "Replica count - redundancy (cluster only)", "default": "3",
-      values: [ { value: "2", caption: "2 copies" }, { value: "3", caption: "3 copies (recommended)" } ] },
-    { type: "spinner", name: "replicaSets", caption: "Replica sets - capacity slices (cluster only)",
-      min: 1, max: maxSets, "default": 1 },
+
+    // Volume
+    { type: "string", name: "volumeName", caption: "Volume name", "default": "data", required: true,
+      regex: "^[a-zA-Z0-9_-]+$", regexText: "Volume name: letters, digits, dash, underscore only." },
+    { type: "string", name: "mountPoint", caption: "Mount point", "default": "/data", required: true,
+      regex: "^/[a-zA-Z0-9/_-]+$", regexText: "Mount point must start with / and use letters/digits/dash/underscore." },
+
+    // Env name
     { type: "envname", name: "envName", caption: "Environment", required: true, randomName: true }
   ];
+
+  // Quota warning if cluster mode is impossible (< 3 nodes/env allowed).
+  if (maxSame > 0 && maxSame < 3) {
+    fields.unshift({ type: "displayfield", cls: "warning", hideLabel: true, height: 50,
+      markup: "<p>Your account allows max <b>" + maxSame + "</b> nodes of the same type per environment - only 'Single node per region' (async) will fit; cluster modes need at least 3 same-type nodes. Upgrade your account for in-region clustering.</p>" });
+  }
 
   if (maxSame > 0 && maxSame < 3) {
     fields.unshift({ type: "displayfield", cls: "warning", hideLabel: true, height: 45,
