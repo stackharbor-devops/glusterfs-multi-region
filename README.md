@@ -1,241 +1,344 @@
-# Multi-Region GlusterFS Cluster (JPS)
+# Multi-Region GlusterFS Cluster — Write-Anywhere
 
-A standalone Jelastic/Virtuozzo JPS package that deploys an independent GlusterFS
-storage cluster in each of several regions and connects them with native
-**GlusterFS geo-replication**. It is a *service-only* package — no app/web/DB
-layers — modelled on `jelastic-jps/galera-multiregion` but for storage.
+A turnkey [Jelastic/Virtuozzo JPS](https://docs.jelastic.com/marketplace) package
+that deploys a **synchronous stretched GlusterFS volume** spanning multiple
+regions. Write to any node in any region — the change replicates synchronously
+to every other region. Repository: <https://github.com/stackharbor-devops/glusterfs-multi-region>.
 
-## What it deploys
+---
 
-```
- Region 1 (PRIMARY)            Region 2                     Region N
- ┌───────────────────┐        ┌───────────────────┐        ┌───────────────────┐
- │ storage cluster   │  geo   │ storage cluster   │  geo   │ storage cluster   │
- │ (Certified Storage│ ─────▶ │ (Certified Storage│ ─────▶ │ (Certified Storage│
- │  nodes, glusterd) │  rep   │  nodes, glusterd) │  rep   │  nodes, glusterd) │
- │ volume: data      │        │ volume: data      │        │ volume: data      │
- └───────────────────┘        └───────────────────┘        └───────────────────┘
-        envName-1                    envName-2                    envName-N
-```
-
-- One environment per region (`envName-1 … envName-N`), all in one env-group.
-- **Region 1 is the geo-replication master**; it pushes the volume to every other
-  region (one-directional **star** topology, asynchronous).
-- Cross-region transport is selectable: **internal** (platform GRE routing, no
-  public IPs — default) or **public** (WAN, one public IP per node). See
-  *Networking* below.
-
-## Replication models
-
-Chosen at deploy via **Replication model**:
-
-- **Async geo-replication (default)** — an independent GlusterFS cluster per
-  region; the **primary** region pushes the volume to every secondary via native
-  geo-replication. One-directional (write primary, read secondaries),
-  asynchronous, efficient over WAN. Best for read-heavy / DR / high-latency.
-- **Synchronous stretched cluster** — **all regions form one volume** with
-  `replica = number of regions` (one brick per region per replica set). **Write to
-  any node in any region and it replicates to every region**, synchronously
-  (multi-master). Requires an **odd region count** (3, 5, …) for split-brain
-  quorum. Slicing still applies: more nodes per region ⇒ more replica sets ⇒
-  distributed-replicated capacity. **Tradeoff:** writes wait for all regions, so
-  write latency ≈ cross-region round-trip.
-
-> GlusterFS geo-replication is one-directional by design, so true write-anywhere
-> requires the synchronous model — there is no async multi-master option for files.
-
-## Volume model (async model — single / cluster / slicing)
-
-The install dialog expresses the volume as two dimensions:
-
-| Field | Meaning |
-|-------|---------|
-| **Per-region topology** | `single` = 1 node/region; `cluster` = multi-node/region |
-| **Replica count** | copies per file within a region (redundancy): 2 or 3 |
-| **Replica sets** | number of replica sets = capacity "slices" (distribution width) |
-
-`nodesPerRegion = replicaCount × replicaSets`.
-
-| Choice | Resulting GlusterFS volume | Use |
-|--------|----------------------------|-----|
-| topology `single` | single-brick volume, geo-replicated | **Option 1**: single node per region |
-| `cluster`, sets = 1 | `replica N` (pure mirror) | **Option 2**: cluster per region, redundancy only |
-| `cluster`, sets > 1 | **distributed-replicated** (`replica N`, bricks = N×sets) | **Advanced**: scale capacity *and* keep redundancy |
-
-Example: replica 3 × 2 sets = 6 nodes/region → ~2× usable capacity vs a single
-node, every file still stored 3×. Add another set (3 more nodes) → ~3× capacity.
-
-## File layout
+## What you get in one install
 
 ```
-manifest.jps                     # orchestrator (install): region picker → per-region envs → geo-rep
-scripts/
-  getClusterEnvs.js              # discover sibling regional envs by name prefix
-  storage-region.jps             # per-region Certified-Storage env (install)
-  cluster-logic.jps              # in-region volume lifecycle + elastic scaling (update, permanent)
-  geoReplicationManager.jps      # async model: cross-region geo-rep orchestrator (runs in primary)
-  geoReplication.jps             # async model: per-env geo-rep worker
-  syncClusterManager.jps         # sync model: forms one stretched volume across all regions
-addons/
-  management.jps                 # operational buttons (status/heal/rebalance), installed on every region
-  addRegion.jps                  # day-2: add a new region (mode-aware: async or sync)
-  forgetRegion.jps               # day-2: remove a region (mode-aware)
-  addCapacitySlice.jps           # day-2 (sync only): add a replica set (capacity +1 slice)
-  promoteRegion.jps              # day-2 (async only): failover - promote a secondary to primary
-  switchNetworkMode.jps          # day-2: switch internal (GRE) <-> public (WAN)
-success/success.md               # post-install summary
+   ┌─────────────── Region A ────────────────┐  ┌─────────── Region B ─────────┐  ┌─── Region C ───┐
+   │  env-XXXX-1                             │  │  env-XXXX-2                  │  │  env-XXXX-3    │
+   │   ┌─────────┐ ┌─────────┐ ┌─────────┐   │  │   ┌─────────┐ ...            │  │   ┌─────────┐  │
+   │   │ storage │ │ storage │ │ storage │   │  │   │ storage │                │  │   │ storage │  │
+   │   │  node 1 │ │  node 2 │ │  node 3 │   │  │   │  node 1 │                │  │   │  node 1 │  │
+   │   └─────────┘ └─────────┘ └─────────┘   │  │   └─────────┘                │  │   └─────────┘  │
+   │       │           │           │         │  │       │                      │  │       │        │
+   │   brick A1     brick A2    brick A3     │  │   brick B1                   │  │   brick C1     │
+   └─────────────────────────────────────────┘  └──────────────────────────────┘  └────────────────┘
+                            │                                    │                          │
+                            └──────────── one trusted pool ──────┴──────────────────────────┘
+                                  one GlusterFS volume "data": replica = N regions
+                                  bricks = regions × nodes-per-region
+                                  Write anywhere → reads from local brick, writes to all
 ```
 
-## On-disk / mount conventions
+- **One volume** across all regions, FUSE-mounted at `/data` on every node.
+- **Replica = number of regions** (one brick per region per replica set).
+- **Capacity slices** = nodes per region. More nodes per region → distributed-
+  replicated layout with more usable space, redundancy preserved.
+- **Odd region count required** (3, 5, 7) for split-brain quorum.
+- **Networking:** internal (platform GRE, no public IPs) or public (each storage
+  node gets a public IPv4 for cross-region WAN).
+- **Security:** `auth.allow` is set to the cluster's peer IPs only — no
+  unauthorised mounts even with port access. Firewall rules applied at install.
 
-- **Brick:** `/glustervolume` (one per node).
-- **FUSE mount:** the volume is mounted on every storage node at the chosen mount
-  point (default `/data`) via `mount.glusterfs localhost:/<volume>`, with a
-  systemd-automount fstab entry.
-- **NFS re-export:** `/data` is re-exported (`/etc/exports`, unique `fsid`) so app
-  nodes in the same region can mount it.
-- **glusterd is preinstalled** on Certified Storage — there is no package install.
+---
 
-## Scaling
+## Quickstart (turnkey)
 
-### Scaling out (add capacity) — supported automatically
-Scale a region's `storage` layer **in multiples of the replica count**. Each group
-of `replicaCount` new nodes becomes a new replica set; `cluster-logic.jps`
-peer-probes them, runs `add-brick … replica N`, then `rebalance start` +
-`heal full`. Adding a number of nodes that is *not* a multiple of the replica
-count leaves them peered but idle (logged as a warning) to avoid an invalid
-brick/replica ratio.
+In your Jelastic dashboard:
 
-### Scaling in — gated (manual)
-Auto scale-in is blocked (`onBeforeScaleIn` stopEvent) because removing bricks
-from a distributed-replicated volume without migrating data first loses it. To
-remove a replica set safely, from the region's storage master:
+1. **Import** → URL:
+   ```
+   https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main/manifest.jps
+   ```
+2. In the install dialog:
+   | Field | Pick |
+   |---|---|
+   | Regions | 3 (or 5 or 7) of your active regions |
+   | Cross-region networking | Internal (GRE) — the cheap default |
+   | Per-region topology | Single node per region — for trying it out |
+   | Volume name | `data` |
+   | Mount point | `/data` |
+   | Environment | (auto-generated; rename if you like) |
+3. **Install**. The package will create one Certified-Storage environment per
+   region, peer them all into one trusted pool, build the stretched volume,
+   mount it at `/data` on every node, harden `auth.allow`, and install the
+   **GlusterFS Cluster** management addon onto each region's storage node-group.
 
-```bash
-gluster volume remove-brick <vol> <brick1> <brick2> <brick3> start
-gluster volume remove-brick <vol> <brick1> <brick2> <brick3> status   # wait: "completed"
-gluster volume remove-brick <vol> <brick1> <brick2> <brick3> commit
-gluster peer detach <host>                                            # for each removed node
-```
+You're done. Write a file on any node in any region and `ls /data` on any
+other node — it's there.
 
-## Networking (internal GRE vs public WAN)
+---
 
-Chosen at deploy via **Cross-region networking**, and switchable later with the
-`switchNetworkMode` add-on:
+## Deployment models
 
-- **Internal (default)** — regions talk over Jelastic's built-in **GRE routing**
-  between regions. **No public IPs**, nothing to expose. Geo-replication targets
-  each region's *internal* storage IP. Simplest and cheapest; note inter-region
-  GRE paths are shared and can saturate under heavy replication.
-- **Public** — the package attaches a **public IPv4 to every storage node**
-  (`binder.SetExtIpCount … ipv4 1`) and geo-replication targets those public IPs
-  over the WAN. Use when you want dedicated cross-region bandwidth / to avoid GRE.
+The install dialog gives you a single binary choice for per-region topology:
 
-### Firewall (handled in the JPS)
+### Single node per region (default)
 
-At cluster creation, `cluster-logic.jps` sets firewall rules on the `storage`
-group via the platform API (`environment.security.AddRule`):
-- **Outbound:** ALLOW all (so nodes can always reach peers).
-- **Inbound:** ALLOW TCP **22, 24007–24008, 49152–49251** (GlusterFS + SSH).
+- 1 storage node × N regions.
+- Each file has exactly N copies (one per region).
+- Cheapest write-anywhere setup; loses zero data on any single-region failure.
+- Scale up later: deploy the **Add Capacity Slice** addon after you scale each
+  region's storage layer.
 
-These are real platform firewall rules (persistent, not in-container iptables),
-and are a no-op when the env firewall feature is disabled (nothing is filtered
-then). The same rules serve both networking modes.
+### Cluster per region (3–9 nodes per region)
 
-### Volume access (auth.allow hardening)
+- N regions × K nodes per region = N×K bricks total.
+- Volume is **distributed-replicated**: `replica N` × `K` sets.
+- Each file is still stored in every region (replica = N), but more nodes per
+  region = more usable capacity AND in-region failure tolerance.
+- Pick `K` (3 to 9) at install via the slider; scale to more later.
 
-At install time the volume is created with `auth.allow '*'` so the geo-rep
-gverify mount and peer probes succeed. **After install/topology change, the
-managers automatically tighten `auth.allow` to the cluster's storage-node IPs
-plus 127.0.0.1** (`hardenAuth` action). Day-2 ops (addRegion, forgetRegion,
-addCapacitySlice, promoteRegion) re-run hardenAuth at the end. Inspect on a
-storage node with:
+| Example | Regions | Nodes/region | Bricks | Replica | Sets | Behaviour |
+|---|---|---|---|---|---|---|
+| Minimal write-anywhere | 3 | 1 | 3 | 3 | 1 | 3 file copies, one per region |
+| Small cluster | 3 | 3 | 9 | 3 | 3 | 3 file copies, ~3× capacity |
+| Bigger cluster | 5 | 3 | 15 | 5 | 3 | 5 file copies, ~3× capacity, stronger quorum |
+| Wide cluster | 3 | 9 | 27 | 3 | 9 | 3 file copies, ~9× capacity |
+
+---
+
+## Networking
+
+Picked at install via **Cross-region networking**, applied automatically:
+
+### Internal (GRE) — default
+
+- Regions communicate over Jelastic's platform GRE routes.
+- **No public IPs allocated.** Cheapest and simplest. GRE bandwidth is shared
+  among tenants — fine for most workloads, may saturate under heavy traffic.
+- Best for: dev/staging, modest-traffic production.
+
+### Public WAN
+
+- Each storage node gets a public IPv4 (`binder.SetExtIpCount … ipv4 1`).
+- Cross-region traffic flows over the public Internet.
+- Highest cross-region bandwidth; predictable performance.
+- Best for: high-throughput production where GRE saturates.
+
+### Firewall
+
+Set by the JPS at install via `environment.security.AddRule`:
+- **Outbound:** ALLOW all — so nodes can always reach peers.
+- **Inbound:** ALLOW TCP `22`, `24007–24008`, `49152–49251` (GlusterFS + SSH).
+
+The same rules apply in both networking modes. No-op if the env firewall feature
+is disabled (nothing is filtered then anyway).
+
+### auth.allow hardening
+
+At install, the volume is created with `auth.allow '*'` so peer probes can
+complete. **The cluster manager then tightens `auth.allow` to the list of peer
+storage-node IPs (plus 127.0.0.1)** via the `hardenAuth` action. Inspect on any
+node:
 
 ```
 gluster volume info data | grep auth.allow
 ```
 
-Note: firewall `src` is still `ALL` (port-level). `auth.allow` is the gluster-
-level access gate; the open ports without auth simply mean an attacker can
-**connect** but the brick will reject the SETVOLUME handshake. In **public**
-networkMode you should also consider restricting the platform firewall `src` to
-the peer IPs as a follow-up.
+Day-2 ops (addRegion, forgetRegion, addCapacitySlice) all re-run `hardenAuth` at
+the end, so the allow list stays current.
 
-**Geo-rep account:** sessions connect as the `jelastic` user via the GlusterFS
-mountbroker (upstream `jelastic-jps/wordpress-multiregions` recipe). If a session
-fails to start, check `gluster volume geo-replication <vol> status` and the
-mountbroker on the slave (`/var/mountbroker-root`, `geogroup`, user `jelastic`).
+---
 
-## Hosting / `baseUrl`
+## How sync stretched works (under the hood)
 
-All scripts are fetched at install time from `baseUrl` (currently
-`https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main`).
-**Set `baseUrl` in every `*.jps` to wherever you host this repo**, or installs
-will fail to fetch `scripts/*`. Import `manifest.jps` via the Jelastic dashboard
-("Import" → URL or local file).
+Conceptually it's just **one GlusterFS volume** with `replica = N regions`,
+where the brick layout is **interleaved** so each replica set has one brick per
+region.
+
+The implementation lives in `scripts/syncClusterManager.jps`. At install it
+runs `action: install`:
+1. **getClusterEnvs** — discover all regional envs via the `<envName>-N`
+   naming convention.
+2. **gatherNodes** — `env.control.GetEnvInfo` on each env, build the interleaved
+   brick list and the all-nodes list.
+3. **peerProbeAll** — from the primary master, `gluster peer probe <ip>` every
+   other node across all regions, retry until success.
+4. **createStretchedVolume** — `gluster volume create data replica N transport
+   tcp <brick-list>` with quorum tuning:
+   - `cluster.quorum-type auto`
+   - `cluster.server-quorum-type server`
+   - `network.ping-timeout 30` (WAN-friendly)
+   - `cluster.choose-local on` (read from local brick)
+5. **mountAllNodes** — `mount.glusterfs localhost:/data /data` on every node,
+   fstab entry with systemd automount.
+6. **hardenAuth** — set `auth.allow` to peer IPs.
+7. **persistGlobals** — save the deployment params on the primary env's
+   storage node-group so day-2 addons can recover them.
+
+For day-2 ops, the same script dispatches on `settings.action`:
+- `addRegion` — peer + add-brick, replica N→N+1.
+- `removeRegion` — remove-brick + peer detach, replica N→N-1.
+- `addCapacitySlice` — peer new nodes (1 per region), add-brick as a new replica
+  set, then rebalance + heal.
+- `hardenAuth` — re-tighten `auth.allow` to current peer IPs.
+
+---
 
 ## Day-2 operations
 
-All day-2 add-ons run **against the primary environment** (`envName-1`), where the
-deployment parameters are persisted. The **management** buttons work in both
-models; **addRegion / forgetRegion / switchNetworkMode** currently target the
-**async (geo-replication)** model — adding/removing a region from a *synchronous
-stretched* cluster (which changes the replica count) is a planned follow-up.
+### Management dashboard (already installed)
 
-- **Management buttons** (`addons/management.jps`, auto-installed on the primary —
-  shown in the env's Add-ons panel):
-  - *Cluster Status* — peer/volume/status on every region's master.
-  - *Geo-Replication Status* — `geo-replication … status` on the primary.
-  - *Heal Volumes* — `heal … full` on every region.
-  - *Rebalance Volumes* — `rebalance … start` on every region.
-- **Add a region** (`addons/addRegion.jps`): pick a new region; it creates the
-  regional cluster and extends geo-replication to it (same cluster, new slice of
-  geography).
-- **Forget a region** (`addons/forgetRegion.jps`): mode-aware. **Async:** stop+delete
-  the geo-replication session to the target region. **Sync:** remove the target's
-  bricks (replica count −1), peer-detach. Optionally also deletes the environment.
-- **Add capacity slice — sync only** (`addons/addCapacitySlice.jps`): grow usable
-  capacity in the synchronous stretched cluster by 1 replica set. First scale
-  each region's storage layer up by the same count via the topology UI, then
-  run this addon against the primary — it auto-detects new nodes, peer-probes,
-  `add-brick` (replica unchanged), then `rebalance start` + `heal full`.
-- **Promote region — async failover** (`addons/promoteRegion.jps`): promote a
-  surviving secondary to become the new primary if the original primary is
-  lost. Run **against the new primary env**. Best-effort tears down the old
-  primary's sessions, then bootstraps fresh SSH + gsec on the new primary and
-  re-establishes geo-rep sessions to all other secondaries. Use `forgetRegion`
-  afterward to clean up the old primary's env.
-- **Switch network mode** (`addons/switchNetworkMode.jps`): flip the whole
-  deployment between internal (GRE) and public (WAN) — adds/removes public IPs and
-  re-establishes geo-replication in the new mode.
+Each region's env has a **GlusterFS Cluster** addon in the storage node-group's
+Add-Ons panel, with a single **Manage Cluster** button that opens a popup
+modal:
 
-## Scaling
+| Operation | What it does |
+|---|---|
+| Cluster status | Peer status / volume info / volume status / auth.allow, fanned out to every region in parallel |
+| Heal volume — full | `gluster volume heal data full` on every region |
+| Rebalance volume | `gluster volume rebalance data start` on every region |
+| Re-tighten auth.allow | Recomputes peer IPs and applies to the volume |
+| List storage nodes + IPs | Inventory table across regions |
+| Custom CLI command | Run an arbitrary `gluster …` command on every region's master (regex-guarded for safety) |
 
-- **Scale out (add capacity):** use the native topology UI to add `storage` nodes
-  **in multiples of the replica count**. `cluster-logic.jps` automatically
-  peer-probes them, runs `add-brick … replica N`, and `rebalance` + `heal`. Each
-  group of `replicaCount` nodes is a new capacity slice.
-- **Scale in (remove capacity):** automatic scale-in is gated (`onBeforeScaleIn`
-  stopEvent) because removing bricks from a distributed-replicated volume without
-  migrating data first loses it. Remove a full replica set safely with the
-  controlled `remove-brick start → status → commit` procedure (see *Scaling in*
-  above), then detach the peers and scale the layer down. A guided scale-in
-  add-on is a planned follow-up (deferred because safe data migration is async
-  and doesn't fit a blocking event handler).
+Output lands in the env's Tasks log. All operations work from **any** region —
+they rediscover the cluster via `getClusterEnvs` at click time.
 
-## Status / known gaps
+### Add a region
 
-- **Async master promotion (`promoteRegion`)** is best-effort: it brings up
-  geo-rep from a chosen surviving secondary to the rest. It does NOT reconcile
-  data drift between the dead primary's last state and the surviving secondaries
-  — that's a manual decision.
-- **Sync day-2 ops** (`addRegion`/`forgetRegion` in sync mode, `addCapacitySlice`)
-  change live volume topology. For `addCapacitySlice` you must scale each
-  region by the same number of nodes via the topology UI before running the
-  addon, or it aborts (refuses to add a partial replica set).
-- **Firewall src is still `ALL`** at the port level; `auth.allow` is the real
-  protection layer (now restricted to peer IPs after `hardenAuth`). For public
-  networkMode in production, tighten the platform firewall to peer IPs as a
-  follow-up.
-- Cannot be validated off-platform; the items under *Networking* and the geo-rep
-  mountbroker are the most likely to need tuning on a real Virtuozzo platform.
+```
+Import → URL: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main/addons/addRegion.jps
+```
+Run against the **primary env** (the one with `-1` suffix). Pick a new region in
+the dialog. The addon:
+1. Creates a new regional env at `<prefix>-<next-index>` with `nodesPerRegion`
+   nodes, pinned to the chosen region.
+2. Runs `syncClusterManager` with `action=addRegion` — peer-probes the new node(s),
+   `add-brick replica N+1`, mounts the volume locally, re-hardens `auth.allow`.
+
+**Note:** keep your region count odd (3, 5, 7) for split-brain protection.
+Adding a single region temporarily makes it even — fine if transitional.
+
+### Remove a region ("forget")
+
+```
+Import → URL: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main/addons/forgetRegion.jps
+```
+Run against the **primary env**. Pick the region to remove; optionally check
+"Also delete the environment". The addon runs `syncClusterManager` with
+`action=removeRegion` — `remove-brick replica N-1 force`, peer-detach, optional
+env delete.
+
+Combine forget + add to migrate the cluster off a bad region.
+
+### Add capacity (slicing)
+
+Two steps:
+1. **Scale each region by the same count** via the Jelastic topology panel.
+   E.g., go from 1 node/region to 2 nodes/region in every region.
+2. **Import** → URL:
+   ```
+   https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main/addons/addCapacitySlice.jps
+   ```
+   Run against the primary env. It auto-detects the new nodes (those not yet in
+   the volume), peer-probes them, `add-brick` (replica unchanged), then
+   `rebalance start` + `heal full`. **Aborts cleanly if the new-node count isn't
+   a multiple of the replica count** — that would leave a partial replica set.
+
+### Backup (separate addon)
+
+A backup addon is in development; see `addons/backup.jps`. It schedules restic
+backups of the volume to S3 / SFTP, with rotation.
+
+---
+
+## Sizing & performance
+
+### Writes
+Writes are **synchronous** — they return when the slowest region acknowledges.
+Plan around your worst-case cross-region RTT:
+- 3 regions in the same continent (~50ms RTT): writes ~50ms.
+- 3 regions across continents (~150ms RTT): writes ~150ms+.
+- Heavy small-file workloads (e.g. node_modules) feel WAN latency a lot.
+- Bulk transfers are bottlenecked by GRE bandwidth (internal mode) or your
+  WAN link (public mode).
+
+### Reads
+Reads come from the **local** brick (`cluster.choose-local on`). Same speed as
+local storage; no WAN cost.
+
+### Capacity
+- Single node per region: usable capacity ≈ one node's storage / 1 (replica = N
+  copies, but only one slice).
+- K nodes per region: usable capacity ≈ K × one node's storage.
+- Always cap at the smallest region's quota (capacity is bound by the smallest
+  replica set).
+
+---
+
+## Scaling decision tree
+
+| You want… | Do this |
+|---|---|
+| More regions (geographic coverage) | Use `addRegion`. Keep region count odd. |
+| More capacity in existing regions | Scale each region by the same N nodes, run `addCapacitySlice`. |
+| Remove a region (decommission, failure) | Use `forgetRegion`. Add a fresh region after if you want to keep N odd. |
+| Tighten security after topology change | Use Manage Cluster → "Re-tighten auth.allow" |
+| Switch internal ↔ public networking | Manual: scale-down then re-deploy. (The dedicated addon was removed in v2.0 — net-new sync version is a future feature.) |
+
+---
+
+## Troubleshooting
+
+### "auth.allow shows `*`, not peer IPs"
+Click **Manage Cluster** → **Re-tighten auth.allow**. (`hardenAuth` runs at
+install and after every day-2 op; if you see `*`, something interrupted the
+flow.)
+
+### Writes hang / time out
+- Check `Cluster Status` → look at `Network ping-timeout`. WAN latency higher
+  than the ping timeout will cause stalls.
+- Increase it: `Manage Cluster` → Custom CLI command:
+  ```
+  gluster volume set data network.ping-timeout 60
+  ```
+
+### Geo-rep error in the logs
+The package no longer uses geo-replication (sync mode only since v2.0). If you
+see geo-rep references in logs, you're on an env deployed by an older manifest
+— redeploy.
+
+### "Not a multiple of replica" when adding capacity
+You scaled an unequal number of nodes across regions. Make every region the
+same node count, then re-run `addCapacitySlice`.
+
+### Split-brain warnings
+You're running with an **even** number of regions. Add one to get to the next
+odd number, or accept the reduced fault tolerance for the transitional period.
+
+---
+
+## File layout
+
+```
+manifest.jps                       install orchestrator (regionlist + topology + volume params)
+scripts/
+  getClusterEnvs.js                discover sibling regional envs by name prefix
+  storage-region.jps               per-region Certified-Storage env (install)
+  cluster-logic.jps                in-region node prep (firewall, glusterd, dirs) — permanent addon
+  syncClusterManager.jps           cross-region stretched-volume manager — action-dispatch
+                                    (install / addRegion / removeRegion / addCapacitySlice / hardenAuth)
+addons/
+  management.jps                   single-button "Manage Cluster" with popup operations
+  addRegion.jps                    day-2: add a new region (replica +1)
+  forgetRegion.jps                 day-2: remove a region (replica -1)
+  addCapacitySlice.jps             day-2: grow capacity (sets +1; replica unchanged)
+success/success.md                 post-install summary shown to the user
+```
+
+---
+
+## Versioning
+
+- **v2.0** (current): synchronous stretched cluster only. Write-anywhere from
+  any node in any region. Async geo-replication code removed.
+- **v1.x**: dual-model (sync OR async geo-replication). Async master/secondary
+  topology, geo-rep sessions, promoteRegion failover. Deprecated.
+
+Clusters deployed by v1.x in async mode still work but the v2.x day-2 addons
+won't manage them (they assume sync). Redeploy with v2.x for the new feature set.
+
+---
+
+## License & contribution
+
+MIT. PRs welcome. File issues at
+<https://github.com/stackharbor-devops/glusterfs-multi-region/issues>.
