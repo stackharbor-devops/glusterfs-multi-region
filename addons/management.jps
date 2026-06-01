@@ -86,9 +86,7 @@ addons:
                   hideLabel: true
                   cls: warning
                   height: 50
-                  markup: |
-                    <p><strong>Advanced:</strong> command runs on every region's storage master
-                    as root, in parallel. Use with care.</p>
+                  markup: "Advanced: command runs as root on the LOCAL master of this env (gluster propagates cluster-wide commands automatically). Use with care."
                 - type: string
                   name: customCmd
                   caption: Command to run
@@ -118,6 +116,15 @@ actions:
     - if ('${settings.operation}' == 'custom'):       op_custom
 
   # ---- shared helpers ----------------------------------------------------
+  #
+  # CRITICAL DESIGN NOTE: in the sync stretched cluster there is ONE shared
+  # volume across every region. Mutation commands (rebalance, heal,
+  # `volume set …`, etc.) must run ONCE on a single master — gluster's
+  # transaction lock is cluster-wide. Earlier versions fanned commands out to
+  # every region's master in parallel; that produces "Another transaction is
+  # in progress" errors on every master except the first. The actions below
+  # run on the LOCAL env's master (`cmd[${nodes.storage.master.id}]`); gluster
+  # propagates the result to the rest of the cluster automatically.
 
   # Rediscover all regional envs from the current env-name prefix.
   # Uses ${globals.base_path} (NOT ${baseUrl}) — see the design note above.
@@ -127,65 +134,46 @@ actions:
     - setGlobals:
         clusterEnvs: ${response.items.join(,)}
 
-  # Build a parallel api[] of ExecCmdById calls (one per region's storage
-  # master) running ${this.command}, then return them with async:true so the
-  # platform executes them concurrently across regions.
-  fanOutToMasters:
-    - getClusterEnvs
-    - script: |
-        var envs = '${globals.clusterEnvs}'.split(','), api = [], cmd = '${this.command}';
-        for (var i = 0, n = envs.length; i < n; i++) {
-          var resp = jelastic.env.control.GetEnvInfo(envs[i], session);
-          if (resp.result != 0) return resp;
-          for (var l = 0, k = resp.nodes; l < k.length; l++)
-            if (k[l].nodeGroup == 'storage' && k[l].ismaster) {
-              api.push({
-                method: "env.control.ExecCmdById",
-                envName: envs[i],
-                nodeId: k[l].id,
-                commandList: [{ command: cmd }]
-              });
-              break;
-            }
-        }
-        return { result: 0, onAfterReturn: { api: api, async: true } };
-
   # ---- operations --------------------------------------------------------
+  #
+  # All volume-touching ops run on the LOCAL master only. The output appears
+  # in the env's Tasks log.
 
   op_status:
-    - fanOutToMasters:
-        command: |-
-          echo ===== PEERS =====; gluster peer status;
-          echo ===== INFO  =====; gluster volume info ${globals.volumeName};
-          echo ===== STATUS ====; gluster volume status ${globals.volumeName};
-          echo ===== AUTH.ALLOW ====; gluster volume info ${globals.volumeName} | grep auth.allow;
-          echo ===== LAST BACKUP =====;
-          if [ -f /var/lib/glusterfs-backup/last-success.json ]; then
-            if command -v jq >/dev/null 2>&1; then
-              jq -r '"started: \(.started_at // "?")\nfinished: \(.finished_at // "?")\nsnapshot: \(.summary.snapshot_id // "?")\nfiles_new: \(.summary.files_new // 0)\nfiles_changed: \(.summary.files_changed // 0)\ndata_added_bytes: \(.summary.data_added // 0)\ntotal_files: \(.summary.total_files_processed // 0)\ntotal_bytes: \(.summary.total_bytes_processed // 0)\nduration_sec: \(.summary.total_duration // 0)"' /var/lib/glusterfs-backup/last-success.json;
-            else
-              cat /var/lib/glusterfs-backup/last-success.json;
-            fi;
+    - cmd[${nodes.storage.master.id}]: |-
+        echo ===== PEERS =====; gluster peer status;
+        echo ===== INFO  =====; gluster volume info ${globals.volumeName};
+        echo ===== STATUS ====; gluster volume status ${globals.volumeName};
+        echo ===== AUTH.ALLOW ====; gluster volume info ${globals.volumeName} | grep auth.allow;
+        echo ===== LAST BACKUP =====;
+        if [ -f /var/lib/glusterfs-backup/last-success.json ]; then
+          if command -v jq >/dev/null 2>&1; then
+            jq -r '"started: \(.started_at // "?")\nfinished: \(.finished_at // "?")\nsnapshot: \(.summary.snapshot_id // "?")\nfiles_new: \(.summary.files_new // 0)\nfiles_changed: \(.summary.files_changed // 0)\ndata_added_bytes: \(.summary.data_added // 0)\ntotal_files: \(.summary.total_files_processed // 0)\ntotal_bytes: \(.summary.total_bytes_processed // 0)\nduration_sec: \(.summary.total_duration // 0)"' /var/lib/glusterfs-backup/last-success.json;
           else
-            echo "(no successful backup recorded on this node)";
-            echo "Backups run only on the PRIMARY env's storage master, so this line will show 'no recorded backup' on every other region — that is expected.";
+            cat /var/lib/glusterfs-backup/last-success.json;
           fi;
+        else
+          echo "(no successful backup recorded on this node)";
+          echo "Backups run only on the PRIMARY env (envName-1), so this line shows 'no recorded backup' on every other region - that is expected.";
+        fi;
+      user: root
 
   op_heal:
-    - fanOutToMasters:
-        command: gluster volume heal ${globals.volumeName} full
+    - cmd[${nodes.storage.master.id}]: gluster volume heal ${globals.volumeName} full
+      user: root
 
   op_rebalance:
-    - fanOutToMasters:
-        command: gluster volume rebalance ${globals.volumeName} start
+    - cmd[${nodes.storage.master.id}]: gluster volume rebalance ${globals.volumeName} start
+      user: root
 
-  # Re-compute peer IP list across all regions, then push auth.allow to each
-  # region's volume. Idempotent — safe to run any time topology changes.
+  # Compute the peer-IP list across all regions, stash it in a global, then set
+  # auth.allow ONCE on the local master (gluster propagates the volume setting
+  # to the rest of the trusted pool automatically).
   op_harden:
     - getClusterEnvs
     - script: |
         function extIp(node){ if(node.extIPs&&node.extIPs.length){var e=node.extIPs[0];return (e&&e.address)?e.address:e;} if(node.extIP)return node.extIP; if(node.externalIp)return node.externalIp; return node.address; }
-        var envs = '${globals.clusterEnvs}'.split(','), ips = ['127.0.0.1'], api = [];
+        var envs = '${globals.clusterEnvs}'.split(','), ips = ['127.0.0.1'];
         for (var i = 0; i < envs.length; i++) {
           var r = jelastic.env.control.GetEnvInfo(envs[i], session);
           if (r.result != 0) continue;
@@ -197,23 +185,11 @@ actions:
             }
           }
         }
-        var allow = ips.join(',');
-        for (var i = 0; i < envs.length; i++) {
-          var r = jelastic.env.control.GetEnvInfo(envs[i], session);
-          if (r.result != 0) continue;
-          for (var l = 0; l < r.nodes.length; l++) {
-            if (r.nodes[l].nodeGroup == 'storage' && r.nodes[l].ismaster) {
-              api.push({
-                method: "env.control.ExecCmdById",
-                envName: envs[i],
-                nodeId: r.nodes[l].id,
-                commandList: [{ command: "gluster volume set ${globals.volumeName} auth.allow '" + allow + "'; gluster volume info ${globals.volumeName} | grep auth.allow;" }]
-              });
-              break;
-            }
-          }
-        }
-        return { result: 0, onAfterReturn: { api: api, async: true } };
+        return { result: 0, onAfterReturn: { setGlobals: { peerAllowList: ips.join(',') } } };
+    - cmd[${nodes.storage.master.id}]: |-
+        gluster volume set ${globals.volumeName} auth.allow '${globals.peerAllowList}';
+        gluster volume info ${globals.volumeName} | grep auth.allow;
+      user: root
 
   # Read-only: list all storage nodes across regions with their IPs (handy for
   # the security review and for debugging from any region).
@@ -235,5 +211,5 @@ actions:
         return { result: 0, type: 'info', message: lines.join('\n') };
 
   op_custom:
-    - fanOutToMasters:
-        command: ${settings.customCmd}
+    - cmd[${nodes.storage.master.id}]: ${settings.customCmd}
+      user: root
