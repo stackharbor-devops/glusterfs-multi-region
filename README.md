@@ -38,11 +38,46 @@ to every other region. Repository: <https://github.com/stackharbor-devops/gluste
 
 ---
 
+## Hosting in your JCA marketplace (operators)
+
+If you operate a Jelastic / Virtuozzo Application Platform (e.g. via JCA),
+register this package as a marketplace tile so your tenants can install it
+with one click:
+
+1. **JCA → Cluster Admin → Marketplace → Applications** (path varies by
+   platform version).
+2. **Add Application → URL**, paste:
+   ```
+   https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main/manifest.jps
+   ```
+3. Pick a category (`apps/clusters` already declared by the manifest) and
+   approve. The tile shows up in the tenant marketplace with the logo +
+   description.
+
+**Updating the marketplace entry.** JCA caches the manifest at registration.
+Two flavors of update:
+- **Script/addon-level changes** (any file under `scripts/` or `addons/`,
+  the management addon, the backup runner, etc.) propagate **automatically**
+  to the next install — every reference in the manifest uses
+  `${baseUrl}/<path>?_r=${fn.random}`, so the platform pulls the freshest
+  GitHub content each time. No JCA action needed.
+- **Manifest-level changes** (install-dialog fields, the orchestrator's
+  `onInstall` sequence, the package's `version:`, `logo:`, `description:`)
+  require a JCA refresh: edit the marketplace entry → **Refresh from URL**
+  (or remove + re-add). Bumping `version:` in the manifest makes this
+  unambiguous in change logs.
+
+For stricter version pinning, replace `main` in the manifest URL with a
+tag — e.g. `…/v2.2/manifest.jps`. Tag the GitHub repo each release, and
+register the marketplace entry against the tag URL. Tenants then get a
+stable version regardless of `main` branch movement.
+
 ## Quickstart (turnkey)
 
 In your Jelastic dashboard:
 
-1. **Import** → URL:
+1. **Import** → URL (or click the marketplace tile if you've registered it
+   per the previous section):
    ```
    https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main/manifest.jps
    ```

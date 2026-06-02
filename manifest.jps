@@ -1,9 +1,10 @@
 type: install
-version: 2.0
+version: 2.2
 id: glusterfs-multiregion
 name: Multi-Region GlusterFS Cluster (Write-Anywhere)
 baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
 homepage: https://github.com/stackharbor-devops/glusterfs-multi-region
+logo: ${baseUrl}/images/logo.svg
 description:
   text: |
     Deploys ONE synchronous GlusterFS volume spanning every selected region.

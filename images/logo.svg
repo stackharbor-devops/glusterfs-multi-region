@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0288d1"/>
+      <stop offset="1" stop-color="#01579b"/>
+    </linearGradient>
+  </defs>
+  <!-- Rounded square background -->
+  <rect x="2" y="2" width="124" height="124" rx="22" fill="url(#g)"/>
+  <!-- Center: storage cylinder (the volume) -->
+  <g transform="translate(64,64)">
+    <ellipse cx="0" cy="-14" rx="22" ry="6" fill="#fff"/>
+    <rect x="-22" y="-14" width="44" height="28" fill="#fff"/>
+    <ellipse cx="0" cy="14" rx="22" ry="6" fill="#fff"/>
+    <!-- Top edge highlight -->
+    <ellipse cx="0" cy="-14" rx="22" ry="6" fill="none" stroke="#0288d1" stroke-width="1.5"/>
+    <!-- Center horizontal lines (data) -->
+    <ellipse cx="0" cy="0" rx="22" ry="6" fill="none" stroke="#0288d1" stroke-width="1" stroke-dasharray="2,2"/>
+  </g>
+  <!-- Three region nodes orbiting -->
+  <g fill="#4caf50" stroke="#fff" stroke-width="2">
+    <circle cx="20" cy="42" r="8"/>
+    <circle cx="108" cy="42" r="8"/>
+    <circle cx="64" cy="110" r="8"/>
+  </g>
+  <!-- Connection lines region -> center -->
+  <g stroke="#fff" stroke-width="2" opacity="0.7" fill="none">
+    <line x1="26" y1="44" x2="44" y2="52"/>
+    <line x1="102" y1="44" x2="84" y2="52"/>
+    <line x1="64" y1="104" x2="64" y2="84"/>
+  </g>
+</svg>
