@@ -7,16 +7,27 @@ logo: https://raw.githubusercontent.com/jelastic-jps/backup-storage/main/images/
 description:
   short: Snapshot the GlusterFS volume to a Jelastic backup-storage env (single backup per cluster).
   text: |
-    ONE backup per multi-region cluster - runs only on the primary env's
-    storage master (regardless of how many regions or nodes you have), since
-    the volume is sync-replicated and backing up from every region would
-    duplicate the same dataset. Uses restic on top of an NFS mount to a
-    Jelastic backup-storage env (the same one you can deploy with the
-    orchestrator's "Deploy a backup server" checkbox).
+    Snapshots the data state of the multi-region GlusterFS volume to a
+    Jelastic backup-storage env via restic. Each scheduled firing runs
+    EXACTLY ONE backup operation, on the storage master of whichever
+    cluster env this addon is installed on - the volume is sync-replicated
+    across every region, so backing up from any one node gives you the
+    same dataset.
+
+    INSTALL this addon on the cluster env that is in the SAME hardware
+    region as your backup-storage env, so the NFS write path is
+    intra-region. The orchestrator's "Deploy a backup server" flow picks
+    that env automatically; if you import this addon manually, pick
+    accordingly.
+
+    Note: this addon does NOT replace Jelastic VAP's node-level snapshots
+    (which give you full container-state recovery). It exists to preserve
+    the data state of the GlusterFS volume specifically - a layer that
+    benefits from logical restic snapshots independent of the container.
 
     Repo convention matches the vendor jelastic-jps/backup-storage spec:
-    repo path = /data/<primary-envName>/, password = primary env name. So
-    the storage env's `getBackups.sh <envName>` CLI lists our backups.
+    repo path = /data/<envName>/, password = env name. So the storage
+    server's `getBackups.sh <envName>` CLI lists our backups.
 
 baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
 
@@ -234,7 +245,12 @@ settings:
 # Bind the addon card to the storage node-group's Add-Ons panel.
 # ---------------------------------------------------------------------------
 onInstall:
-  - assertPrimary
+  # No env restriction. The cron fires on this env's storage master only,
+  # so a single firing == one backup. If the operator accidentally installs
+  # the addon on a second cluster env, both will write to the same restic
+  # repo, but the per-runner flock + restic's repo lock prevent corruption -
+  # at worst you get two snapshots back-to-back. Avoid by installing once
+  # per cluster, ideally on the env co-located with backup-storage.
   - installAddon:
       id: glusterfs-backup-addon
       nodeGroup: storage
@@ -306,16 +322,6 @@ globals:
 # Actions
 # ---------------------------------------------------------------------------
 actions:
-  # Refuse install on non-primary envs. The "primary" is the env whose name
-  # ends in "-1" (orchestrator naming convention). Single backup per cluster.
-  assertPrimary:
-    - script: |
-        var nm = '${env.envName}';
-        if (!/-1$/.test(nm)) {
-          return { result: 1, error: "This backup addon must be installed on the PRIMARY env (the one ending in '-1'). One backup runs per multi-region cluster; the volume is sync-replicated so backing up from any other region is redundant." };
-        }
-        return { result: 0 };
-
   # Install (or self-update) restic on every storage node via the official
   # vendor helper script. Same one jelastic-jps/backup-addon uses, so we
   # inherit its distro coverage and `restic self-update` logic for free.

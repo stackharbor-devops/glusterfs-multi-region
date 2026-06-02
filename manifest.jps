@@ -288,15 +288,26 @@ actions:
         }];
         return { result: 0, onAfterReturn: { 'marketplace.jps.install': actions } };
 
-  # Install our backup addon onto the primary env, pre-configured to use the
-  # auto-deployed backup-storage env. The addon skips the storage-env picker
-  # when `preconfigured: true` is set. We also pass cluster_id and
-  # primary_region_name so the backup runner can tag every snapshot.
+  # Install the backup addon onto the cluster env CO-LOCATED with the
+  # backup-storage env (same hardware region), so the NFS-to-restic write
+  # path is intra-region — not cross-WAN. Fall back to the primary env if
+  # the backup-storage region doesn't match any cluster region (the
+  # "DR-grade outside-the-cluster" scenario).
+  #
+  # One backup per cluster: the runner only runs on this one env's master,
+  # so each cron firing = exactly one restic backup operation.
   installBackupAddon:
     - script: |
+        var regions = '${settings.regions}'.split(',');
+        var bkpRegion = '${settings.backupServerRegion}';
+        var targetIndex = 1;  // default: primary
+        for (var i = 0; i < regions.length; i++) {
+          if (regions[i] == bkpRegion) { targetIndex = i + 1; break; }
+        }
+        var targetEnv = '${settings.envName}-' + targetIndex;
         var actions = [{
           jps: "${baseUrl}/addons/backup.jps?_r=${fn.random}",
-          envName: "${settings.envName}-1",
+          envName: targetEnv,
           settings: {
             "preconfigured": "true",
             "storageName": "${settings.envName}-bkp",
@@ -308,7 +319,8 @@ actions:
             "cluster_id": "${settings.envName}",
             "primary_region_name": "${globals.regionName-1}",
             "backup_region_name": "${settings.backupServerRegion}",
-            "volume_name": "${settings.volumeName}"
+            "volume_name": "${settings.volumeName}",
+            "backup_runner_env": targetEnv
           }
         }];
         return { result: 0, onAfterReturn: { 'marketplace.jps.install': actions } };
