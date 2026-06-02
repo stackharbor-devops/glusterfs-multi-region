@@ -42,126 +42,15 @@ targetNodes:
 # ---------------------------------------------------------------------------
 settings:
   main:
-    fields:
-      - type: displayfield
-        hideLabel: true
-        height: 30
-        markup: "Schedules under 10 minutes use flock to prevent overlap, but ensure the dataset fits the chosen interval. 1-minute backups are for testing tiny datasets only."
-
-      - type: radio-fieldset
-        name: scheduleType
-        hidden: false
-        default: '1'
-        values:
-          - value: 1
-            caption: Pre-defined frequency
-          - value: 2
-            caption: Custom (day-of-week + time)
-          - value: 3
-            caption: Manual (raw cron expression)
-        showIf:
-          1:
-            - name: cronTime
-              caption: Backup frequency
-              type: list
-              editable: false
-              default: "0 * * * *"
-              values:
-                - value: "* * * * *"
-                  caption: "Every 1 minute  ⚠ test/tiny datasets only"
-                - value: "*/5 * * * *"
-                  caption: "Every 5 minutes"
-                - value: "*/10 * * * *"
-                  caption: "Every 10 minutes"
-                - value: "0 * * * *"
-                  caption: "Every 1 hour (at minute 0)"
-                - value: "0 */2 * * *"
-                  caption: "Every 2 hours"
-                - value: "0 */3 * * *"
-                  caption: "Every 3 hours"
-                - value: "0 */6 * * *"
-                  caption: "Every 6 hours"
-                - value: "0 */12 * * *"
-                  caption: "Every 12 hours"
-                - value: "0 0 * * *"
-                  caption: "Every 24 hours (at 00:00 UTC)"
-          2:
-            - type: string
-              name: backupTime
-              caption: Time
-              inputType: time
-              default: "02:00"
-              cls: x-form-text
-              width: 120
-              required: true
-            - caption: Days
-              type: compositefield
-              name: days
-              defaultMargins: 0 12 0 0
-              items:
-                - { name: sun, value: false, type: checkbox, caption: Su }
-                - { name: mon, value: true,  type: checkbox, caption: Mo }
-                - { name: tue, value: true,  type: checkbox, caption: Tu }
-                - { name: wed, value: true,  type: checkbox, caption: We }
-                - { name: thu, value: true,  type: checkbox, caption: Th }
-                - { name: fri, value: true,  type: checkbox, caption: Fr }
-                - { name: sat, value: false, type: checkbox, caption: Sa }
-            - name: tz
-              caption: Time zone
-              type: list
-              required: true
-              editable: true
-              forceSelection: true
-              default: UTC
-              values:
-                UTC: UTC
-                America/New_York: America/New_York
-                America/Los_Angeles: America/Los_Angeles
-                Europe/London: Europe/London
-                Europe/Berlin: Europe/Berlin
-                Asia/Tokyo: Asia/Tokyo
-          3:
-            - name: cronTime
-              caption: Crontab expression
-              type: string
-              default: "0 2 * * *"
-              regexText: Cron expression looks invalid - five fields separated by spaces.
-              regex: "^[ -~]{6,}$"
-
-      - type: string
-        name: sourcePath
-        caption: Volume mount path (source)
-        default: "/data"
-        required: true
-        regex: "^/[a-zA-Z0-9/_-]+$"
-        regexText: "Must start with / and contain only letters/digits/dash/underscore."
-
-      - type: list
-        name: storageName
-        caption: Backup storage environment
-        tooltip: "A Jelastic backup-storage env (created by the orchestrator if you ticked 'Deploy a backup server', or one you created separately via the Marketplace 'Backup Storage' app)."
-        dependsOn: region
-        required: true
-
-      - type: spinner
-        name: backupCount
-        caption: Retention (snapshots to keep)
-        tooltip: "Older snapshots are pruned via `restic forget --keep-last N`."
-        min: 1
-        max: 200
-        default: 24
-
-      - type: toggle
-        name: isAlwaysUmount
-        caption: Always unmount backup storage when idle
-        tooltip: "Auto-disabled for high-frequency schedules (<60 min) to avoid mount churn."
-        value: false
-
+    # Fields built dynamically in onBeforeInit — see below. Empty initial
+    # fields is the vendor wp-backup pattern; the platform expects the
+    # button form's onBeforeInit to return the full fields array.
+    fields: []
     onBeforeInit: |
-      // Filter to envs that are in the vendor "Backup storage nodes" env
-      // group (jelastic-jps/backup-storage attaches itself to that group on
-      // install, so this is the right way to list backup-storage envs). Falls
-      // back to all sibling envs if the group isn't found.
+      // Build the backup-storage env dropdown. Filter to envs that are in
+      // the vendor "Backup storage nodes" env group (jelastic-jps/backup-
+      // storage attaches itself to that group on install). Fall back to all
+      // sibling envs if none match, so the form stays usable.
       var vals = {};
       try {
         var resp = jelastic.environment.control.GetEnvs(appid, session);
@@ -182,7 +71,6 @@ settings:
               vals[info.env.envName] = (info.env.displayName || info.env.envName) + ' (backup-storage)';
             }
           }
-          // Fallback: no backup-storage envs found, show all siblings so the user can still pick.
           if (!Object.keys(vals).length) {
             for (var j = 0; j < resp.infos.length; j++) {
               var info2 = resp.infos[j];
@@ -192,12 +80,75 @@ settings:
           }
         }
       } catch (e) { /* leave vals empty; dropdown stays empty but form renders */ }
-      for (var f = 0; f < settings.fields.length; f++) {
-        if (settings.fields[f] && settings.fields[f].name == 'storageName') {
-          settings.fields[f].values = vals;
-        }
-      }
-      return { result: 0, settings: settings };
+
+      // Build all form fields here (vendor pattern). Return as `fields:`,
+      // NOT wrapped in `settings:` — that wrapping is for top-level install
+      // dialogs, not addon button forms. Returning `{result:0, settings:{}}`
+      // makes the modal render empty.
+      return { result: 0, fields: [
+        { type: "displayfield", hideLabel: true, height: 30,
+          markup: "Schedules under 10 minutes use flock to prevent overlap. 1-minute backups are for tiny datasets / testing only." },
+        { type: "radio-fieldset", name: "scheduleType", hidden: false, "default": "1",
+          values: [
+            { value: 1, caption: "Pre-defined frequency" },
+            { value: 2, caption: "Custom (day-of-week + time)" },
+            { value: 3, caption: "Manual (raw cron expression)" }
+          ],
+          showIf: {
+            "1": [
+              { name: "cronTime", caption: "Backup frequency", type: "list",
+                editable: false, "default": "0 * * * *",
+                values: [
+                  { value: "* * * * *",    caption: "Every 1 minute (test/tiny datasets only)" },
+                  { value: "*/5 * * * *",  caption: "Every 5 minutes" },
+                  { value: "*/10 * * * *", caption: "Every 10 minutes" },
+                  { value: "0 * * * *",    caption: "Every 1 hour (at minute 0)" },
+                  { value: "0 */2 * * *",  caption: "Every 2 hours" },
+                  { value: "0 */3 * * *",  caption: "Every 3 hours" },
+                  { value: "0 */6 * * *",  caption: "Every 6 hours" },
+                  { value: "0 */12 * * *", caption: "Every 12 hours" },
+                  { value: "0 0 * * *",    caption: "Every 24 hours (at 00:00 UTC)" }
+                ] }
+            ],
+            "2": [
+              { type: "string", name: "backupTime", caption: "Time", inputType: "time", "default": "02:00", cls: "x-form-text", width: 120, required: true },
+              { caption: "Days", type: "compositefield", name: "days",
+                items: [
+                  { name: "sun", value: false, type: "checkbox", caption: "Su" },
+                  { name: "mon", value: true,  type: "checkbox", caption: "Mo" },
+                  { name: "tue", value: true,  type: "checkbox", caption: "Tu" },
+                  { name: "wed", value: true,  type: "checkbox", caption: "We" },
+                  { name: "thu", value: true,  type: "checkbox", caption: "Th" },
+                  { name: "fri", value: true,  type: "checkbox", caption: "Fr" },
+                  { name: "sat", value: false, type: "checkbox", caption: "Sa" }
+                ] },
+              { name: "tz", caption: "Time zone", type: "list", required: true,
+                editable: true, forceSelection: true, "default": "UTC",
+                values: {
+                  "UTC": "UTC",
+                  "America/New_York": "America/New_York",
+                  "America/Los_Angeles": "America/Los_Angeles",
+                  "Europe/London": "Europe/London",
+                  "Europe/Berlin": "Europe/Berlin",
+                  "Asia/Tokyo": "Asia/Tokyo"
+                } }
+            ],
+            "3": [
+              { name: "cronTime", caption: "Crontab expression", type: "string", "default": "0 2 * * *", required: true,
+                regex: "^[ -~]{6,}$",
+                regexText: "Cron expression looks invalid - five fields separated by spaces." }
+            ]
+          } },
+        { type: "string", name: "sourcePath", caption: "Volume mount path (source)", "default": "/data", required: true,
+          regex: "^/[a-zA-Z0-9/_-]+$",
+          regexText: "Must start with / and contain only letters/digits/dash/underscore." },
+        { type: "list", name: "storageName", caption: "Backup storage environment",
+          required: true, editable: false, forceSelection: true, values: vals },
+        { type: "spinner", name: "backupCount", caption: "Retention (snapshots to keep)",
+          min: 1, max: 200, "default": 24 },
+        { type: "toggle", name: "isAlwaysUmount", caption: "Always unmount backup storage when idle",
+          value: false }
+      ] };
 
   restore:
     fields: []
@@ -212,16 +163,16 @@ settings:
         snapshots = JSON.parse(resp.responses[0].out || '[]');
       } catch (e) { snapshots = []; }
       if (!snapshots.length) {
-        return { result: 0, settings: { fields: [
+        // Same {result, fields} shape; NOT wrapped in settings.
+        return { result: 0, fields: [
           { type: "displayfield", cls: "warning", hideLabel: true, height: 60,
             markup: "No restic snapshots found. Run Backup first to create one." }
-        ] } };
+        ] };
       }
-      // Canonical array-of-{value,caption} form — same pattern the official
-      // jelastic-jps/kubernetes addons use. The map-form values: {k:v} can
-      // render but the platform does not always bind the user's selection to
-      // settings.<name> at submit, which caused the restore command to run
-      // with the placeholder literally.
+      // Array-of-{value,caption} for the snapshot list — same form the
+      // official jelastic-jps/kubernetes addons use. Map-form values: {k:v}
+      // can render but doesn't reliably bind the user's selection to
+      // settings.<name> at submit.
       var snapList = [];
       for (var i = 0; i < snapshots.length; i++) {
         var s = snapshots[i];
@@ -229,17 +180,17 @@ settings:
         var sid = (s.short_id || (s.id || '').slice(0, 8));
         snapList.push({ value: s.id, caption: when + "  " + sid });
       }
-      return { result: 0, settings: { fields: [
+      return { result: 0, fields: [
         { type: "list", name: "snapshotId", caption: "Snapshot to restore",
           required: true, editable: false, forceSelection: true,
           values: snapList },
         { type: "string", name: "restorePath", caption: "Restore target",
-          default: "/data", required: true,
+          "default": "/data", required: true,
           regex: "^/[a-zA-Z0-9/_-]+$",
           regexText: "Must start with / and contain only letters/digits/dash/underscore." },
         { type: "displayfield", hideLabel: true, cls: "warning", height: 60,
           markup: "Restore overwrites files at the target path. Since the volume is synchronously replicated, the restore propagates to every region. Stop write workloads first." }
-      ] } };
+      ] };
 
 # ---------------------------------------------------------------------------
 # Bind the addon card to the storage node-group's Add-Ons panel.
