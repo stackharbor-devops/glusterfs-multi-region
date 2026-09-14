@@ -86,7 +86,7 @@ actions:
   # internal (GRE) and public (WAN) networking - src ALL covers either source.
   # Best-effort: the firewall API takes ONE port or ONE range per rule (no comma
   # lists), so add the GlusterFS/SSH inbound ports as separate rules. Never fail
-  # the install on a firewall hiccup - the cluster + geo-rep are what matter.
+  # the install on a firewall hiccup - the cluster is what matters.
   setupFirewall:
     - script: |
         var envName = "${env.name}";

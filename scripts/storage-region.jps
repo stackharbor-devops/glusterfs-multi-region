@@ -36,7 +36,7 @@ nodes:
     displayName: GlusterFS Storage
 
 onInstall:
-  # In public mode, give each storage node a public IPv4 for cross-region geo-rep.
+  # In public mode, give each storage node a public IPv4 for cross-region sync (WAN).
   # In internal mode, nodes use platform GRE routing and need no public IP.
   - if ('${globals.networkMode}' == 'public'):
       - attachPublicIP

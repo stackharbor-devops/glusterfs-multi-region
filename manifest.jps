@@ -118,7 +118,7 @@ actions:
   # nodes/region = settings.replicaSets (capacity slices), total bricks = product.
   initGlobals:
     - script: |
-        var regions = '${settings.regions}'.split(','), index, resp,
+        var regions = '${settings.regions}'.split(','),
             onAfterReturn = { setGlobals: {} }, glbs = onAfterReturn.setGlobals;
 
         if (regions.length < 3 || (regions.length % 2) == 0)
@@ -147,20 +147,9 @@ actions:
         glbs["topologyDescription"] = desc;
         glbs["modelDescription"]    = modelDesc;
 
-        resp = jelastic.env.control.GetRegions(appid, session);
-        if (resp.result != 0) return resp;
-        resp = resp.array;
+        // region-N globals feed createEnvs' region-pinning below.
         for (var i = 0, n = regions.length; i < n; i++) {
-          index = i + 1;
-          glbs["region-" + index] = regions[i];
-          for (var a = 0, b = resp.length; a < b; a++) {
-            for (var k = 0, l = resp[a].hardNodeGroups.length; k < l; k++) {
-              if (resp[a].hardNodeGroups[k].uniqueName == regions[i]) {
-                glbs["domain-" + index]     = resp[a].domain;
-                glbs["regionName-" + index] = resp[a].displayName;
-              }
-            }
-          }
+          glbs["region-" + (i + 1)] = regions[i];
         }
         return { result: 0, onAfterReturn: onAfterReturn };
 
