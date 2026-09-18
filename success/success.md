@@ -17,26 +17,25 @@ Every storage node already has the volume FUSE-mounted at `${globals.replicatedP
 Write to that path on **any node in any region** and the change replicates
 synchronously to every other region.
 
-**Mounting it into another environment** — the volume is open to any
-GlusterFS-native client on the platform's private network (access is governed
-by Jelastic network isolation + the storage firewall, not a gluster allow-list).
-In your app layer's **Volumes → Add → Data Container** dialog pick:
-
-- **Server:** the GlusterFS *region* env nearest that app (e.g. `env-XXXX-2`) — you
-  select the region, not a node; it's one stretched volume, so any region serves
-  the whole dataset.
-- **Client Type:** Gluster Native (FUSE)
-- **Volume:** `${globals.volumeName}` → **Local Path:** wherever you want it.
-
-Once mounted, the FUSE client talks to every brick in every region directly, so
-a node failing in that region does not break the mount. The only single-node
-dependency is fetching the volfile at mount time; to remove it, mount manually
-with fallback servers listed:
+**Mounting it into another environment (FUSE, by region)** — import the
+**GlusterFS Client** addon *onto the app environment*:
 
 ```
-mount -t glusterfs <region-node-ip>:/${globals.volumeName} /your/mount/point \
-  -o backup-volfile-servers=<other-node-ips-in-that-region,colon-separated>
+https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main/addons/client.jps
 ```
+
+Pick the GlusterFS *region* nearest that app (same-region choices are listed
+first), the volume `${globals.volumeName}`, a mount path, and the node group.
+It installs the gluster FUSE client and mounts the volume with the region master
+as volfile server and the region's other nodes as `backup-volfile-servers` —
+resilient at mount time and at runtime, since the FUSE client then talks to
+every brick in every region directly. It's one stretched volume, so any region
+serves the whole dataset.
+
+(Jelastic's own *Volumes → Data Container* dialog only offers Gluster-native
+FUSE for storage it auto-clusters itself, which is incompatible with a
+cross-region volume — for this package it exposes **NFS** only. NFS via that
+dialog does work, as a single-node-dependency alternative.)
 
 ## Day-2 management
 

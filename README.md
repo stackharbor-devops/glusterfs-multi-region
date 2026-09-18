@@ -167,29 +167,47 @@ gluster volume info data | grep auth.allow     # expected: auth.allow: *
 ### Mounting the volume from other environments (FUSE)
 
 Because it is **one stretched volume**, you mount by *region*, not by node, and
-any region serves the entire dataset. In your app layer's **Volumes → Add →
-Data Container** dialog:
+any region serves the entire dataset.
+
+**Why the Volumes dialog won't do it for you.** Jelastic's *Data Container*
+dialog only offers the **Gluster Native (FUSE)** client type for storage layers
+it auto-clusters itself (`cluster: true` — what the OEM "GlusterFS Replicated
+Volume" package uses; that's what makes it show as *Storage Containers × N*).
+This package deliberately uses `cluster: false` and owns its own **cross-region**
+gluster pool — a node can belong to only one pool, so Jelastic's per-region
+auto-clustering and a stretched volume are mutually exclusive. As a result the
+dialog lists our storage nodes individually and exposes **NFS only**.
+
+**Use the client addon instead** — it performs the native FUSE mount, by region,
+with better HA than the dialog can express:
+
+```
+Import → URL: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main/addons/client.jps
+```
+
+Import it **onto the app environment** (not the storage env). The dialog asks:
 
 | Field | Value |
 |---|---|
-| Server | the GlusterFS **region env** nearest that app, e.g. `env-XXXX-2` |
-| Client Type | **Gluster Native (FUSE)** |
-| Volume | `data` (the volume name) |
-| Local Path | wherever you want it in the container |
+| GlusterFS region | the region env nearest that app — same-region choices listed first |
+| Volume name | `data` |
+| Mount path | where to mount inside the app containers (default `/mnt/gluster`) |
+| Mount on node group | e.g. `cp` |
 
-Once mounted, the FUSE client connects **directly to every brick in every
-region** and fails over on its own — a node dying in that region does not break
-the mount. The one single-node dependency is fetching the volfile *at mount
-time* (Jelastic resolves the chosen region env to one of its storage nodes). To
-make mount-time resilient too, mount manually with fallback volfile servers:
+It installs the gluster FUSE client on that node group, pre-checks that it can
+reach the region's glusterd port (failing fast with a clear message if network
+isolation or firewall blocks it), then mounts with the region **master as
+volfile server and the region's other nodes as `backup-volfile-servers`** — so
+the mount is resilient both at mount time and at runtime (post-mount, the FUSE
+client talks to every brick in every region directly). It persists via fstab +
+systemd automount, re-applies after redeploy / scale-out / start, and removes
+itself on uninstall. A **GlusterFS Client** card on that node group gives you
+**Status / Remount / Unmount**.
 
-```
-mount -t glusterfs <region-node-ip>:/data /your/mount/point \
-  -o backup-volfile-servers=<other-node-ip>:<other-node-ip>
-```
-
-(`backup-volfile-servers` is colon-separated. Get a region's node IPs from
-**Manage Cluster → List all storage nodes + IPs**.)
+**Alternative — NFS via the dialog.** The storage nodes re-export the volume over
+NFS, so *Data Container → Server = the region's storage node → NFS* works with
+zero extra setup. Trade-offs: it's a single-node dependency on that storage
+node, and NFS rather than gluster-native semantics.
 
 ---
 
@@ -410,6 +428,8 @@ addons/
   addCapacitySlice.jps             day-2: grow capacity (sets +1; replica unchanged)
   backup.jps                       optional: scheduled restic backups from one
                                     secondary node in the backup-storage region
+  client.jps                       import onto an APP env: Gluster-native FUSE mount
+                                    of the volume by region (backup-volfile-servers)
 success/success.md                 post-install summary shown to the user
 ```
 
@@ -417,10 +437,15 @@ success/success.md                 post-install summary shown to the user
 
 ## Versioning
 
-- **v2.5** (current): volume access opened for FUSE clients — `auth.allow` is
+- **v2.6** (current): new `addons/client.jps` — Gluster-native FUSE mount of the
+  volume into any app environment, by region, with the region master as volfile
+  server and the other region nodes as `backup-volfile-servers`. Added because
+  Jelastic's Volumes dialog only offers FUSE for `cluster: true` storage (which
+  is incompatible with the cross-region stretched volume) and exposes NFS only
+  for this package.
+- **v2.5**: volume access opened for FUSE clients — `auth.allow` is
   left at `*` (no peer-IP hardening; access governed by Jelastic network
   isolation + the storage firewall). "Re-tighten auth.allow" operation removed.
-  Documented mounting the volume from other environments by region.
 - **v2.4**: internal-only networking (public-WAN option removed — all
   replication over GRE). Backup re-added in a region-targeted form: deploy a
   backup-storage node inside a chosen cluster region and back up from one

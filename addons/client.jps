@@ -1,0 +1,278 @@
+type: update
+version: 1.0
+jpsVersion: 6.1.1
+id: glusterfs-client
+name: GlusterFS Client (mount by region)
+baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
+logo: ${baseUrl}/images/logo.svg
+targetEditions: any
+description:
+  short: Mount the multi-region GlusterFS volume into this environment over Gluster-native FUSE, by region.
+  text: |
+    Installs the GlusterFS FUSE client on a node group of THIS environment and
+    mounts the multi-region stretched volume from a GlusterFS REGION you pick.
+
+    Why an addon: Jelastic's Volumes dialog only offers the "Gluster Native
+    (FUSE)" client type for storage layers it auto-clusters itself
+    (cluster: true). The multi-region package deliberately owns its own
+    cross-region gluster pool (cluster: false) - a node can belong to only one
+    pool - so the dialog exposes only NFS for it. This addon performs the
+    native FUSE mount instead, and does it with better HA than the dialog can
+    express: the chosen region's nodes become the volfile server plus
+    backup-volfile-servers, so the mount is resilient at mount time AND at
+    runtime (the FUSE client talks to every brick in every region directly).
+
+    Pick the region nearest this environment. It is ONE stretched volume, so
+    any region serves the whole dataset. The mount persists via fstab +
+    systemd automount, is re-applied after redeploy / scale-out / start, and
+    is removed on uninstall.
+
+# ---------------------------------------------------------------------------
+# Install dialog. Top-level onBeforeInit => return {result, settings:{fields}}
+# (the WRAPPED shape; addon BUTTON forms use the unwrapped {result, fields}).
+# ---------------------------------------------------------------------------
+onBeforeInit: |
+  var thisEnv = '${env.envName}', thisRegion = '', groupVals = [], groupsKnown = false;
+
+  // Node groups of THIS env (where the mount goes). If the env context isn't
+  // available at dialog time, fall back to a free-text group field below.
+  try {
+    var mine = jelastic.env.control.GetEnvInfo(thisEnv, session);
+    if (mine && mine.result == 0 && mine.nodes) {
+      thisRegion = (mine.env && mine.env.hostGroup) ? String(mine.env.hostGroup.uniqueName || '') : '';
+      var seen = {};
+      for (var n = 0; n < mine.nodes.length; n++) {
+        var g = mine.nodes[n].nodeGroup;
+        if (g && !seen[g]) { seen[g] = 1; groupVals.push({ value: g, caption: g }); }
+      }
+      groupsKnown = groupVals.length > 0;
+    }
+  } catch (e) { /* fall through */ }
+  var defaultGroup = groupsKnown ? groupVals[0].value : 'cp';
+  for (var d = 0; d < groupVals.length; d++) if (groupVals[d].value == 'cp') defaultGroup = 'cp';
+
+  // GlusterFS region envs created by the multi-region orchestrator. Recognised
+  // by display name ("GlusterFS Storage Region") or env group ("GlusterFS
+  // Cluster <name>"). Same-region-as-this-env entries are listed first.
+  var local = [], remote = [];
+  try {
+    var resp = jelastic.environment.control.GetEnvs(appid, session);
+    if (resp && resp.result == 0 && resp.infos) {
+      for (var i = 0; i < resp.infos.length; i++) {
+        var info = resp.infos[i]; if (!info || !info.env) continue;
+        var e = info.env; if (e.envName == thisEnv) continue;
+        var dn = String(e.displayName || ''), isGfs = (dn.indexOf('GlusterFS Storage Region') === 0);
+        if (!isGfs && info.envGroups && info.envGroups.length) {
+          for (var gi = 0; gi < info.envGroups.length; gi++) {
+            var grp = info.envGroups[gi], gn = (typeof grp === 'string') ? grp : (grp && grp.name);
+            if (gn && String(gn).indexOf('GlusterFS Cluster') === 0) { isGfs = true; break; }
+          }
+        }
+        if (!isGfs) continue;
+        var hg = e.hostGroup || {}, rUnique = String(hg.uniqueName || ''), rDisp = String(hg.displayName || rUnique || '');
+        var same = (rUnique !== '' && rUnique == thisRegion);
+        var item = { value: e.envName, caption: e.envName + ' - ' + rDisp + (same ? '  (same region as this env)' : '') };
+        if (same) local.push(item); else remote.push(item);
+      }
+    }
+  } catch (e2) { /* fall through */ }
+  var regionVals = local.concat(remote);
+
+  var fields = [];
+  if (!regionVals.length) {
+    fields.push({ type: 'displayfield', cls: 'warning', hideLabel: true, height: 50,
+      markup: 'No GlusterFS region environments found in this account. Deploy the Multi-Region GlusterFS Cluster package first.' });
+  } else {
+    fields.push({ type: 'displayfield', hideLabel: true, height: 50,
+      markup: 'Pick the GlusterFS region nearest this environment. It is ONE stretched volume - any region serves the whole dataset. Same-region choices are listed first.' });
+  }
+  fields.push({ type: 'list', name: 'regionEnv', caption: 'GlusterFS region',
+    required: true, editable: false, forceSelection: true, values: regionVals });
+  fields.push({ type: 'string', name: 'volumeName', caption: 'Volume name', 'default': 'data', required: true,
+    regex: '^[a-zA-Z0-9_-]+$', regexText: 'Letters, digits, dash, underscore only.' });
+  fields.push({ type: 'string', name: 'mountPath', caption: 'Mount path (in this env)', 'default': '/mnt/gluster', required: true,
+    regex: '^/[a-zA-Z0-9/_.-]+$', regexText: 'Must start with / and use letters/digits/dash/underscore/dot.' });
+  if (groupsKnown) {
+    fields.push({ type: 'list', name: 'nodeGroup', caption: 'Mount on node group',
+      required: true, editable: false, forceSelection: true, 'default': defaultGroup, values: groupVals });
+  } else {
+    fields.push({ type: 'string', name: 'nodeGroup', caption: 'Mount on node group', 'default': 'cp', required: true,
+      regex: '^[a-zA-Z0-9_-]+$', regexText: 'Node group name, e.g. cp' });
+  }
+  return { result: 0, settings: { fields: fields } };
+
+globals:
+  base_path:   ${baseUrl}
+  regionEnv:   ${settings.regionEnv}
+  volumeName:  ${settings.volumeName:data}
+  mountPath:   ${settings.mountPath:/mnt/gluster}
+  targetGroup: ${settings.nodeGroup:cp}
+
+onInstall:
+  - resolveRegionNodes
+  - installAddon:
+      id: glusterfs-client-addon
+      nodeGroup: ${globals.targetGroup}
+  - checkReachability
+  - installClient
+  - mountVolume
+
+onUninstall:
+  - unmountVolume
+
+# Re-apply after events that can drop the mount or add nodes. Every step is
+# idempotent: the client install is skipped if present, the mount is skipped
+# if already mounted, and the fstab entry is replaced rather than duplicated.
+# The events are unfiltered so a dynamic node group works; a redeploy or
+# scale-out of some OTHER group is simply a no-op on ours.
+onAfterRedeployContainer:
+  - resolveRegionNodes
+  - installClient
+  - mountVolume
+onAfterScaleOut:
+  - resolveRegionNodes
+  - installClient
+  - mountVolume
+onAfterStart:
+  - resolveRegionNodes
+  - mountVolume
+
+addons:
+  - id: glusterfs-client-addon
+    name: GlusterFS Client
+    permanent: true
+    description: Gluster-native FUSE mount of the multi-region volume, by region. Status / Remount / Unmount.
+    buttons:
+      - caption: Status
+        action: statusMount
+        loadingText: Checking...
+        successText: See the env Tasks log.
+      - caption: Remount
+        action: remount
+        confirmText: "Re-resolve the region's nodes and (re)mount the volume on this node group?"
+        loadingText: Mounting...
+        successText: Remounted - see the env Tasks log.
+      - caption: Unmount
+        action: unmountVolume
+        confirmText: "Unmount the volume and remove its fstab entry on this node group?"
+        loadingText: Unmounting...
+        successText: Unmounted.
+
+actions:
+  # Resolve the chosen region's storage nodes: master first (volfile server),
+  # the rest become backup-volfile-servers. Also ask the region master for its
+  # gluster major version so the client can try to install a matching one.
+  # Runs at the start of every event/button, so the IP list is always current.
+  resolveRegionNodes:
+    - script: |
+        var r = jelastic.env.control.GetEnvInfo('${globals.regionEnv}', session);
+        if (!r || r.result != 0 || !r.nodes) return { result: 1, error: "Cannot read GlusterFS region env '${globals.regionEnv}'." };
+        var storage = [];
+        for (var i = 0; i < r.nodes.length; i++) if (r.nodes[i].nodeGroup == 'storage') storage.push(r.nodes[i]);
+        if (!storage.length) return { result: 1, error: "No storage nodes in '${globals.regionEnv}' - is it a GlusterFS region env?" };
+        storage.sort(function(a, b){ var ma = a.ismaster ? 0 : 1, mb = b.ismaster ? 0 : 1; return (ma - mb) || (a.id - b.id); });
+        var ips = [];
+        for (var j = 0; j < storage.length; j++) if (storage[j].address) ips.push(storage[j].address);
+        if (!ips.length) return { result: 1, error: "Storage nodes in '${globals.regionEnv}' have no internal IPs yet." };
+        var primary = ips[0], backups = ips.slice(1).join(':');
+        var major = '';
+        try {
+          var v = api.env.control.ExecCmdById({ envName: '${globals.regionEnv}', session: session, nodeId: String(storage[0].id),
+            commandList: toJSON([{ command: "gluster --version 2>/dev/null | head -1 | awk '{print $2}' | cut -d. -f1" }]) });
+          if (v && v.responses && v.responses[0]) major = String(v.responses[0].out || '').trim();
+        } catch (e) { major = ''; }
+        var region = (r.env && r.env.hostGroup && r.env.hostGroup.displayName) ? r.env.hostGroup.displayName : '';
+        return { result: 0, onAfterReturn: { setGlobals: {
+          primaryIp: primary, backupServers: backups, allIps: ips.join(','), serverMajor: major, regionDisplay: region
+        } } };
+
+  # Fail fast, with a message that names the real cause, if this node group
+  # cannot reach the region's glusterd port. That is network isolation or
+  # firewall - never gluster itself (the volume is open, auth.allow '*').
+  checkReachability:
+    - cmd[${globals.targetGroup}]: |-
+        H="${globals.primaryIp}"; P=24007
+        if timeout 5 bash -c "</dev/tcp/$H/$P" 2>/dev/null; then
+          echo "OK: GlusterFS region node $H:$P (glusterd) reachable from $(hostname)"
+        else
+          echo "ERROR: cannot reach GlusterFS region node $H on TCP $P from $(hostname)." >&2
+          echo "This is network isolation or firewall, not gluster. Ensure this environment can reach the storage nodes' private IPs and the storage firewall allows TCP 24007 and 49152-49251 from it." >&2
+          exit 1
+        fi
+      user: root
+
+  # Install the gluster FUSE client (idempotent). RHEL family: try a release
+  # matching the server's gluster major via the CentOS Storage SIG, then fall
+  # back to whatever the distro offers. Debian family: glusterfs-client.
+  installClient:
+    - cmd[${globals.targetGroup}]: |-
+        set +e
+        if command -v mount.glusterfs >/dev/null 2>&1; then echo "gluster FUSE client already present on $(hostname)"; exit 0; fi
+        MAJ="${globals.serverMajor}"
+        if command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+          PM=dnf; command -v dnf >/dev/null 2>&1 || PM=yum
+          $PM -y install glusterfs-fuse >/dev/null 2>&1
+          if ! command -v mount.glusterfs >/dev/null 2>&1; then
+            for rel in centos-release-gluster$MAJ centos-release-gluster almalinux-release-storage epel-release; do
+              $PM -y install $rel >/dev/null 2>&1 || true
+            done
+            $PM -y install glusterfs-fuse 2>&1 | tail -3
+          fi
+        elif command -v apt-get >/dev/null 2>&1; then
+          apt-get update >/dev/null 2>&1; apt-get install -y glusterfs-client 2>&1 | tail -3
+        fi
+        if command -v mount.glusterfs >/dev/null 2>&1; then
+          echo "gluster FUSE client installed on $(hostname): $(mount.glusterfs -V 2>&1 | head -1)"; exit 0
+        fi
+        echo "ERROR: could not install the gluster FUSE client on $(hostname). Install 'glusterfs-fuse' (RHEL family / CentOS Storage SIG) or 'glusterfs-client' (Debian family) manually, then click Remount." >&2
+        exit 1
+      user: root
+
+  # Mount with the region master as volfile server and the region's other
+  # nodes as backup-volfile-servers; persist via fstab + systemd automount.
+  mountVolume:
+    - cmd[${globals.targetGroup}]: |-
+        P="${globals.mountPath}"; V="${globals.volumeName}"; PRI="${globals.primaryIp}"; BK="${globals.backupServers}"
+        FOPTS="defaults,_netdev,noauto,x-systemd.automount"
+        MOPTS="_netdev"
+        if [ -n "$BK" ]; then FOPTS="$FOPTS,backup-volfile-servers=$BK"; MOPTS="$MOPTS,backup-volfile-servers=$BK"; fi
+        mkdir -p "$P"
+        # Replace any existing fstab entry for this mount point (no duplicates).
+        sed -i "\|[[:space:]]$P[[:space:]]|d" /etc/fstab
+        echo "$PRI:/$V  $P  glusterfs  $FOPTS  0 0" >> /etc/fstab
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        if ! mountpoint -q "$P"; then
+          mount -t glusterfs "$PRI:/$V" "$P" -o "$MOPTS" 2>&1 || { sleep 3; mount -t glusterfs "$PRI:/$V" "$P" -o "$MOPTS" 2>&1; }
+        fi
+        BKSHOW="$BK"; [ -z "$BKSHOW" ] && BKSHOW=none
+        if mountpoint -q "$P"; then
+          echo "MOUNTED $PRI:/$V at $P on $(hostname) (region: ${globals.regionDisplay}; backup volfile servers: $BKSHOW)"
+          df -h "$P" | tail -1
+        else
+          echo "ERROR: mount of $PRI:/$V at $P failed on $(hostname). Check /var/log/glusterfs/ on this node." >&2
+          exit 1
+        fi
+      user: root
+
+  unmountVolume:
+    - cmd[${globals.targetGroup}]: |-
+        P="${globals.mountPath}"
+        systemctl stop "$(systemd-escape -p --suffix=automount "$P")" >/dev/null 2>&1 || true
+        umount -l "$P" >/dev/null 2>&1 || true
+        sed -i "\|[[:space:]]$P[[:space:]]|d" /etc/fstab
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        echo "Unmounted $P on $(hostname) and removed its fstab entry"
+      user: root
+
+  statusMount:
+    - cmd[${globals.targetGroup}]: |-
+        P="${globals.mountPath}"
+        echo "===== $(hostname) ====="
+        if mountpoint -q "$P"; then echo "MOUNTED: $P"; mount | grep " $P "; df -h "$P" | tail -1; else echo "NOT MOUNTED: $P"; fi
+        echo "fstab: $(grep -F " $P " /etc/fstab || echo '(no entry)')"
+      user: root
+
+  remount:
+    - resolveRegionNodes
+    - installClient
+    - mountVolume
