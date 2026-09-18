@@ -17,25 +17,20 @@ Every storage node already has the volume FUSE-mounted at `${globals.replicatedP
 Write to that path on **any node in any region** and the change replicates
 synchronously to every other region.
 
-**Mounting it into another environment (FUSE, by region)** — import the
-**GlusterFS Client** addon *onto the app environment*:
+**Mounting it into another environment (FUSE, by region)** — straight from the
+dashboard. On the app environment open the mount dialog (*Volumes → Add → Data
+Container*, or *Config → Mount Points → Mount*), choose the GlusterFS region
+env nearest that app — it is listed as **Storage Containers** — keep **Client
+Type: Gluster Native (FUSE)**, and mount the volume `${globals.volumeName}`.
+Nothing needs installing on the app environment. It's one stretched volume, so
+any region serves the whole dataset; after mounting, the FUSE client talks to
+every brick in every region directly.
 
-```
-https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main/addons/client.jps
-```
-
-Pick the GlusterFS *region* nearest that app (same-region choices are listed
-first), the volume `${globals.volumeName}`, a mount path, and the node group.
-It installs the gluster FUSE client and mounts the volume with the region master
-as volfile server and the region's other nodes as `backup-volfile-servers` —
-resilient at mount time and at runtime, since the FUSE client then talks to
-every brick in every region directly. It's one stretched volume, so any region
-serves the whole dataset.
-
-(Jelastic's own *Volumes → Data Container* dialog only offers Gluster-native
-FUSE for storage it auto-clusters itself, which is incompatible with a
-cross-region volume — for this package it exposes **NFS** only. NFS via that
-dialog does work, as a single-node-dependency alternative.)
+If the dialog lists the region's storage nodes individually with no *Client
+Type* choice, see *Troubleshooting* in the package README. Fallbacks that always
+work: the **GlusterFS Client** addon imported *onto the app environment*
+(`https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main/addons/client.jps`),
+or plain **NFS** against a single storage node via the same dialog.
 
 ## Day-2 management
 

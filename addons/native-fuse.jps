@@ -1,0 +1,145 @@
+type: update
+version: 1.0
+jpsVersion: 6.1.1
+id: glusterfs-native-fuse
+name: GlusterFS Native FUSE Mounts
+baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
+targetEditions: any
+description:
+  short: Makes the dashboard offer "Gluster Native (FUSE)" mounts for this region's storage layer.
+  text: |
+    Flags this environment's storage layer as a storage cluster, so that in any
+    other environment's Volumes -> Data Container dialog it is listed as
+    "Storage Containers x N" and can be mounted with the Gluster Native (FUSE)
+    client type - by region, not by individual node, and with nothing installed
+    on the client environment.
+
+    Installed automatically on every region of a fresh deployment. Import it by
+    hand only to upgrade a region deployed by an older version of the package.
+    Uninstalling it removes the flag again.
+
+# ---------------------------------------------------------------------------
+# WHY THIS FILE EXISTS
+#
+# In the dashboard's Volumes -> Data Container dialog the "Client Type"
+# (protocol) selector is HIDDEN by default. It is shown - and defaults to
+# Gluster Native (FUSE) - only when the selected source is a "storage cluster"
+# entry. The dashboard builds that entry for a node group when ALL of these
+# hold (read from the dashboard source, HasNodeGroupCluster /
+# GetNodeGroupClusterSetting / GetStorageClusterGlusterVolume):
+#
+#   - the layer's nodes are Shared Storage nodes (nodeType: storage)
+#   - node-group data  cluster.enabled                    is true
+#   - node-group data  cluster.settings.replicatedPath    is non-empty
+#   - node-group data  cluster.settings.replicatedVolume  names the gluster
+#     volume (when missing the dashboard falls back to a volume called
+#     "jelastic", which does not exist here)
+#
+# The platform normally writes that data when its DEFAULT storage
+# clusterization package is applied (`cluster: true` ->
+# jelastic-jps/glusterfs replication-logic.jps). We cannot use that package: it
+# builds a separate gluster trusted pool + replica volume PER ENVIRONMENT, and
+# a node can belong to only one pool - incompatible with our single
+# cross-region stretched volume. Its hooks would also damage a stretched volume
+# (onAfterMigrate wipes /var/lib/glusterd; the scale hooks derive `replica`
+# from the pool-wide peer count).
+#
+# So the region envs are still created with `cluster: false`, the volume is
+# still owned by cluster-logic / syncClusterManager exactly as before, and this
+# package only writes the node-group data the dashboard looks for - through
+# env.control.ApplyNodeGroupData, the same call persistGlobals already uses.
+# The result is verified by reading the node group back.
+#
+# Deliberately NOT written: `clusterTemplate`. With it the topology wizard
+# would impose the default package's validation (min 3 nodes, 2-node scaling
+# steps) and single-node regions could no longer be edited.
+# ---------------------------------------------------------------------------
+
+targetNodes:
+  nodeType:
+    - storage
+
+settings:
+  fields:
+    - type: string
+      name: replicatedVolume
+      caption: Gluster volume
+      default: data
+    - type: string
+      name: replicatedPath
+      caption: Mount path on storage nodes
+      default: /data
+
+globals:
+  nodeGroup: ${settings.nodeGroup:storage}
+  replicatedVolume: ${settings.replicatedVolume:data}
+  replicatedPath: ${settings.replicatedPath:/data}
+  # strict: a flag the platform refuses to persist fails the install. That is
+  # what you want when importing this by hand. storage-region.jps passes
+  # strict=false so a dashboard nicety can never fail a storage deployment.
+  strict: ${settings.strict:true}
+  nativeFuseStatus: not run
+
+onInstall:
+  - setClusterFlag:
+      enabled: true
+  - log: "[native-fuse] ${globals.nativeFuseStatus}"
+
+onUninstall:
+  - setClusterFlag:
+      enabled: false
+  - log: "[native-fuse] ${globals.nativeFuseStatus}"
+
+actions:
+  setClusterFlag:
+    - script: |
+        var envName = '${env.name}', group = '${globals.nodeGroup}';
+        var enable = '${this.enabled}' == 'true';
+        var strict = '${globals.strict}' == 'true';
+        var path = '${globals.replicatedPath}', volume = '${globals.replicatedVolume}';
+
+        var want = enable
+          ? { cluster: { enabled: true, settings: { replicatedPath: path, replicatedVolume: volume } } }
+          : { cluster: { enabled: false } };
+
+        function readBack() {
+          var r = api.env.control.GetNodeGroups(envName, session);
+          if (r.result != 0) return null;
+          for (var i = 0, n = r.object.length; i < n; i++)
+            if (r.object[i].name == group) return r.object[i].cluster;
+          return null;
+        }
+
+        // The dashboard needs `cluster` stored as a real object, not as a JSON
+        // string - so check the shape, not just the API result code.
+        function persisted(c) {
+          if (!c || typeof c == 'string') return false;
+          if (!enable) return String(c.enabled) != 'true';
+          return String(c.enabled) == 'true' && !!c.settings
+              && String(c.settings.replicatedPath) == path
+              && String(c.settings.replicatedVolume) == volume;
+        }
+
+        // `data` is a JSON string in the API contract; some engine builds also
+        // take a native object. Try the canonical form first, verify, fall back.
+        var forms = [ toJSON(want), want ], resp, got;
+        for (var f = 0; f < forms.length; f++) {
+          resp = api.env.control.ApplyNodeGroupData(envName, session, group, forms[f]);
+          got = readBack();
+          if (resp.result == 0 && persisted(got)) break;
+        }
+
+        var msg;
+        if (persisted(got)) {
+          msg = enable
+            ? "storage layer '" + group + "' of " + envName + " flagged as a storage cluster (path " + path + ", volume " + volume + ") - Gluster Native (FUSE) is now offered in Volumes > Data Container"
+            : "storage cluster flag removed from layer '" + group + "' of " + envName;
+        } else {
+          msg = "the platform did NOT persist the storage cluster flag on layer '" + group + "' of " + envName
+              + " (ApplyNodeGroupData result " + (resp ? resp.result : "n/a") + (resp && resp.error ? ", " + resp.error : "")
+              + "; read back: " + String(toJSON(got)).replace(/"/g, "'") + ")."
+              + " The volume itself is unaffected; only the dashboard's native FUSE mount option is missing.";
+          // Only enabling may fail the run - an uninstall must always go through.
+          if (strict && enable) return { result: 1, error: msg };
+        }
+        return { result: 0, onAfterReturn: { setGlobals: { nativeFuseStatus: msg } } };

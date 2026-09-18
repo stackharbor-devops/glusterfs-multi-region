@@ -29,6 +29,9 @@ nodes:
     # (which always makes a pure replica = node-count volume per region). Our
     # cluster-logic / syncClusterManager owns the volume instead, so we get
     # distributed-replicated slicing (async) and the stretched volume (sync).
+    #
+    # The layer is still presented to the dashboard as a storage cluster - see
+    # enableNativeFuse below - but without the built-in package ever running.
     cluster: false
     fixedCloudlets: 1
     flexibleCloudlets: 8
@@ -38,6 +41,7 @@ onInstall:
   # Cross-region replication runs over the platform's internal GRE routing —
   # no public IPs are allocated to storage nodes.
   - installClusterLogic
+  - enableNativeFuse
 
 actions:
   # Install the permanent in-region cluster logic (volume create / mount / scale).
@@ -50,3 +54,17 @@ actions:
         replicatedPath: ${globals.replicatedPath}
         replicaCount: ${globals.replicaCount}
         replicationModel: ${globals.replicationModel}
+
+  # Flag the layer as a storage cluster in node-group data, so other envs'
+  # Volumes -> Data Container dialog lists it as "Storage Containers x N" and
+  # offers the Gluster Native (FUSE) client type - region-level mounts with
+  # nothing installed on the client env. Metadata only: it does not touch
+  # gluster. strict=false -> it can never fail the storage deployment.
+  enableNativeFuse:
+    install:
+      jps: ${baseUrl}/addons/native-fuse.jps?_r=${fn.random}
+      settings:
+        nodeGroup: storage
+        replicatedVolume: ${globals.replicatedVolume}
+        replicatedPath: ${globals.replicatedPath}
+        strict: false

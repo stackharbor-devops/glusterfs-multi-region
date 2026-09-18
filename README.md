@@ -36,6 +36,10 @@ to every other region. Repository: <https://github.com/stackharbor-devops/gluste
 - **Access:** the volume stays open at the Gluster layer (`auth.allow '*'`) so any
   GlusterFS-native (FUSE) client on the platform's private network can mount it.
   Access is governed by Jelastic network isolation + the storage firewall.
+- **Native dashboard mounts:** each region's storage layer shows up in other
+  environments' *Volumes → Data Container* dialog as **Storage Containers × N**
+  with the **Gluster Native (FUSE)** client type — mount by region, with nothing
+  installed on the client environment.
 - **Optional backup:** at install you can deploy a backup-storage node inside one
   of the cluster regions; scheduled restic backups then run from a single
   secondary node in that same region.
@@ -169,17 +173,48 @@ gluster volume info data | grep auth.allow     # expected: auth.allow: *
 Because it is **one stretched volume**, you mount by *region*, not by node, and
 any region serves the entire dataset.
 
-**Why the Volumes dialog won't do it for you.** Jelastic's *Data Container*
-dialog only offers the **Gluster Native (FUSE)** client type for storage layers
-it auto-clusters itself (`cluster: true` — what the OEM "GlusterFS Replicated
-Volume" package uses; that's what makes it show as *Storage Containers × N*).
-This package deliberately uses `cluster: false` and owns its own **cross-region**
-gluster pool — a node can belong to only one pool, so Jelastic's per-region
-auto-clustering and a stretched volume are mutually exclusive. As a result the
-dialog lists our storage nodes individually and exposes **NFS only**.
+**Natively, from the dashboard (v3.0+).** On the app environment open the
+layer's *Volumes → Add → Data Container* (custom containers) or *Config → Mount
+Points → Mount* (certified containers) — both use the same mount dialog:
 
-**Use the client addon instead** — it performs the native FUSE mount, by region,
-with better HA than the dialog can express:
+| Field | Value |
+|---|---|
+| Data Container | the region env nearest that app → **Storage Containers × N** |
+| Client Type | **Gluster Native (FUSE)** (pre-selected) |
+| Remote path | the volume, `data` |
+| Local path | where to mount inside the app containers |
+
+Nothing is installed on the app environment, and you pick a *region*, not a node.
+
+**How that works.** The dashboard hides the *Client Type* selector unless the
+chosen source is a "storage cluster", which it decides purely from the storage
+layer's node-group data: `cluster.enabled` must be true **and**
+`cluster.settings.replicatedPath` / `replicatedVolume` must name the mount path
+and gluster volume. The platform normally writes that when it auto-clusters a
+storage layer itself (`cluster: true` — what the OEM "GlusterFS Replicated
+Volume" package uses). This package cannot use that: the built-in package builds
+a separate gluster pool **per environment**, and a node can belong to only one
+pool, so it is mutually exclusive with a cross-region stretched volume. So the
+region envs are still created with `cluster: false`, the volume is still owned by
+this package, and `addons/native-fuse.jps` — installed automatically on every
+region — writes just that node-group data. It is metadata only and never touches
+gluster; uninstalling the **GlusterFS Native FUSE Mounts** add-on removes the
+flag again.
+
+**Regions deployed by an older version** can be upgraded in place — no redeploy.
+Import this onto **each region's storage env**:
+
+```
+Import → URL: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main/addons/native-fuse.jps
+```
+
+When imported by hand it runs strict: if the platform does not persist the flag,
+the install fails and reports what it read back.
+
+**Alternative — the client addon.** `addons/client.jps` performs the same native
+FUSE mount from the client side, for platforms where the dialog route is not
+available. It explicitly passes the region's other nodes as
+`backup-volfile-servers`:
 
 ```
 Import → URL: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main/addons/client.jps
@@ -381,12 +416,29 @@ local storage; no WAN cost.
 
 ## Troubleshooting
 
+### The Data Container dialog doesn't offer Gluster Native (FUSE)
+The region's storage layer isn't flagged as a storage cluster. Check that the
+**GlusterFS Native FUSE Mounts** add-on is installed on that region env (storage
+layer → Add-Ons) and look for its `[native-fuse]` line in the Cloud Scripting
+console log — during a deployment it runs non-strict, so a platform that refused
+the flag is logged there rather than failing the install. Re-importing
+`addons/native-fuse.jps` by hand runs strict and shows the reason. Reload the
+dashboard after installing it; it caches environment data.
+
 ### A FUSE mount from another environment fails
 The volume is intentionally open (`auth.allow '*'`), so gluster itself won't
 refuse the client. Check reachability instead: the client env must be able to
 reach the storage nodes' private IPs (Jelastic network isolation), and the
-storage firewall must allow TCP `24007` and `49152–49251` from it. Quick test
+storage firewall must allow TCP `24007` and `49152–49251` from it — for the
+nodes of **every** region, since a FUSE client talks to all bricks. Quick test
 from the client node: `nc -zv <storage-node-ip> 24007`.
+
+Also confirm the volume is still open — `gluster volume get data auth.allow`
+should print `*`. If mounting through the dashboard ever leaves a list of client
+IPs there instead, reset it (*Manage Cluster → Custom CLI command*):
+`gluster volume set data auth.allow '*'`. One volume spans every region, so a
+per-environment allow-list would lock out clients that mounted via another
+region.
 
 ### Writes hang / time out
 - Check `Cluster Status` → look at `Network ping-timeout`. WAN latency higher
@@ -420,16 +472,18 @@ scripts/
   storage-region.jps               per-region Certified-Storage env (install)
   cluster-logic.jps                in-region node prep (firewall, glusterd, dirs) — permanent addon
   syncClusterManager.jps           cross-region stretched-volume manager — action-dispatch
-                                    (install / addRegion / removeRegion / addCapacitySlice / hardenAuth)
+                                    (install / addRegion / removeRegion / addCapacitySlice)
 addons/
+  native-fuse.jps                  flags a region's storage layer as a storage cluster so the
+                                    dashboard offers Gluster Native (FUSE) mounts (auto-installed)
   management.jps                   single-button "Manage Cluster" with popup operations
   addRegion.jps                    day-2: add a new region (replica +1)
   forgetRegion.jps                 day-2: remove a region (replica -1)
   addCapacitySlice.jps             day-2: grow capacity (sets +1; replica unchanged)
   backup.jps                       optional: scheduled restic backups from one
                                     secondary node in the backup-storage region
-  client.jps                       import onto an APP env: Gluster-native FUSE mount
-                                    of the volume by region (backup-volfile-servers)
+  client.jps                       fallback, import onto an APP env: Gluster-native FUSE
+                                    mount of the volume by region (backup-volfile-servers)
 success/success.md                 post-install summary shown to the user
 ```
 
@@ -437,7 +491,17 @@ success/success.md                 post-install summary shown to the user
 
 ## Versioning
 
-- **v2.6** (current): new `addons/client.jps` — Gluster-native FUSE mount of the
+- **v3.0** (current): native dashboard mounts. Every region's storage layer is
+  flagged as a storage cluster in node-group data (`cluster.enabled` +
+  `cluster.settings.replicatedPath` / `replicatedVolume` — the exact condition
+  the dashboard checks, taken from its source), so *Volumes → Data Container*
+  lists it as *Storage Containers × N* and offers **Gluster Native (FUSE)**, with
+  nothing installed on client environments. Done by the new
+  `addons/native-fuse.jps`; the region envs keep `cluster: false`, so the
+  platform's built-in per-environment gluster clustering never runs and the
+  stretched volume is unchanged. Older deployments upgrade by importing that
+  add-on onto each region env.
+- **v2.6**: new `addons/client.jps` — Gluster-native FUSE mount of the
   volume into any app environment, by region, with the region master as volfile
   server and the other region nodes as `backup-volfile-servers`. Added because
   Jelastic's Volumes dialog only offers FUSE for `cluster: true` storage (which
