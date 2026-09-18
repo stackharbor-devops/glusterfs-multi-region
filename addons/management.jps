@@ -1,5 +1,5 @@
 type: update
-version: 1.5
+version: 1.6
 id: glusterfs-management
 name: GlusterFS Cluster Management
 baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
@@ -85,10 +85,14 @@ addons:
                   cls: warning
                   height: 50
                   markup: "Advanced: command runs as root on the LOCAL master of this env (gluster propagates cluster-wide commands automatically). Use with care."
+                # NOTE: do NOT mark this `required`. A required field nested in
+                # a showIf still counts toward form validity while hidden, which
+                # disables the form's submit (Run) button for every OTHER
+                # operation. op_custom only runs when `custom` is selected, and
+                # the field carries a default, so requiredness is unnecessary.
                 - type: string
                   name: customCmd
                   caption: Command to run
-                  required: true
                   default: gluster volume status
                   regex: "^[^|;&<>$`\\\\]*$"
                   regexText: "Pipes, semicolons, redirects, command substitution, and backslashes are blocked."
