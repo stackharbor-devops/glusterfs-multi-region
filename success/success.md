@@ -45,3 +45,12 @@ To grow usable capacity, scale **each region's** `storage` layer up by the same
 count (e.g. all 3 regions go from 1 → 2 nodes), then run the **Add Capacity
 Slice** add-on against this env — it peer-probes the new nodes, adds them as a
 new replica set, then triggers rebalance + heal.
+
+## Backups (if enabled)
+
+If you ticked **Deploy a backup server**, a `-bkp` backup-storage env was created
+in your chosen region, and a **GlusterFS Backup/Restore** card is on the storage
+node-group of the cluster env in that same region. Backups run from a single
+secondary node there (the whole volume is sync-replicated, so one node captures
+everything). Use the card's **Config** button to change the schedule, **Backup**
+to run one now, and **Restore** to roll back to a snapshot.

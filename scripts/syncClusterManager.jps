@@ -26,7 +26,6 @@ globals:
   master_env_name: ${settings.master_env_name}
   volumeName: ${settings.volumeName:data}
   replicatedPath: ${settings.mountPoint:/data}
-  networkMode: ${settings.networkMode:internal}
   envNamePrefix: ${settings.envNamePrefix:}
   nodesPerRegion: ${settings.nodesPerRegion:1}
   regionsCount: ${settings.regionsCount:3}
@@ -78,8 +77,9 @@ actions:
   # brick list, and pick the primary master. perRegion[r][j] = jth node of region r.
   gatherNodes:
     - script: |
-        function extIp(node){ if(node.extIPs&&node.extIPs.length){var e=node.extIPs[0];return (e&&e.address)?e.address:e;} if(node.extIP)return node.extIP; if(node.externalIp)return node.externalIp; return node.address; }
-        var pub  = ('${globals.networkMode}' == 'public');
+        // Internal/GRE only: every node is addressed by its internal IP.
+        function extIp(node){ return node.address; }
+        var pub  = false;
         var envs = '${globals.clusterEnvs}'.split(',');
         envs.sort(function(a, b){ return parseInt(a.split('-').pop(), 10) - parseInt(b.split('-').pop(), 10); });
 

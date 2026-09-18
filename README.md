@@ -31,10 +31,13 @@ to every other region. Repository: <https://github.com/stackharbor-devops/gluste
 - **Capacity slices** = nodes per region. More nodes per region → distributed-
   replicated layout with more usable space, redundancy preserved.
 - **Odd region count required** (3, 5, 7) for split-brain quorum.
-- **Networking:** internal (platform GRE, no public IPs) or public (each storage
-  node gets a public IPv4 for cross-region WAN).
+- **Networking:** cross-region replication runs over the platform's internal GRE
+  routing — no public IPs are allocated.
 - **Security:** `auth.allow` is set to the cluster's peer IPs only — no
   unauthorised mounts even with port access. Firewall rules applied at install.
+- **Optional backup:** at install you can deploy a backup-storage node inside one
+  of the cluster regions; scheduled restic backups then run from a single
+  secondary node in that same region.
 
 ---
 
@@ -85,10 +88,10 @@ In your Jelastic dashboard:
    | Field | Pick |
    |---|---|
    | Regions | 3 (or 5 or 7) of your active regions |
-   | Cross-region networking | Internal (GRE) — the cheap default |
    | Per-region topology | Single node per region — for trying it out |
    | Volume name | `data` |
    | Mount point | `/data` |
+   | Deploy a backup server | (optional) tick to add backup storage in one region |
    | Environment | (auto-generated; rename if you like) |
 3. **Install**. The package will create one Certified-Storage environment per
    region, peer them all into one trusted pool, build the stretched volume,
@@ -131,30 +134,20 @@ The install dialog gives you a single binary choice for per-region topology:
 
 ## Networking
 
-Picked at install via **Cross-region networking**, applied automatically:
-
-### Internal (GRE) — default
-
-- Regions communicate over Jelastic's platform GRE routes.
-- **No public IPs allocated.** Cheapest and simplest. GRE bandwidth is shared
-  among tenants — fine for most workloads, may saturate under heavy traffic.
-- Best for: dev/staging, modest-traffic production.
-
-### Public WAN
-
-- Each storage node gets a public IPv4 (`binder.SetExtIpCount … ipv4 1`).
-- Cross-region traffic flows over the public Internet.
-- Highest cross-region bandwidth; predictable performance.
-- Best for: high-throughput production where GRE saturates.
+Cross-region replication runs over **Jelastic's platform GRE routing** — regions
+communicate over internal routes and **no public IPs are allocated** to storage
+nodes. GRE bandwidth is shared among tenants; fine for most workloads, and it may
+saturate under very heavy cross-region traffic. There is no public-WAN option:
+the package is internal-only by design (simpler, cheaper, no exposed IPs).
 
 ### Firewall
 
-Set by the JPS at install via `environment.security.AddRule`:
+Set by the JPS at install via `environment.security.AddRule`, on the storage
+node group:
 - **Outbound:** ALLOW all — so nodes can always reach peers.
 - **Inbound:** ALLOW TCP `22`, `24007–24008`, `49152–49251` (GlusterFS + SSH).
 
-The same rules apply in both networking modes. No-op if the env firewall feature
-is disabled (nothing is filtered then anyway).
+No-op if the env firewall feature is disabled (nothing is filtered then anyway).
 
 ### auth.allow hardening
 
@@ -270,11 +263,41 @@ Two steps:
 
 ### Backup / restore
 
-Not part of this package. Use the platform's own snapshot/backup features
-against the storage nodes (Jelastic VAP does node-level snapshots for full
-state recovery), or deploy your own backup tooling against the FUSE mount on
-any storage node — every node sees the live synchronous volume at the
-configured mount point.
+Optional, opt-in at install. Tick **Deploy a backup server** and pick a **backup
+region** — which must be one of your selected cluster regions. The orchestrator
+then:
+
+1. Deploys a Jelastic **backup-storage** env (`<envName>-bkp`) inside that region.
+2. Installs the **GlusterFS Backup/Restore** addon onto that region's cluster env.
+3. The addon picks **one secondary storage node** in that region (the lowest-id
+   non-master node; it falls back to the region master only if the region has a
+   single node) and configures scheduled `restic` backups there.
+
+Only that one node backs up. Because the volume is synchronously replicated, one
+node holds the whole dataset — so a single in-region backup captures everything,
+while leaving the region master unburdened and keeping the NFS write path
+intra-region. Example: 3 regions × 3 nodes = 9 nodes holding identical data; if
+the backup storage is in region B, exactly one secondary node in region B runs
+the backup.
+
+After install you'll see a **GlusterFS Backup/Restore** card on that env's
+storage node-group with four buttons:
+
+| Button | What it does |
+|---|---|
+| Backup | Runs the restic backup once, now (on the backup node). |
+| Config | Schedule (every 1 min ⚠ / 5 / 10 min / 1 / 2 / 3 / 6 / 12 / 24 h, or custom day+time, or raw cron), backup-storage env, source path (default `/data`), retention count, always-unmount toggle. |
+| Restore | Lists snapshots; pick one + a restore target. Restores in place; since the volume is sync-replicated, the restore propagates to every region. |
+| Verify | `restic check` on the repo. |
+
+**Backend:** restic over an NFS mount to the backup-storage env. Repo path
+`/data/<envName>/`, password = the env name (so the storage server's
+`getBackups.sh <envName>` lists them). Sub-hourly schedules use `flock` to
+prevent overlapping runs. This does **not** replace Jelastic VAP's node-level
+snapshots — it preserves the GlusterFS volume's *data* state specifically.
+
+You can also add it later by importing `addons/backup.jps` onto the cluster env
+in the region where your backup-storage env lives.
 
 ---
 
@@ -285,9 +308,8 @@ Writes are **synchronous** — they return when the slowest region acknowledges.
 Plan around your worst-case cross-region RTT:
 - 3 regions in the same continent (~50ms RTT): writes ~50ms.
 - 3 regions across continents (~150ms RTT): writes ~150ms+.
-- Heavy small-file workloads (e.g. node_modules) feel WAN latency a lot.
-- Bulk transfers are bottlenecked by GRE bandwidth (internal mode) or your
-  WAN link (public mode).
+- Heavy small-file workloads (e.g. node_modules) feel cross-region latency a lot.
+- Bulk transfers are bottlenecked by shared GRE bandwidth.
 
 ### Reads
 Reads come from the **local** brick (`cluster.choose-local on`). Same speed as
@@ -310,7 +332,7 @@ local storage; no WAN cost.
 | More capacity in existing regions | Scale each region by the same N nodes, run `addCapacitySlice`. |
 | Remove a region (decommission, failure) | Use `forgetRegion`. Add a fresh region after if you want to keep N odd. |
 | Tighten security after topology change | Use Manage Cluster → "Re-tighten auth.allow" |
-| Switch internal ↔ public networking | Manual: scale-down then re-deploy. (The dedicated addon was removed in v2.0 — net-new sync version is a future feature.) |
+| Add scheduled backups after deploy | Import `addons/backup.jps` onto the cluster env in the region where a backup-storage env lives (or redeploy with "Deploy a backup server" ticked). |
 
 ---
 
@@ -359,6 +381,8 @@ addons/
   addRegion.jps                    day-2: add a new region (replica +1)
   forgetRegion.jps                 day-2: remove a region (replica -1)
   addCapacitySlice.jps             day-2: grow capacity (sets +1; replica unchanged)
+  backup.jps                       optional: scheduled restic backups from one
+                                    secondary node in the backup-storage region
 success/success.md                 post-install summary shown to the user
 ```
 
@@ -366,11 +390,13 @@ success/success.md                 post-install summary shown to the user
 
 ## Versioning
 
-- **v2.3** (current): backup addon + "deploy backup server" install option
-  removed. Storage layer only — bring your own backup tooling or use the
-  platform's snapshots.
+- **v2.4** (current): internal-only networking (public-WAN option removed — all
+  replication over GRE). Backup re-added in a region-targeted form: deploy a
+  backup-storage node inside a chosen cluster region and back up from one
+  secondary node in that region.
+- **v2.3**: backup addon + "deploy backup server" install option removed.
 - **v2.2**: optional `deployBackupServer` install flag + integrated restic
-  backup addon. Removed in v2.3.
+  backup addon (backed up from the primary env's master).
 - **v2.0**: synchronous stretched cluster only. Write-anywhere from
   any node in any region. Async geo-replication code removed.
 - **v1.x**: dual-model (sync OR async geo-replication). Async master/secondary

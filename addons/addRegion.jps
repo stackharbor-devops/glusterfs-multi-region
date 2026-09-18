@@ -69,7 +69,6 @@ actions:
             "replicaCount": "${globals.replicaCount}",
             "volumeName": "${globals.volumeName}",
             "mountPoint": "${globals.replicatedPath}",
-            "networkMode": "${globals.networkMode}",
             "replicationModel": "sync"
           }
         }];
@@ -85,7 +84,6 @@ actions:
             "master_env_name": "${globals.master_env_name}",
             "volumeName": "${globals.volumeName}",
             "mountPoint": "${globals.replicatedPath}",
-            "networkMode": "${globals.networkMode}",
             "envNamePrefix": "${globals.envNamePrefix}",
             "nodesPerRegion": "${globals.nodesPerRegion}",
             "regionsCount": "${globals.regionsCount}",

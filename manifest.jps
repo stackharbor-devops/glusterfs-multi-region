@@ -1,5 +1,5 @@
 type: install
-version: 2.3
+version: 2.4
 id: glusterfs-multiregion
 name: Multi-Region GlusterFS Cluster (Write-Anywhere)
 baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
@@ -44,6 +44,27 @@ onBeforeInit: |
   } catch (e) { maxSame = 0; }
   var maxNodes = (maxSame > 0) ? maxSame : 16;
 
+  // Region list for the optional BACKUP SERVER picker. A second `regionlist`
+  // in the same form makes the dialog fail to render, so this is a plain
+  // `list` populated from GetRegions. At install we assert the chosen backup
+  // region is one of the cluster regions (backup storage lives INSIDE a
+  // cluster region so its NFS path to the backup node is intra-region).
+  var availableRegions = {};
+  try {
+    var rr = jelastic.environment.control.GetRegions(appid, session);
+    if (rr && rr.result == 0 && rr.array) {
+      for (var ra = 0; ra < rr.array.length; ra++) {
+        var hwg = rr.array[ra].hardNodeGroups || [];
+        for (var rh = 0; rh < hwg.length; rh++) {
+          var hg = hwg[rh];
+          if (hg && hg.isActive !== false) {
+            availableRegions[hg.uniqueName] = (rr.array[ra].displayName || '') + (rr.array[ra].displayName ? ' - ' : '') + (hg.displayName || hg.uniqueName);
+          }
+        }
+      }
+    }
+  } catch (e) { /* leave empty; field shows no values, but dialog still renders */ }
+
   // Cap the cluster-mode slider at the smaller of 9 and the account's
   // same-type quota. Single node per region needs no quota beyond 1.
   var clusterMax = (maxSame > 0 && maxSame < 9) ? maxSame : 9;
@@ -54,14 +75,6 @@ onBeforeInit: |
     { type: "regionlist", name: "regions", caption: "Regions",
       multiSelect: true, required: true, min: 3, max: 7,
       disableInactive: true, selectFirstAvailable: false },
-
-    // Networking
-    { type: "list", name: "networkMode", caption: "Cross-region networking",
-      "default": "internal", required: true, editable: false,
-      values: [
-        { value: "internal", caption: "Internal - platform GRE routing (no public IPs needed)" },
-        { value: "public",   caption: "Public WAN - attaches a public IPv4 to every storage node" }
-      ] },
 
     // Topology — binary choice. Cluster mode reveals a spinner for the
     // initial nodes-per-region count (3-9). After deploy, scale via the
@@ -91,6 +104,30 @@ onBeforeInit: |
       regex: "^/[a-zA-Z0-9/_-]+$",
       regexText: "Mount point must start with / and use letters/digits/dash/underscore." },
 
+    // Optional: deploy a Jelastic backup-storage env INSIDE one of the cluster
+    // regions and auto-install the backup addon onto that region's cluster env.
+    // Backups then run from a single SECONDARY storage node in that same region
+    // (intra-region NFS path; the region master is left unburdened). The chosen
+    // backup region MUST be one of the regions selected above — validated at
+    // install. backupServerRegion is a plain `list` (not a second regionlist,
+    // which would break the dialog); values come from `availableRegions` above.
+    { type: "checkbox", name: "deployBackupServer",
+      caption: "Deploy a backup server (inside a selected region) and schedule backups",
+      value: false,
+      showIf: {
+        "true": [
+          { type: "displayfield", hideLabel: true, height: 65, cls: "info",
+            markup: "Pick a region that is ALSO one of the cluster regions you selected above. A backup-storage node is created there, and ONE secondary storage node in that same region is configured to run scheduled restic backups of the volume. The volume is sync-replicated, so backing up one node captures the whole dataset." },
+          { type: "list", name: "backupServerRegion",
+            caption: "Backup server region (must be a selected region)",
+            required: true, editable: false,
+            values: availableRegions },
+          { type: "spinner", name: "backupStorageSize",
+            caption: "Backup storage disk size, GB",
+            min: 5, max: 1000, "default": 50 }
+        ]
+      } },
+
     // Env name
     { type: "envname", name: "envName", caption: "Environment",
       required: true, randomName: true }
@@ -112,6 +149,13 @@ onInstall:
   - getClusterEnvs
   - setupSyncCluster
   - installManagement
+  # Optional: deploy a backup-storage env INSIDE a chosen cluster region, then
+  # install the backup addon onto that region's cluster env. The addon runs
+  # backups from a single secondary node in that region.
+  - if ('${settings.deployBackupServer}' == 'true'):
+      - assertBackupRegionInCluster
+      - createBackupServer
+      - installBackupAddon
 
 actions:
   # Resolve regions -> domains, derive node counts. Sync-only: replica = #regions,
@@ -169,7 +213,6 @@ actions:
               "replicaCount": "${globals.replicaCount}",
               "volumeName": "${settings.volumeName}",
               "mountPoint": "${settings.mountPoint}",
-              "networkMode": "${settings.networkMode}",
               "replicationModel": "sync"
             }
           });
@@ -193,7 +236,6 @@ actions:
             "master_env_name": "${settings.envName}-1",
             "volumeName": "${settings.volumeName}",
             "mountPoint": "${settings.mountPoint}",
-            "networkMode": "${settings.networkMode}",
             "envNamePrefix": "${settings.envName}",
             "nodesPerRegion": "${globals.nodesPerRegion}",
             "regionsCount": "${globals.regionsCount}"
@@ -217,6 +259,69 @@ actions:
             }
           });
         }
+        return { result: 0, onAfterReturn: { 'marketplace.jps.install': actions } };
+
+  # ---- optional backup deployment -----------------------------------------
+
+  # Guard: the backup-storage node must live INSIDE one of the cluster's own
+  # regions (so its NFS path to the backup runner is intra-region). Abort with
+  # a clear message otherwise.
+  assertBackupRegionInCluster:
+    - script: |
+        var regions = '${settings.regions}'.split(',');
+        var bkp = '${settings.backupServerRegion}';
+        if (!bkp) return { result: 1, error: "Backup server was requested but no backup region was selected." };
+        if (regions.indexOf(bkp) < 0)
+          return { result: 1, error: "Backup region '" + bkp + "' is not one of the selected cluster regions (" + regions.join(', ') + "). The backup-storage node must live inside a cluster region. Re-run and pick a backup region that is also a cluster region." };
+        return { result: 0 };
+
+  # Deploy a Jelastic backup-storage env (official vendor package) INSIDE the
+  # chosen cluster region. Named "<envName>-bkp" so it groups with the cluster.
+  createBackupServer:
+    - script: |
+        var actions = [{
+          jps: "https://raw.githubusercontent.com/jelastic-jps/backup-storage/main/storage.jps",
+          envName: "${settings.envName}-bkp",
+          loggerName: "${settings.envName}-bkp",
+          envGroups: "GlusterFS Cluster ${settings.envName}",
+          region: "${settings.backupServerRegion}",
+          settings: {
+            "clustered": false,
+            "storageNodesCount": 1,
+            "diskspace": "${settings.backupStorageSize}",
+            "cloudlets": 6
+          }
+        }];
+        return { result: 0, onAfterReturn: { 'marketplace.jps.install': actions } };
+
+  # Install the backup addon onto the cluster env that sits in the backup
+  # region. Regions map to envs by selection order (region index N -> env
+  # "<envName>-N"), so we locate the backup region's index. The addon then
+  # picks a SECONDARY storage node in that env to run backups (falls back to
+  # the master when the region has a single node). One firing = one backup,
+  # from one node, intra-region.
+  installBackupAddon:
+    - script: |
+        var regions = '${settings.regions}'.split(',');
+        var idx = regions.indexOf('${settings.backupServerRegion}');
+        if (idx < 0) idx = 0;
+        var targetEnv = '${settings.envName}-' + (idx + 1);
+        var actions = [{
+          jps: "${baseUrl}/addons/backup.jps?_r=${fn.random}",
+          envName: targetEnv,
+          settings: {
+            "storageName": "${settings.envName}-bkp",
+            "scheduleType": "1",
+            "cronTime": "0 * * * *",
+            "sourcePath": "${settings.mountPoint}",
+            "backupCount": "24",
+            "isAlwaysUmount": "false",
+            "cluster_id": "${settings.envName}",
+            "primary_region_name": "${globals.region-1}",
+            "backup_region_name": "${settings.backupServerRegion}",
+            "volume_name": "${settings.volumeName}"
+          }
+        }];
         return { result: 0, onAfterReturn: { 'marketplace.jps.install': actions } };
 
 success:

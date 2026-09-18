@@ -1,5 +1,5 @@
 type: update
-version: 1.4
+version: 1.5
 id: glusterfs-management
 name: GlusterFS Cluster Management
 baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
@@ -159,16 +159,15 @@ actions:
   op_harden:
     - getClusterEnvs
     - script: |
-        function extIp(node){ if(node.extIPs&&node.extIPs.length){var e=node.extIPs[0];return (e&&e.address)?e.address:e;} if(node.extIP)return node.extIP; if(node.externalIp)return node.externalIp; return node.address; }
+        // Internal/GRE only: nodes are addressed by their internal IP.
         var envs = '${globals.clusterEnvs}'.split(','), ips = ['127.0.0.1'];
         for (var i = 0; i < envs.length; i++) {
           var r = jelastic.env.control.GetEnvInfo(envs[i], session);
           if (r.result != 0) continue;
           for (var l = 0; l < r.nodes.length; l++) {
             if (r.nodes[l].nodeGroup == 'storage') {
-              var iIp = r.nodes[l].address, eIp = extIp(r.nodes[l]);
+              var iIp = r.nodes[l].address;
               if (iIp && ips.indexOf(iIp) < 0) ips.push(iIp);
-              if (eIp && ips.indexOf(eIp) < 0) ips.push(eIp);
             }
           }
         }
@@ -186,17 +185,16 @@ actions:
   op_listNodes:
     - getClusterEnvs
     - script: |
-        function extIp(node){ if(node.extIPs&&node.extIPs.length){var e=node.extIPs[0];return (e&&e.address)?e.address:e;} if(node.extIP)return node.extIP; if(node.externalIp)return node.externalIp; return node.address; }
         var envs = '${globals.clusterEnvs}'.split(',');
         // Pretty-aligned table (column widths sized for typical Jelastic env names).
-        var rows = [['REGION','ENV','NODE','INT_IP','EXT_IP','MASTER']];
+        var rows = [['REGION','ENV','NODE','IP','MASTER']];
         for (var i = 0; i < envs.length; i++) {
           var r = jelastic.env.control.GetEnvInfo(envs[i], session);
           if (r.result != 0) continue;
           var region = (r.env && r.env.hostGroup && r.env.hostGroup.displayName) ? r.env.hostGroup.displayName : '(unknown)';
           for (var l = 0; l < r.nodes.length; l++) {
             if (r.nodes[l].nodeGroup == 'storage') {
-              rows.push([region, envs[i], String(r.nodes[l].id), r.nodes[l].address || '', extIp(r.nodes[l]) || '', r.nodes[l].ismaster ? 'yes' : '']);
+              rows.push([region, envs[i], String(r.nodes[l].id), r.nodes[l].address || '', r.nodes[l].ismaster ? 'yes' : '']);
             }
           }
         }

@@ -82,8 +82,8 @@ onBeforeStop:
 actions:
   # Open outbound (so nodes can reach peers) and the GlusterFS + SSH ports inbound,
   # on the storage node group, via the platform firewall API. No-op when the env
-  # firewall feature is disabled (nothing is filtered in that case). Works for both
-  # internal (GRE) and public (WAN) networking - src ALL covers either source.
+  # firewall feature is disabled (nothing is filtered in that case). Cross-region
+  # replication runs over internal GRE routing; src ALL covers the peer sources.
   # Best-effort: the firewall API takes ONE port or ONE range per rule (no comma
   # lists), so add the GlusterFS/SSH inbound ports as separate rules. Never fail
   # the install on a firewall hiccup - the cluster is what matters.
