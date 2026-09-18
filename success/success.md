@@ -15,11 +15,27 @@ ${globals.modelDescription}
 
 Every storage node already has the volume FUSE-mounted at `${globals.replicatedPath}`.
 Write to that path on **any node in any region** and the change replicates
-synchronously to every other region. Each storage node also re-exports the
-volume over NFS for clients in the same region:
+synchronously to every other region.
+
+**Mounting it into another environment** — the volume is open to any
+GlusterFS-native client on the platform's private network (access is governed
+by Jelastic network isolation + the storage firewall, not a gluster allow-list).
+In your app layer's **Volumes → Add → Data Container** dialog pick:
+
+- **Server:** the GlusterFS *region* env nearest that app (e.g. `env-XXXX-2`) — you
+  select the region, not a node; it's one stretched volume, so any region serves
+  the whole dataset.
+- **Client Type:** Gluster Native (FUSE)
+- **Volume:** `${globals.volumeName}` → **Local Path:** wherever you want it.
+
+Once mounted, the FUSE client talks to every brick in every region directly, so
+a node failing in that region does not break the mount. The only single-node
+dependency is fetching the volfile at mount time; to remove it, mount manually
+with fallback servers listed:
 
 ```
-mount -t glusterfs <local-region-storage-master-ip>:/${globals.volumeName} /your/mount/point
+mount -t glusterfs <region-node-ip>:/${globals.volumeName} /your/mount/point \
+  -o backup-volfile-servers=<other-node-ips-in-that-region,colon-separated>
 ```
 
 ## Day-2 management
@@ -31,7 +47,6 @@ region's env. Click **Manage Cluster** for a popup with:
   every region (parallel fan-out).
 - **Heal volume — full** — runs `gluster volume heal ${globals.volumeName} full`.
 - **Rebalance volume** — runs `gluster volume rebalance ${globals.volumeName} start`.
-- **Re-tighten auth.allow** — recomputes the peer IP list and applies it.
 - **List storage nodes + IPs** — inventory table across regions.
 - **Custom CLI command** — run an arbitrary `gluster …` command (advanced).
 

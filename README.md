@@ -33,8 +33,9 @@ to every other region. Repository: <https://github.com/stackharbor-devops/gluste
 - **Odd region count required** (3, 5, 7) for split-brain quorum.
 - **Networking:** cross-region replication runs over the platform's internal GRE
   routing — no public IPs are allocated.
-- **Security:** `auth.allow` is set to the cluster's peer IPs only — no
-  unauthorised mounts even with port access. Firewall rules applied at install.
+- **Access:** the volume stays open at the Gluster layer (`auth.allow '*'`) so any
+  GlusterFS-native (FUSE) client on the platform's private network can mount it.
+  Access is governed by Jelastic network isolation + the storage firewall.
 - **Optional backup:** at install you can deploy a backup-storage node inside one
   of the cluster regions; scheduled restic backups then run from a single
   secondary node in that same region.
@@ -95,7 +96,7 @@ In your Jelastic dashboard:
    | Environment | (auto-generated; rename if you like) |
 3. **Install**. The package will create one Certified-Storage environment per
    region, peer them all into one trusted pool, build the stretched volume,
-   mount it at `/data` on every node, harden `auth.allow`, and install the
+   mount it at `/data` on every node, and install the
    **GlusterFS Cluster** management addon onto each region's storage node-group.
 
 You're done. Write a file on any node in any region and `ls /data` on any
@@ -149,19 +150,46 @@ node group:
 
 No-op if the env firewall feature is disabled (nothing is filtered then anyway).
 
-### auth.allow hardening
+### Access control
 
-At install, the volume is created with `auth.allow '*'` so peer probes can
-complete. **The cluster manager then tightens `auth.allow` to the list of peer
-storage-node IPs (plus 127.0.0.1)** via the `hardenAuth` action. Inspect on any
-node:
+The volume is created with — and deliberately left at — `auth.allow '*'`. Gluster
+itself does not maintain an allow-list; any GlusterFS-native (FUSE) client that
+can reach the storage nodes over the platform's private network may mount it.
+Access is governed by **Jelastic network isolation** (private IPs aren't reachable
+by non-client environments) plus the **storage node-group firewall**. To restrict
+who can mount, tighten the firewall's inbound rules for TCP `24007` and
+`49152–49251` — don't rely on `auth.allow`. Inspect on any node:
 
 ```
-gluster volume info data | grep auth.allow
+gluster volume info data | grep auth.allow     # expected: auth.allow: *
 ```
 
-Day-2 ops (addRegion, forgetRegion, addCapacitySlice) all re-run `hardenAuth` at
-the end, so the allow list stays current.
+### Mounting the volume from other environments (FUSE)
+
+Because it is **one stretched volume**, you mount by *region*, not by node, and
+any region serves the entire dataset. In your app layer's **Volumes → Add →
+Data Container** dialog:
+
+| Field | Value |
+|---|---|
+| Server | the GlusterFS **region env** nearest that app, e.g. `env-XXXX-2` |
+| Client Type | **Gluster Native (FUSE)** |
+| Volume | `data` (the volume name) |
+| Local Path | wherever you want it in the container |
+
+Once mounted, the FUSE client connects **directly to every brick in every
+region** and fails over on its own — a node dying in that region does not break
+the mount. The one single-node dependency is fetching the volfile *at mount
+time* (Jelastic resolves the chosen region env to one of its storage nodes). To
+make mount-time resilient too, mount manually with fallback volfile servers:
+
+```
+mount -t glusterfs <region-node-ip>:/data /your/mount/point \
+  -o backup-volfile-servers=<other-node-ip>:<other-node-ip>
+```
+
+(`backup-volfile-servers` is colon-separated. Get a region's node IPs from
+**Manage Cluster → List all storage nodes + IPs**.)
 
 ---
 
@@ -187,8 +215,7 @@ runs `action: install`:
    - `cluster.choose-local on` (read from local brick)
 5. **mountAllNodes** — `mount.glusterfs localhost:/data /data` on every node,
    fstab entry with systemd automount.
-6. **hardenAuth** — set `auth.allow` to peer IPs.
-7. **persistGlobals** — save the deployment params on the primary env's
+6. **persistGlobals** — save the deployment params on the primary env's
    storage node-group so day-2 addons can recover them.
 
 For day-2 ops, the same script dispatches on `settings.action`:
@@ -196,7 +223,6 @@ For day-2 ops, the same script dispatches on `settings.action`:
 - `removeRegion` — remove-brick + peer detach, replica N→N-1.
 - `addCapacitySlice` — peer new nodes (1 per region), add-brick as a new replica
   set, then rebalance + heal.
-- `hardenAuth` — re-tighten `auth.allow` to current peer IPs.
 
 ---
 
@@ -213,7 +239,6 @@ modal:
 | Cluster status | Peer status / volume info / volume status / auth.allow, fanned out to every region in parallel |
 | Heal volume — full | `gluster volume heal data full` on every region |
 | Rebalance volume | `gluster volume rebalance data start` on every region |
-| Re-tighten auth.allow | Recomputes peer IPs and applies to the volume |
 | List storage nodes + IPs | Inventory table across regions |
 | Custom CLI command | Run an arbitrary `gluster …` command on every region's master (regex-guarded for safety) |
 
@@ -331,17 +356,19 @@ local storage; no WAN cost.
 | More regions (geographic coverage) | Use `addRegion`. Keep region count odd. |
 | More capacity in existing regions | Scale each region by the same N nodes, run `addCapacitySlice`. |
 | Remove a region (decommission, failure) | Use `forgetRegion`. Add a fresh region after if you want to keep N odd. |
-| Tighten security after topology change | Use Manage Cluster → "Re-tighten auth.allow" |
+| Restrict who can mount the volume | Tighten the storage firewall's inbound rules (TCP `24007`, `49152–49251`) — the volume itself stays `auth.allow '*'` |
 | Add scheduled backups after deploy | Import `addons/backup.jps` onto the cluster env in the region where a backup-storage env lives (or redeploy with "Deploy a backup server" ticked). |
 
 ---
 
 ## Troubleshooting
 
-### "auth.allow shows `*`, not peer IPs"
-Click **Manage Cluster** → **Re-tighten auth.allow**. (`hardenAuth` runs at
-install and after every day-2 op; if you see `*`, something interrupted the
-flow.)
+### A FUSE mount from another environment fails
+The volume is intentionally open (`auth.allow '*'`), so gluster itself won't
+refuse the client. Check reachability instead: the client env must be able to
+reach the storage nodes' private IPs (Jelastic network isolation), and the
+storage firewall must allow TCP `24007` and `49152–49251` from it. Quick test
+from the client node: `nc -zv <storage-node-ip> 24007`.
 
 ### Writes hang / time out
 - Check `Cluster Status` → look at `Network ping-timeout`. WAN latency higher
@@ -390,7 +417,11 @@ success/success.md                 post-install summary shown to the user
 
 ## Versioning
 
-- **v2.4** (current): internal-only networking (public-WAN option removed — all
+- **v2.5** (current): volume access opened for FUSE clients — `auth.allow` is
+  left at `*` (no peer-IP hardening; access governed by Jelastic network
+  isolation + the storage firewall). "Re-tighten auth.allow" operation removed.
+  Documented mounting the volume from other environments by region.
+- **v2.4**: internal-only networking (public-WAN option removed — all
   replication over GRE). Backup re-added in a region-targeted form: deploy a
   backup-storage node inside a chosen cluster region and back up from one
   secondary node in that region.

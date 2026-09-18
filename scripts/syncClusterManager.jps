@@ -18,8 +18,9 @@ description:
 #                         (decreases replica count from N to N-1, removes its bricks)
 #   addCapacitySlice   - take already-scaled nodes (one new node per region) and
 #                         add them as a new replica set (capacity grows by ~1 brick)
-#   hardenAuth         - tighten the volume's auth.allow to the peer node IPs
-# Every successful day-2 action ends with hardenAuth + persistGlobals.
+# Every successful day-2 action ends with persistGlobals. The volume stays at
+# auth.allow '*' - access is governed by network isolation + firewall, not an
+# allow-list (see ACCESS CONTROL below).
 # ---------------------------------------------------------------------------
 
 globals:
@@ -42,29 +43,22 @@ onInstall:
       - peerProbeAll
       - createStretchedVolume
       - mountAllNodes
-      - hardenAuth
       - persistGlobals
   - if ('${globals.action}' == 'addRegion'):
       - gatherNodes
       - addRegionToVolume
       - mountNewRegionNodes
-      - hardenAuth
       - persistGlobals
   - if ('${globals.action}' == 'removeRegion'):
       - gatherNodes
       - removeRegionFromVolume
-      - hardenAuth
       - persistGlobals
   - if ('${globals.action}' == 'addCapacitySlice'):
       - gatherNodes
       - addCapacitySliceToVolume
       - mountAllNodes
       - rebalanceAndHeal
-      - hardenAuth
       - persistGlobals
-  - if ('${globals.action}' == 'hardenAuth'):
-      - gatherNodes
-      - hardenAuth
 
 actions:
   getClusterEnvs:
@@ -339,36 +333,15 @@ actions:
             gluster volume heal ${globals.volumeName} full 2>&1 || true;
       user: root
 
-  # ---- SECURITY: tighten auth.allow to peer IPs only ----------------------
+  # ---- ACCESS CONTROL --------------------------------------------------------
   #
-  # Sets the volume's auth.allow to the comma-separated list of all storage node
-  # IPs across all regions (plus 127.0.0.1). Replaces the install-time '*' value.
-  # In sync mode all peers see the same volume, so setting it from each region's
-  # master is redundant but harmless. In async mode each region has its own
-  # volume, so this is run per-master too.
-  hardenAuth:
-    - script: |
-        var envs = '${globals.clusterEnvs}'.split(','), execs = [];
-        for (var i = 0; i < envs.length; i++) {
-          var r = jelastic.env.control.GetEnvInfo(envs[i], session);
-          if (r.result != 0) continue;
-          for (var l = 0; l < r.nodes.length; l++) {
-            if (r.nodes[l].nodeGroup == 'storage' && r.nodes[l].ismaster) {
-              execs.push({ env: envs[i], id: r.nodes[l].id });
-              break;
-            }
-          }
-        }
-        return { result: 0, onAfterReturn: { setGlobals: { hardenList: execs } } };
-    - forEach (e:globals.hardenList):
-      - api: env.control.ExecCmdById
-        envName: ${@e.env}
-        nodeId: ${@e.id}
-        commandList:
-          - command: |-
-              gluster volume set ${globals.volumeName} auth.allow '${globals.allowedIPs}' 2>&1 || true;
-              echo "auth.allow on ${globals.volumeName} now: $(gluster volume info ${globals.volumeName} | grep auth.allow)";
-        user: root
+  # The volume is left at auth.allow '*' (set in createStretchedVolume). Any
+  # GlusterFS-native (FUSE) client that can reach the storage nodes over the
+  # platform's private network may mount it. Access is governed by Jelastic's
+  # network isolation (private IPs are not reachable by non-client envs) plus
+  # the storage node-group firewall rules - NOT by a gluster auth.allow allow-
+  # list. This keeps the volume mountable region-wide by client environments
+  # without per-client re-authorisation. To restrict access, use firewall rules.
 
   # Persist parameters on the primary env for day-2 add-ons / management.
   # The manager always runs IN the primary env's context (it is installed there

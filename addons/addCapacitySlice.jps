@@ -18,7 +18,7 @@ description:
 #   2) Run this addon AGAINST THE PRIMARY ENV. It detects the new nodes
 #      (those not yet part of the volume), peer-probes them, runs
 #      `gluster volume add-brick` with the new bricks (replica unchanged), then
-#      starts rebalance + heal full, and re-hardens auth.allow.
+#      starts rebalance + heal full.
 #
 # Requirements:
 #   - replicationModel must be 'sync'.

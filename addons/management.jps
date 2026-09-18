@@ -1,5 +1,5 @@
 type: update
-version: 1.6
+version: 1.7
 id: glusterfs-management
 name: GlusterFS Cluster Management
 baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
@@ -43,7 +43,7 @@ addons:
   - id: glusterfs-mgmt
     name: GlusterFS Cluster
     permanent: true
-    description: Open the Cluster Manager to run status, heal, rebalance, and security operations across every region.
+    description: Open the Cluster Manager to run status, heal, rebalance, and inventory operations across every region.
 
     # Settings form — opens as a popup overlay when the button is clicked.
     # Operation-specific extra fields are revealed via `showIf` on the
@@ -70,8 +70,6 @@ addons:
                 caption: Heal volume - full
               - value: rebalance
                 caption: Rebalance volume
-              - value: harden
-                caption: Re-tighten auth.allow to peer IPs
               - value: list_nodes
                 caption: List all storage nodes + IPs
               - value: custom
@@ -113,7 +111,6 @@ actions:
     - if ('${settings.operation}' == 'status'):       op_status
     - if ('${settings.operation}' == 'heal'):         op_heal
     - if ('${settings.operation}' == 'rebalance'):    op_rebalance
-    - if ('${settings.operation}' == 'harden'):       op_harden
     - if ('${settings.operation}' == 'list_nodes'):   op_listNodes
     - if ('${settings.operation}' == 'custom'):       op_custom
 
@@ -155,30 +152,6 @@ actions:
 
   op_rebalance:
     - cmd[${nodes.storage.master.id}]: gluster volume rebalance ${globals.volumeName} start
-      user: root
-
-  # Compute the peer-IP list across all regions, stash it in a global, then set
-  # auth.allow ONCE on the local master (gluster propagates the volume setting
-  # to the rest of the trusted pool automatically).
-  op_harden:
-    - getClusterEnvs
-    - script: |
-        // Internal/GRE only: nodes are addressed by their internal IP.
-        var envs = '${globals.clusterEnvs}'.split(','), ips = ['127.0.0.1'];
-        for (var i = 0; i < envs.length; i++) {
-          var r = jelastic.env.control.GetEnvInfo(envs[i], session);
-          if (r.result != 0) continue;
-          for (var l = 0; l < r.nodes.length; l++) {
-            if (r.nodes[l].nodeGroup == 'storage') {
-              var iIp = r.nodes[l].address;
-              if (iIp && ips.indexOf(iIp) < 0) ips.push(iIp);
-            }
-          }
-        }
-        return { result: 0, onAfterReturn: { setGlobals: { peerAllowList: ips.join(',') } } };
-    - cmd[${nodes.storage.master.id}]: |-
-        gluster volume set ${globals.volumeName} auth.allow '${globals.peerAllowList}';
-        gluster volume info ${globals.volumeName} | grep auth.allow;
       user: root
 
   # Read-only inventory of every storage node across every region. The Java
