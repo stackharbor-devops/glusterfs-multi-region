@@ -1,5 +1,5 @@
 type: install
-version: 3.0
+version: 3.1
 id: glusterfs-multiregion
 name: Multi-Region GlusterFS Cluster (Write-Anywhere)
 baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main

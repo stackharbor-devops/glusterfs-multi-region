@@ -491,7 +491,12 @@ success/success.md                 post-install summary shown to the user
 
 ## Versioning
 
-- **v3.0** (current): native dashboard mounts. Every region's storage layer is
+- **v3.1** (current): *Manage Cluster* — the **Run** button is now enabled for
+  the pre-selected default operation (Cluster status). The dashboard only enables
+  an add-on form's submit button once the form has been changed, unless the form
+  sets `submitUnchanged: true`; it now does (management add-on v1.8). No storage
+  or install-flow changes.
+- **v3.0**: native dashboard mounts. Every region's storage layer is
   flagged as a storage cluster in node-group data (`cluster.enabled` +
   `cluster.settings.replicatedPath` / `replicatedVolume` — the exact condition
   the dashboard checks, taken from its source), so *Volumes → Data Container*
