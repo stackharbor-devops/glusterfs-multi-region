@@ -1,5 +1,5 @@
 type: update
-version: 1.7
+version: 1.8
 id: glusterfs-management
 name: GlusterFS Cluster Management
 baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
@@ -50,6 +50,14 @@ addons:
     # operation list, so the form stays compact until needed.
     settings:
       main:
+        # REQUIRED. The dashboard builds this popup as an "apply settings"
+        # dialog and keeps the submit button disabled until the form is dirty:
+        #   enabled = valid && (submitUnchanged || form.isDirty())
+        # This form is an action launcher, not a settings editor - running the
+        # pre-selected default (Cluster status) without touching anything is
+        # the most common use, and without this flag Run stays greyed out for
+        # it. Placed on the form (not the button), as jelastic-jps add-ons do.
+        submitUnchanged: true
         fields:
           - type: displayfield
             hideLabel: true
@@ -83,11 +91,10 @@ addons:
                   cls: warning
                   height: 50
                   markup: "Advanced: command runs as root on the LOCAL master of this env (gluster propagates cluster-wide commands automatically). Use with care."
-                # NOTE: do NOT mark this `required`. A required field nested in
-                # a showIf still counts toward form validity while hidden, which
-                # disables the form's submit (Run) button for every OTHER
-                # operation. op_custom only runs when `custom` is selected, and
-                # the field carries a default, so requiredness is unnecessary.
+                # NOTE: keep a non-empty `default` here. The dashboard hides
+                # showIf fields without disabling them, so they are still
+                # validated while hidden - an EMPTY required/regex-failing field
+                # in this branch would block Run for every other operation.
                 - type: string
                   name: customCmd
                   caption: Command to run
