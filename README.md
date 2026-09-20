@@ -239,10 +239,11 @@ systemd automount, re-applies after redeploy / scale-out / start, and removes
 itself on uninstall. A **GlusterFS Client** card on that node group gives you
 **Status / Remount / Unmount**.
 
-**Alternative — NFS via the dialog.** The storage nodes re-export the volume over
-NFS, so *Data Container → Server = the region's storage node → NFS* works with
-zero extra setup. Trade-offs: it's a single-node dependency on that storage
-node, and NFS rather than gluster-native semantics.
+**Alternative — NFS via the same dialog.** Once a region is flagged, the dialog
+lists it only as *Storage Containers × N* — its individual nodes are no longer
+offered. To mount over NFS instead, switch **Client Type** to **NFS** on that
+same entry. Trade-offs: NFS is served by a single storage node rather than by
+every brick, and you get NFS rather than gluster-native semantics.
 
 ---
 
@@ -505,7 +506,8 @@ success/success.md                 post-install summary shown to the user
   `addons/native-fuse.jps`; the region envs keep `cluster: false`, so the
   platform's built-in per-environment gluster clustering never runs and the
   stretched volume is unchanged. Older deployments upgrade by importing that
-  add-on onto each region env.
+  add-on onto each region env. Verified on a live platform: the region is listed
+  with Gluster Native (FUSE), the mount works, and `auth.allow` stays `*`.
 - **v2.6**: new `addons/client.jps` — Gluster-native FUSE mount of the
   volume into any app environment, by region, with the region master as volfile
   server and the other region nodes as `backup-volfile-servers`. Added because

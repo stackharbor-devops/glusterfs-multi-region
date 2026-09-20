@@ -30,7 +30,7 @@ If the dialog lists the region's storage nodes individually with no *Client
 Type* choice, see *Troubleshooting* in the package README. Fallbacks that always
 work: the **GlusterFS Client** addon imported *onto the app environment*
 (`https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main/addons/client.jps`),
-or plain **NFS** against a single storage node via the same dialog.
+or **Client Type: NFS** in the same dialog (served by a single storage node).
 
 ## Day-2 management
 
