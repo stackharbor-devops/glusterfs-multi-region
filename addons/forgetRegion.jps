@@ -41,18 +41,13 @@ onInstall:
       - deleteTargetEnv
 
 actions:
+  # Cluster parameters persisted by syncClusterManager. The shared loader
+  # rebuilds them from the live cluster if they are missing or were
+  # overwritten (the v1 backup add-on did that when its env was -1).
   importGlobalsFromNodeGroup:
-    - script: |
-        var resp = api.env.control.GetNodeGroups("${env.name}", session);
-        if (resp.result != 0) return resp;
-        var groups = resp.object, globals;
-        for (var i = 0, n = groups.length; i < n; i++)
-          if (groups[i].name == "${this}" && groups[i].globals) {
-            globals = new org.yaml.snakeyaml.Yaml().load(groups[i].globals);
-            break;
-          }
-        if (!globals) return { result: 1, error: "No persisted GlusterFS globals found. Run this add-on against the primary environment." };
-        return { result: 0, onAfterReturn: { setGlobals: globals } };
+    - script: ${baseUrl}/scripts/loadClusterGlobals.js
+      envName: ${env.name}
+      nodeGroup: ${this}
 
   # Drive syncClusterManager with action=removeRegion against the primary env.
   finalize:
@@ -73,6 +68,26 @@ actions:
         }];
         return { result: 0, onAfterReturn: { 'marketplace.jps.install': actions } };
 
+  # Never delete a region whose nodes still hold bricks of the volume (for
+  # example because remove-brick was refused): that would destroy live replicas.
   deleteTargetEnv:
+    - script: |
+        var target = "${settings.targetEnv}", master = "${globals.master_env_name}", vol = "${globals.volumeName}", ips = [], mid = null, i;
+        var t = api.env.control.GetEnvInfo(target, session);
+        if (t.result != 0) return t;
+        for (i = 0; i < (t.nodes || []).length; i++) if (t.nodes[i].nodeGroup == "storage") ips.push(String(t.nodes[i].address));
+        var mi = api.env.control.GetEnvInfo(master, session);
+        if (mi.result != 0) return mi;
+        for (i = 0; i < (mi.nodes || []).length; i++) if (mi.nodes[i].nodeGroup == "storage" && mi.nodes[i].ismaster) mid = mi.nodes[i].id;
+        var ex = null;
+        try {
+          ex = api.env.control.ExecCmdById(master, session, mid, toJSON([{ command: "gluster volume info " + vol + " 2>/dev/null | awk '/^Brick[0-9]+:/ {print $2}'; echo @@END" }]), true, "root");
+        } catch (e) { ex = null; }
+        var out = (ex && ex.responses && ex.responses.length) ? String(ex.responses[0].out || "") : "";
+        if (out.indexOf("@@END") < 0) return { result: 1, error: "Could not read volume " + vol + " to confirm that " + target + " holds no bricks - the environment was NOT deleted." };
+        for (i = 0; i < ips.length; i++) {
+          if (out.indexOf(ips[i] + ":/glustervolume") >= 0) return { result: 1, error: target + " still holds bricks of volume " + vol + " (" + ips[i] + ") - the environment was NOT deleted." };
+        }
+        return { result: 0 };
     - api: env.control.DeleteEnv
       envName: ${settings.targetEnv}

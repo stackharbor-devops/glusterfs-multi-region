@@ -123,6 +123,9 @@ actions:
 
         return { result: 0, onAfterReturn: { setGlobals: {
           replicaCount: envs.length,
+          // Live bricks per region, so the persisted value (read by Add Region
+          // to size a new region) stays right after Add Capacity Slice.
+          nodesPerRegion: maxK,
           bricksOrdered: bricks.join(' '),
           allNodes: allNodes,                              // for forEach (works on arrays)
           allIPsCSV: allIPsCSV,                            // for string interpolation in scripts
@@ -274,12 +277,26 @@ actions:
       envName: ${globals.primaryMasterEnv}
       nodeId: ${globals.primaryMasterId}
       commandList:
+        # Only nodes that really hold a brick are removed (a node scaled for a
+        # capacity slice but not yet stitched holds none), and a refused
+        # remove-brick fails this step - peers are then NOT detached, and
+        # Forget Region does not delete the environment.
         - command: |-
             set +e;
-            echo "Removing region from volume: replica -> ${globals.removeBricksReplica}, bricks: ${globals.removeBricksList}";
-            yes 2>/dev/null | gluster volume remove-brick ${globals.volumeName} replica ${globals.removeBricksReplica} ${globals.removeBricksList} force 2>&1;
-            IFS=',' read -ra DROP <<< "${globals.peerDetachIPs}";
-            for ip in "${DROP[@]}"; do [ -z "$ip" ] && continue; gluster peer detach $ip force 2>&1 || true; done;
+            VOL=${globals.volumeName};
+            LIVE=$(gluster volume info $VOL 2>/dev/null | awk '/^Brick[0-9]+:/ {print $2}');
+            if [ -z "$LIVE" ]; then echo "cannot read volume $VOL - nothing was changed"; exit 1; fi;
+            BRICKS=""; N=0;
+            for ip in $(echo "${globals.peerDetachIPs}" | tr ',' ' '); do
+              if echo "$LIVE" | grep -qxF "$ip:/glustervolume"; then BRICKS="$BRICKS $ip:/glustervolume"; N=$((N+1));
+              else echo "node $ip holds no brick of $VOL - skipped"; fi;
+            done;
+            if [ "$N" -gt 0 ]; then
+              echo "Removing region from volume: replica -> ${globals.removeBricksReplica}, bricks:$BRICKS";
+              gluster --mode=script volume remove-brick $VOL replica ${globals.removeBricksReplica} $BRICKS force 2>&1; RC=$?;
+              if [ "$RC" -ne 0 ]; then echo "remove-brick failed (rc=$RC) - peers NOT detached, nothing else changed:"; gluster volume info $VOL; exit $RC; fi;
+            fi;
+            for ip in $(echo "${globals.peerDetachIPs}" | tr ',' ' '); do gluster --mode=script peer detach $ip force 2>&1 || true; done;
       user: root
 
   # ---- DAY-2: addCapacitySlice (replica unchanged, sets +1) ----------------

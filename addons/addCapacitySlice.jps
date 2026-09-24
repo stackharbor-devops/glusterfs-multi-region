@@ -34,18 +34,13 @@ onInstall:
   - finalize
 
 actions:
+  # Cluster parameters persisted by syncClusterManager. The shared loader
+  # rebuilds them from the live cluster if they are missing or were
+  # overwritten (the v1 backup add-on did that when its env was -1).
   importGlobalsFromNodeGroup:
-    - script: |
-        var resp = api.env.control.GetNodeGroups("${env.name}", session);
-        if (resp.result != 0) return resp;
-        var groups = resp.object, globals;
-        for (var i = 0, n = groups.length; i < n; i++)
-          if (groups[i].name == "${this}" && groups[i].globals) {
-            globals = new org.yaml.snakeyaml.Yaml().load(groups[i].globals);
-            break;
-          }
-        if (!globals) return { result: 1, error: "No persisted GlusterFS globals found. Run this add-on against the primary environment." };
-        return { result: 0, onAfterReturn: { setGlobals: globals } };
+    - script: ${baseUrl}/scripts/loadClusterGlobals.js
+      envName: ${env.name}
+      nodeGroup: ${this}
 
   assertSyncMode:
     - script: |

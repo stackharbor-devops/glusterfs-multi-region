@@ -1,5 +1,5 @@
 type: install
-version: 3.1
+version: 3.2
 id: glusterfs-multiregion
 name: Multi-Region GlusterFS Cluster (Write-Anywhere)
 baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
@@ -306,9 +306,13 @@ actions:
         var idx = regions.indexOf('${settings.backupServerRegion}');
         if (idx < 0) idx = 0;
         var targetEnv = '${settings.envName}-' + (idx + 1);
+        // nodeGroup: storage makes the add-on itself the card on the storage
+        // layer (with Uninstall); without it the install is env-level and
+        // invisible in the dashboard.
         var actions = [{
           jps: "${baseUrl}/addons/backup.jps?_r=${fn.random}",
           envName: targetEnv,
+          nodeGroup: "storage",
           settings: {
             "storageName": "${settings.envName}-bkp",
             "scheduleType": "1",
@@ -316,6 +320,7 @@ actions:
             "sourcePath": "${settings.mountPoint}",
             "backupCount": "24",
             "isAlwaysUmount": "false",
+            "notifyOnFailure": "true",
             "cluster_id": "${settings.envName}",
             "primary_region_name": "${globals.region-1}",
             "backup_region_name": "${settings.backupServerRegion}",
