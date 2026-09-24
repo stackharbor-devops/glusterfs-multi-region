@@ -3,7 +3,7 @@ version: 1.0
 jpsVersion: 6.1.1
 id: glusterfs-client
 name: GlusterFS Client (mount by region)
-baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
+baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/backup-v2
 logo: ${baseUrl}/images/logo.svg
 targetEditions: any
 description:

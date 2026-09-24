@@ -2,7 +2,7 @@ type: update
 version: 2.0
 id: glusterfs_cluster_logic
 name: GlusterFS Cluster Logic
-baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
+baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/backup-v2
 description:
   short: Per-region GlusterFS node prep (sync stretched cluster mode).
 

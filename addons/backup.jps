@@ -5,7 +5,7 @@ id: glusterfs-restic-backup
 name: GlusterFS Backup/Restore
 targetEditions: any
 logo: https://raw.githubusercontent.com/jelastic-jps/backup-storage/main/images/backup-logo.svg
-baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
+baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/backup-v2
 description:
   short: Scheduled restic backups of the multi-region GlusterFS volume to a Backup Storage environment, with restore.
   text: |
