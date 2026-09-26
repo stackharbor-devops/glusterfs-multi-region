@@ -59,7 +59,11 @@ new replica set, then triggers rebalance + heal.
 
 If you ticked **Deploy a backup server**, a `-bkp` backup-storage env was created
 in your chosen region, and a **GlusterFS Backup/Restore** card is on the storage
-node-group of the cluster env in that same region. Backups run from a single
-secondary node there (the whole volume is sync-replicated, so one node captures
-everything). Use the card's **Config** button to change the schedule, **Backup**
-to run one now, and **Restore** to roll back to a snapshot.
+layer of the cluster env in that same region. Backups run hourly from a single
+secondary storage node there (the whole volume is sync-replicated, so one node
+captures everything), and every run appears in the **Tasks** log.
+
+The card has **Backup Now**, **Configure** (schedule, retention, storage),
+**Restore** and **Verify**; its menu has **Backup Status**, **Delete All
+Backups** and **Uninstall**. Uninstalling keeps the cluster and the snapshots —
+import `addons/backup.jps` onto that storage layer again to resume.

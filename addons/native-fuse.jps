@@ -3,7 +3,7 @@ version: 1.0
 jpsVersion: 6.1.1
 id: glusterfs-native-fuse
 name: GlusterFS Native FUSE Mounts
-baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
+baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/backup-v2
 targetEditions: any
 description:
   short: Makes the dashboard offer "Gluster Native (FUSE)" mounts for this region's storage layer.

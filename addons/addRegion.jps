@@ -2,7 +2,7 @@ type: update
 version: 2.0
 id: glusterfs-add-region
 name: Add GlusterFS Region
-baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
+baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/backup-v2
 description:
   short: Add a new region to an existing synchronous stretched GlusterFS cluster.
 
@@ -31,23 +31,41 @@ settings:
 
 onInstall:
   - importGlobalsFromNodeGroup: storage
+  - detectNodesPerRegion
   - getClusterEnvs
   - createNewEnv
   - finalize
 
 actions:
+  # Cluster parameters persisted by syncClusterManager. The shared loader
+  # rebuilds them from the live cluster if they are missing or were
+  # overwritten (the v1 backup add-on did that when its env was -1).
   importGlobalsFromNodeGroup:
+    - script: ${baseUrl}/scripts/loadClusterGlobals.js
+      envName: ${env.name}
+      nodeGroup: ${this}
+
+  # A new region needs exactly as many nodes as the volume has bricks per
+  # region ("Number of Bricks: D x R = T" -> D). Read it from the live volume:
+  # the persisted value is stale on clusters that ran Add Capacity Slice
+  # before v3.2.
+  detectNodesPerRegion:
     - script: |
-        var resp = api.env.control.GetNodeGroups("${env.name}", session);
-        if (resp.result != 0) return resp;
-        var groups = resp.object, globals;
-        for (var i = 0, n = groups.length; i < n; i++)
-          if (groups[i].name == "${this}" && groups[i].globals) {
-            globals = new org.yaml.snakeyaml.Yaml().load(groups[i].globals);
-            break;
-          }
-        if (!globals) return { result: 1, error: "No persisted GlusterFS globals found on this env. Run this add-on against the primary environment." };
-        return { result: 0, onAfterReturn: { setGlobals: globals } };
+        var env = "${globals.master_env_name}", vol = "${globals.volumeName}", m = null, i, ex = null, out, nb;
+        var info = api.env.control.GetEnvInfo(env, session);
+        if (info.result != 0) return info;
+        for (i = 0; i < (info.nodes || []).length; i++) {
+          if (info.nodes[i].nodeGroup == "storage" && (!m || info.nodes[i].ismaster)) m = info.nodes[i];
+        }
+        if (!m) return { result: 1, error: "No storage nodes in " + env + "." };
+        try {
+          ex = api.env.control.ExecCmdById(env, session, m.id, toJSON([{ command: "gluster volume info " + vol + " 2>/dev/null | grep -E '^Number of Bricks:'; echo @@END" }]), true, "root");
+        } catch (e) { ex = null; }
+        out = (ex && ex.responses && ex.responses.length) ? String(ex.responses[0].out || "") : "";
+        if (out.indexOf("@@END") < 0) return { result: 1, error: "Could not read volume " + vol + " on " + env + " to size the new region." };
+        nb = /Number of Bricks:\s*(\d+)\s*x\s*(\d+)\s*=/.exec(out);
+        if (!nb) return { result: 1, error: "Unexpected layout of volume " + vol + ": " + out.replace("@@END", "").replace(/\s+/g, " ") };
+        return { result: 0, onAfterReturn: { setGlobals: { nodesPerRegion: nb[1] } } };
 
   getClusterEnvs:
     - script: ${baseUrl}/scripts/getClusterEnvs.js

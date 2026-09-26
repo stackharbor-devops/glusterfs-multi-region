@@ -1,636 +1,411 @@
 type: update
 jpsVersion: 6.1.1
+version: 2.0
+id: glusterfs-restic-backup
 name: GlusterFS Backup/Restore
-id: glusterfs-backup
 targetEditions: any
 logo: https://raw.githubusercontent.com/jelastic-jps/backup-storage/main/images/backup-logo.svg
+baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/backup-v2
 description:
-  short: Snapshot the GlusterFS volume to a Jelastic backup-storage env (one secondary node, in-region).
+  short: Scheduled restic backups of the multi-region GlusterFS volume to a Backup Storage environment, with restore.
   text: |
-    Snapshots the data state of the multi-region GlusterFS volume to a
-    Jelastic backup-storage env via restic. Each scheduled firing runs
-    EXACTLY ONE backup operation, on ONE node - a SECONDARY storage node in
-    the same region as the backup-storage env (falls back to the region
-    master when that region has a single storage node). The volume is
-    sync-replicated across every region, so backing up from any one node
-    captures the whole dataset; using a secondary keeps the region master
-    unburdened and keeps the NFS write path intra-region.
+    Backs up the multi-region GlusterFS volume with restic to a Jelastic
+    "Backup Storage" environment. Install it on the storage layer of the
+    GlusterFS region environment that is in the same region as the backup
+    storage. The volume is synchronously replicated, so ONE node holds the
+    whole dataset: backups run from that region's lowest-id secondary storage
+    node (the master when the region has a single node).
 
-    INSTALL this addon on the cluster env that sits in the SAME region as
-    your backup-storage env. The orchestrator's "Deploy a backup server"
-    flow picks that env automatically; if you import this addon manually,
-    install it on that region's cluster env.
+    Backups are scheduled by the platform, so every run appears in the Tasks
+    log. A manual backup queues behind a running one instead of failing;
+    a restore is never queued, and is never interrupted by Uninstall.
+    Uninstalling the add-on leaves the cluster and the backup repository
+    untouched; install it again at any time to resume. Delete All Backups
+    (in the card's menu) clears this cluster's repository.
 
-    Note: this addon does NOT replace Jelastic VAP's node-level snapshots
-    (which give you full container-state recovery). It exists to preserve
-    the data state of the GlusterFS volume specifically - a layer that
-    benefits from logical restic snapshots independent of the container.
+    Repository layout follows the Jelastic backup-storage convention:
+    /data/<envName>/ on the storage, password = the environment name.
 
-    Repo convention matches the vendor jelastic-jps/backup-storage spec:
-    repo path = /data/<envName>/, password = env name. So the storage
-    server's `getBackups.sh <envName>` CLI lists our backups.
+# ---------------------------------------------------------------------------
+# Structure (v2)
+#
+# This manifest IS the add-on card: top-level buttons/menu, no `addons:`
+# section and no `permanent`, installed on the storage layer (manifest.jps
+# passes nodeGroup: storage). That is what gives the card an Uninstall entry
+# - the v1 add-on bound a permanent inner card and could not be removed.
+#
+#   scripts/backup/manage.js          install / Configure / buttons (uninstall is inline below)
+#   scripts/backup/backup-task.js     per-env platform script "<env>-gfs-backup",
+#                                      run by the platform scheduler and by the
+#                                      buttons; one ExecCmd per run = one Tasks entry
+#   scripts/backup/glusterfs-backup.sh  node-side runner (restic, locking,
+#                                      detached jobs, retention)
+#   scripts/backup/settings-form.js   Configure / install form
+#   scripts/backup/restore-form.js    Restore form (snapshot list)
+#
+# The configuration is kept in the storage node group's data under the key
+# "gfsBackup" - never under "globals", which holds the cluster parameters the
+# day-2 add-ons read back (v1 overwrote them when the backup env was -1).
+# ---------------------------------------------------------------------------
 
-baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
-
-# Storage nodeType only - this addon is for GlusterFS clusters built by our
-# orchestrator (Certified Storage nodes).
 targetNodes:
+  nodeGroup: storage
   nodeType:
     - storage
 
-# ---------------------------------------------------------------------------
-# Settings forms
-# ---------------------------------------------------------------------------
+globals:
+  # ${baseUrl} is captured once at install time; actions reached from the
+  # card's buttons use ${globals.base_path}.
+  base_path: ${baseUrl}
+  backupReport: ""
+
+# Install dialog (Import): fills the Backup Storage and time-zone lists.
+onBeforeInit: scripts/backup/settings-form.js
+
 settings:
   main:
-    # Fields built dynamically in onBeforeInit — see below. Empty initial
-    # fields is the vendor wp-backup pattern; the platform expects the
-    # button form's onBeforeInit to return the full fields array.
-    fields: []
-    onBeforeInit: |
-      // Build the backup-storage env dropdown. Filter to envs that are in
-      // the vendor "Backup storage nodes" env group (jelastic-jps/backup-
-      // storage attaches itself to that group on install). Fall back to all
-      // sibling envs if none match, so the form stays usable.
-      var vals = {};
-      try {
-        var resp = jelastic.environment.control.GetEnvs(appid, session);
-        if (resp && resp.result == 0 && resp.infos) {
-          for (var i = 0; i < resp.infos.length; i++) {
-            var info = resp.infos[i];
-            if (!info || !info.env) continue;
-            if (info.env.envName == '${env.envName}') continue;
-            var isBackupStorage = false;
-            if (info.envGroups && info.envGroups.length) {
-              for (var g = 0; g < info.envGroups.length; g++) {
-                var grp = info.envGroups[g];
-                var nm = (typeof grp === 'string') ? grp : (grp && grp.name);
-                if (nm && nm.indexOf('Backup storage') === 0) { isBackupStorage = true; break; }
-              }
-            }
-            if (isBackupStorage) {
-              vals[info.env.envName] = (info.env.displayName || info.env.envName) + ' (backup-storage)';
-            }
-          }
-          if (!Object.keys(vals).length) {
-            for (var j = 0; j < resp.infos.length; j++) {
-              var info2 = resp.infos[j];
-              if (!info2 || !info2.env || info2.env.envName == '${env.envName}') continue;
-              vals[info2.env.envName] = info2.env.displayName || info2.env.envName;
-            }
-          }
-        }
-      } catch (e) { /* leave vals empty; dropdown stays empty but form renders */ }
-
-      // Build all form fields here (vendor pattern). Return as `fields:`,
-      // NOT wrapped in `settings:` — that wrapping is for top-level install
-      // dialogs, not addon button forms. Returning `{result:0, settings:{}}`
-      // makes the modal render empty.
-      return { result: 0, fields: [
-        { type: "displayfield", hideLabel: true, height: 30,
-          markup: "Schedules under 10 minutes use flock to prevent overlap. 1-minute backups are for tiny datasets / testing only." },
-        { type: "radio-fieldset", name: "scheduleType", hidden: false, "default": "1",
-          values: [
-            { value: 1, caption: "Pre-defined frequency" },
-            { value: 2, caption: "Custom (day-of-week + time)" },
-            { value: 3, caption: "Manual (raw cron expression)" }
-          ],
-          showIf: {
-            "1": [
-              { name: "cronTime", caption: "Backup frequency", type: "list",
-                editable: false, "default": "0 * * * *",
-                values: [
-                  { value: "* * * * *",    caption: "Every 1 minute (test/tiny datasets only)" },
-                  { value: "*/5 * * * *",  caption: "Every 5 minutes" },
-                  { value: "*/10 * * * *", caption: "Every 10 minutes" },
-                  { value: "0 * * * *",    caption: "Every 1 hour (at minute 0)" },
-                  { value: "0 */2 * * *",  caption: "Every 2 hours" },
-                  { value: "0 */3 * * *",  caption: "Every 3 hours" },
-                  { value: "0 */6 * * *",  caption: "Every 6 hours" },
-                  { value: "0 */12 * * *", caption: "Every 12 hours" },
-                  { value: "0 0 * * *",    caption: "Every 24 hours (at 00:00 UTC)" }
-                ] }
-            ],
-            "2": [
-              { type: "string", name: "backupTime", caption: "Time", inputType: "time", "default": "02:00", cls: "x-form-text", width: 120, required: true },
-              { caption: "Days", type: "compositefield", name: "days",
-                items: [
-                  { name: "sun", value: false, type: "checkbox", caption: "Su" },
-                  { name: "mon", value: true,  type: "checkbox", caption: "Mo" },
-                  { name: "tue", value: true,  type: "checkbox", caption: "Tu" },
-                  { name: "wed", value: true,  type: "checkbox", caption: "We" },
-                  { name: "thu", value: true,  type: "checkbox", caption: "Th" },
-                  { name: "fri", value: true,  type: "checkbox", caption: "Fr" },
-                  { name: "sat", value: false, type: "checkbox", caption: "Sa" }
-                ] },
-              { name: "tz", caption: "Time zone", type: "list", required: true,
-                editable: true, forceSelection: true, "default": "UTC",
-                values: {
-                  "UTC": "UTC",
-                  "America/New_York": "America/New_York",
-                  "America/Los_Angeles": "America/Los_Angeles",
-                  "Europe/London": "Europe/London",
-                  "Europe/Berlin": "Europe/Berlin",
-                  "Asia/Tokyo": "Asia/Tokyo"
-                } }
-            ],
-            "3": [
-              { name: "cronTime", caption: "Crontab expression", type: "string", "default": "0 2 * * *", required: true,
-                regex: "^[ -~]{6,}$",
-                regexText: "Cron expression looks invalid - five fields separated by spaces." }
-            ]
-          } },
-        { type: "string", name: "sourcePath", caption: "Volume mount path (source)", "default": "/data", required: true,
-          regex: "^/[a-zA-Z0-9/_-]+$",
-          regexText: "Must start with / and contain only letters/digits/dash/underscore." },
-        { type: "list", name: "storageName", caption: "Backup storage environment",
-          required: true, editable: false, forceSelection: true, values: vals },
-        { type: "spinner", name: "backupCount", caption: "Retention (snapshots to keep)",
-          min: 1, max: 200, "default": 24 },
-        { type: "toggle", name: "isAlwaysUmount", caption: "Always unmount backup storage when idle",
-          value: false }
-      ] };
+    # Save is enabled even when nothing was changed: re-saving re-creates the
+    # task script, the schedule and the node setup.
+    submitUnchanged: true
+    onBeforeInit: scripts/backup/settings-form.js
+    fields:
+      - type: displayfield
+        hideLabel: true
+        cls: info
+        height: 40
+        markup: "Backups are started by the platform scheduler (times in UTC) on one secondary storage node of this region; every run appears in the Tasks log."
+      - type: radio-fieldset
+        name: scheduleType
+        default: "1"
+        values:
+          - value: "1"
+            caption: Pre-defined
+          - value: "2"
+            caption: Custom
+          - value: "3"
+            caption: Manual (cron)
+        showIf:
+          "1":
+            - type: list
+              name: cronTime
+              caption: Frequency
+              editable: false
+              default: "0 * * * *"
+              values:
+                - value: "*/5 * * * *"
+                  caption: Every 5 minutes
+                - value: "*/10 * * * *"
+                  caption: Every 10 minutes
+                - value: "*/15 * * * *"
+                  caption: Every 15 minutes
+                - value: "*/30 * * * *"
+                  caption: Every 30 minutes
+                - value: "0 * * * *"
+                  caption: Hourly (at minute 0)
+                - value: "0 */2 * * *"
+                  caption: Every 2 hours
+                - value: "0 */3 * * *"
+                  caption: Every 3 hours
+                - value: "0 */6 * * *"
+                  caption: Every 6 hours
+                - value: "0 */12 * * *"
+                  caption: Every 12 hours
+                - value: "0 0 * * *"
+                  caption: Daily (00:00 UTC)
+                - value: "0 0 * * 0"
+                  caption: Weekly (Sunday 00:00 UTC)
+          "2":
+            - type: string
+              name: backupTime
+              caption: Time
+              inputType: time
+              default: "02:00"
+              cls: x-form-text
+              width: 120
+              required: true
+            - type: compositefield
+              name: days
+              caption: Days
+              defaultMargins: 0 12 0 0
+              items:
+                - name: sun
+                  type: checkbox
+                  caption: Su
+                  value: false
+                - name: mon
+                  type: checkbox
+                  caption: Mo
+                  value: true
+                - name: tue
+                  type: checkbox
+                  caption: Tu
+                  value: true
+                - name: wed
+                  type: checkbox
+                  caption: We
+                  value: true
+                - name: thu
+                  type: checkbox
+                  caption: Th
+                  value: true
+                - name: fri
+                  type: checkbox
+                  caption: Fr
+                  value: true
+                - name: sat
+                  type: checkbox
+                  caption: Sa
+                  value: false
+            - type: list
+              name: tz
+              caption: Time zone
+              required: true
+              editable: true
+              forceSelection: true
+              default: UTC
+              values:
+                - value: UTC
+                  caption: UTC
+          "3":
+            - type: string
+              name: cronTime
+              caption: Cron (UTC)
+              default: "0 2 * * *"
+              required: true
+              regex: "^[0-9A-Za-z*/,-]+( +[0-9A-Za-z*/,-]+){4}$"
+              regexText: "Five fields: minute hour day-of-month month day-of-week, in UTC."
+      - type: list
+        name: storageName
+        caption: Backup storage
+        tooltip: The Backup Storage environment that holds the snapshots. It should be in the same region as this environment.
+        required: true
+        editable: false
+        forceSelection: true
+        values: []
+      - type: string
+        name: sourcePath
+        caption: Volume mount path
+        tooltip: Where the GlusterFS volume is FUSE-mounted on the storage nodes.
+        default: /data
+        required: true
+        regex: "^/[A-Za-z0-9._/-]*[A-Za-z0-9_-]$"
+        regexText: An absolute path such as /data.
+      - type: spinner
+        name: backupCount
+        caption: Snapshots to keep
+        min: 1
+        max: 1000
+        default: 24
+      - type: toggle
+        name: notifyOnFailure
+        caption: E-mail me when a scheduled backup fails
+        value: true
 
   restore:
     fields: []
+    onBeforeInit: scripts/backup/restore-form.js
+
+  purge:
+    fields: []
     onBeforeInit: |
-      // Resolve the backup runner node inline (a secondary storage node, else
-      // the master) so we list snapshots from the SAME node that writes them.
-      // Self-contained: does not depend on persisted globals at form-open time.
-      var nodeId = '';
-      try {
-        var ri = jelastic.env.control.GetEnvInfo('${env.envName}', session);
-        if (ri && ri.result == 0 && ri.nodes) {
-          var storage = [];
-          for (var i = 0; i < ri.nodes.length; i++) if (ri.nodes[i].nodeGroup == 'storage') storage.push(ri.nodes[i]);
-          storage.sort(function(a, b){ return a.id - b.id; });
-          var master = null, secondary = null;
-          for (var j = 0; j < storage.length; j++) {
-            if (storage[j].ismaster) { if (!master) master = storage[j]; }
-            else if (!secondary) secondary = storage[j];
-          }
-          var pick = secondary || master;
-          if (pick) nodeId = String(pick.id);
-        }
-      } catch (e) { /* leave nodeId empty; handled below */ }
-      var snapshots = [];
-      try {
-        var resp = api.env.control.ExecCmdById({
-          envName: '${env.envName}', session: session,
-          nodeId: nodeId,
-          commandList: toJSON([{ command: "[ -x /root/glusterfs-backup-list.sh ] && /root/glusterfs-backup-list.sh 2>/dev/null || echo '[]'" }])
-        });
-        snapshots = JSON.parse(resp.responses[0].out || '[]');
-      } catch (e) { snapshots = []; }
-      if (!snapshots.length) {
-        // Same {result, fields} shape; NOT wrapped in settings.
-        return { result: 0, fields: [
-          { type: "displayfield", cls: "warning", hideLabel: true, height: 60,
-            markup: "No restic snapshots found. Run Backup first to create one." }
-        ] };
-      }
-      // Array-of-{value,caption} for the snapshot list — same form the
-      // official jelastic-jps/kubernetes addons use. Map-form values: {k:v}
-      // can render but doesn't reliably bind the user's selection to
-      // settings.<name> at submit.
-      var snapList = [];
-      for (var i = 0; i < snapshots.length; i++) {
-        var s = snapshots[i];
-        var when = (s.time || '').slice(0, 19).replace('T', ' ');
-        var sid = (s.short_id || (s.id || '').slice(0, 8));
-        snapList.push({ value: s.id, caption: when + "  " + sid });
-      }
-      return { result: 0, fields: [
-        { type: "list", name: "snapshotId", caption: "Snapshot to restore",
-          required: true, editable: false, forceSelection: true,
-          values: snapList },
-        { type: "string", name: "restorePath", caption: "Restore target",
-          "default": "/data", required: true,
-          regex: "^/[a-zA-Z0-9/_-]+$",
-          regexText: "Must start with / and contain only letters/digits/dash/underscore." },
-        { type: "displayfield", hideLabel: true, cls: "warning", height: 60,
-          markup: "Restore overwrites files at the target path. Since the volume is synchronously replicated, the restore propagates to every region. Stop write workloads first." }
-      ] };
+      settings.fields = [
+        { type: "displayfield", cls: "warning", hideLabel: true, height: 80,
+          markup: "This permanently deletes EVERY snapshot of ${env.envName} from its backup storage. The cluster and its data are not touched, and the next backup starts a new repository." },
+        { type: "string", name: "confirm", caption: "Type ${env.envName}", required: true,
+          regex: "^${env.envName}$", regexText: "Type the environment name exactly.", initialValue: "" }
+      ];
+      return settings;
 
-# ---------------------------------------------------------------------------
-# Bind the addon card to the storage node-group's Add-Ons panel.
-# ---------------------------------------------------------------------------
+buttons:
+  - caption: Backup Now
+    action: backupNow
+    confirmText: Start a backup now? If a backup is already running, this one starts as soon as it finishes.
+    loadingText: Backing up...
+    successText: Backup completed. The snapshot details are in the Tasks log (the "Executing command" entry for the storage node).
+  - caption: Configure
+    action: configure
+    settings: main
+    submitUnchanged: true
+    submitButtonText: Save
+    loadingText: Checking the node and the backup storage...
+    successText: Backup configuration saved and the schedule updated.
+  - caption: Restore
+    action: restore
+    settings: restore
+    title: Restore Backup
+    submitButtonText: Restore
+    confirmText: Restore the selected snapshot? Existing files at the target are overwritten and the change replicates to every region. If another backup job is running, the restore is not started.
+    loadingText: Restoring...
+    successText: Restore completed. Details are in the Tasks log.
+  - caption: Verify
+    action: verify
+    confirmText: Check the backup repository's integrity? This reads back 5% of the stored data.
+    loadingText: Verifying...
+    successText: Repository check passed. Details are in the Tasks log.
+
+menu:
+  - caption: Backup Status
+    action: status
+    confirmText: Show the backup status of this cluster?
+    loadingText: Reading the backup status...
+  - caption: Delete All Backups
+    action: purge
+    settings: purge
+    title: Delete All Backups
+    submitButtonText: Delete
+    confirmText: Permanently delete every snapshot of this cluster from the backup storage? This cannot be undone.
+    loadingText: Deleting...
+    successText: All backups were deleted. The next backup starts a new repository.
+
 onInstall:
-  # resolveBackupNode picks the single node that runs backups (a secondary
-  # storage node in THIS env, else the master) and stashes its id in
-  # ${globals.backupNodeId}, which every command below targets. The cron
-  # fires on that one node only, so a single firing == one backup.
-  - resolveBackupNode
-  - installAddon:
-      id: glusterfs-backup-addon
-      nodeGroup: storage
-  - installRestic
-  - setSchedule
+  - manage:
+      op: apply
+      phase: install
 
+# Uninstall runs inline on purpose: it must work even when the package's
+# scripts cannot be downloaded, and a failing step would make the card
+# impossible to remove. It only refuses while a restore is writing into the
+# volume. The backup repository on the backup storage is kept.
 onUninstall:
-  - resolveBackupNode
-  - removeSchedule
-  - removeMount
+  - script: |
+      var env = "${env.envName}", envAppid = "${env.appid}", name = env + "-gfs-backup", cfgStr = "", i, j, a, r, t, d, g;
+      function unwrap(x) { return (x && x.response && typeof x.response === "object" && x.response.result !== undefined) ? x.response : x; }
+      function evalTask(p) { try { return unwrap(jelastic.dev.scripting.Eval(appid, session, name, p)); } catch (e) { return null; } }
 
-onBeforeDelete:
-  - resolveBackupNode
-  - removeSchedule
-  - removeMount
+      // 1) Never stop a restore halfway (the live volume would be left partly restored).
+      var probe = evalTask({ job: "probe", envName: env });
+      if (probe && probe.result === 0 && probe.restoreRunning) {
+        return { result: 99, error: String(probe.message), message: String(probe.message), type: "error" };
+      }
 
-onAfterRedeployContainer[storage]:
-  - resolveBackupNode
-  - installRestic
-
-# ---------------------------------------------------------------------------
-# Addon card on the storage node-group.
-# ---------------------------------------------------------------------------
-addons:
-  - id: glusterfs-backup-addon
-    name: GlusterFS Backup/Restore
-    permanent: true
-    description: Scheduled restic backups of the GlusterFS volume, with one-click restore.
-    buttons:
-      - caption: Backup
-        action: backupNow
-        confirmText: "Run a backup now?"
-        loadingText: Backing up...
-        successText: "Backup completed - see Tasks log."
-      - caption: Config
-        action: configure
-        settings: main
-        submitButtonText: Save
-        loadingText: Saving...
-        successText: "Schedule + storage updated."
-      - caption: Restore
-        action: restore
-        settings: restore
-        submitButtonText: Restore
-        title: Restore Backup
-        confirmText: "Restore the selected snapshot? Overwrites files at the target and replicates to every region."
-        loadingText: Restoring...
-        successText: "Restore complete."
-      - caption: Verify
-        action: verifyBackups
-        confirmText: "Run restic check on the backup repo?"
-        loadingText: Verifying...
-        successText: "Restic check complete - see Tasks log."
-
-globals:
-  base_path: ${baseUrl}
-  resticRepo: /opt/backup
-  # Restic password = the env name (vendor backup-storage convention). This
-  # makes our backups discoverable on the storage server via the vendor's
-  # getBackups.sh <envName> CLI.
-  resticPassword: ${env.envName}
-  # Forensic metadata baked into every snapshot via --tag. Captured at install
-  # time; persisted in node-group globals; written into the runner script.
-  # When orchestrator-installed these come from manifest.jps; when imported
-  # manually, defaults derive sensible values from the env context.
-  cluster_id:          ${settings.cluster_id:${env.envName}}
-  primary_region_name: ${settings.primary_region_name:unknown}
-  backup_region_name:  ${settings.backup_region_name:unknown}
-  volume_name:         ${settings.volume_name:data}
-
-# ---------------------------------------------------------------------------
-# Actions
-# ---------------------------------------------------------------------------
-actions:
-  # Pick the ONE node that runs backups: a SECONDARY storage node in THIS env
-  # (the cluster env sitting in the backup-storage region), so the region
-  # master is left unburdened and the NFS path is intra-region. Falls back to
-  # the master when the region has a single storage node. Deterministic:
-  # lowest-id secondary. Run at the start of every event/button so downstream
-  # commands can target ${globals.backupNodeId} without relying on persisted
-  # globals. The volume is sync-replicated, so one node holds the whole dataset.
-  resolveBackupNode:
-    - script: |
-        var r = jelastic.env.control.GetEnvInfo('${env.envName}', session);
-        if (!r || r.result != 0 || !r.nodes) return { result: 1, error: "Could not read this environment's nodes to choose a backup runner." };
-        var storage = [];
-        for (var i = 0; i < r.nodes.length; i++) if (r.nodes[i].nodeGroup == 'storage') storage.push(r.nodes[i]);
-        storage.sort(function(a, b){ return a.id - b.id; });
-        var master = null, secondary = null;
-        for (var j = 0; j < storage.length; j++) {
-          if (storage[j].ismaster) { if (!master) master = storage[j]; }
-          else if (!secondary) secondary = storage[j];
+      // 2) No new scheduled runs.
+      var seen = {}, ids = [appid, envAppid];
+      for (i = 0; i < ids.length; i++) {
+        a = ids[i];
+        if (!a || seen[a]) continue;
+        seen[a] = true;
+        try { r = jelastic.utils.scheduler.GetTasks(a, session); } catch (e) { continue; }
+        t = (r && r.result == 0) ? (r.objects || r.array || []) : [];
+        for (j = 0; j < t.length; j++) {
+          if (String(t[j].script) != name) continue;
+          try { d = jelastic.utils.scheduler.RemoveTask(a, session, t[j].id); } catch (e) { d = null; }
+          if (!d || d.result != 0) { try { jelastic.utils.scheduler.DeleteTasks({ appid: a, session: session, ids: String(t[j].id) }); } catch (e) {} }
         }
-        var pick = secondary || master;
-        if (!pick) return { result: 1, error: "No storage node found in this environment to run backups." };
-        return { result: 0, onAfterReturn: { setGlobals: {
-          backupNodeId: pick.id,
-          backupNodeName: (pick.name || pick.address || String(pick.id)),
-          backupNodeRole: secondary ? 'secondary' : 'master-only'
-        } } };
+      }
 
-  # Install (or self-update) restic on the backup node via the official vendor
-  # helper script. Same one jelastic-jps/backup-addon uses, so we inherit its
-  # distro coverage and `restic self-update` logic for free.
-  # Best-effort: exit 0 even on failure so the addon card itself stays clean.
-  installRestic:
-    - cmd[${globals.backupNodeId}]: |-
-        set +e;
-        wget -qO /usr/sbin/installUpdateRestic https://raw.githubusercontent.com/jelastic-jps/backup-storage/main/scripts/installUpdateRestic \
-          && chmod +x /usr/sbin/installUpdateRestic \
-          && /usr/sbin/installUpdateRestic;
-        restic version 2>/dev/null || echo "WARNING: restic not installed - install manually and re-run Configure";
-        exit 0;
-      user: root
+      // 3) Clear the configuration (a run already in flight then does nothing),
+      //    keeping a copy for the node cleanup.
+      try {
+        r = jelastic.env.control.GetNodeGroups(env, session);
+        for (i = 0; r && r.result == 0 && i < r.object.length; i++) {
+          if (String(r.object[i].name) == "storage" && r.object[i].gfsBackup) cfgStr = String(r.object[i].gfsBackup);
+        }
+      } catch (e) {}
+      try {
+        r = jelastic.env.control.ApplyNodeGroupData(env, session, "storage", toJSON({ gfsBackup: "" }));
+        if (!r || r.result != 0) jelastic.env.control.ApplyNodeGroupData(env, session, "storage", { gfsBackup: "" });
+      } catch (e) {}
 
-  # Persist schedule + storage + path globals, then write runner scripts + cron.
-  # High-frequency schedules (<60 min) auto-disable the "always umount" toggle
-  # to avoid mount/umount thrashing.
-  setSchedule:
-    - if ('${settings.scheduleType}' == '2'):
-        - convertCustomToCron
-    - if ('${settings.scheduleType}' != '2'):
-        - setGlobals:
-            cron: ${settings.cronTime:0 * * * *}
-    - setGlobals:
-        storageEnv: ${settings.storageName}
+      // 4) Stop jobs, remove the runner, mounts and v1 leftovers from the nodes.
+      //    A restore that started after step 1 keeps its node untouched; the
+      //    card stays so a later Uninstall removes what is left.
+      var rm = evalTask({ job: "remove", envName: env, config: cfgStr });
+      if (rm && rm.result === 0 && rm.restoreRunning) {
+        var msg = String(rm.message) + " The backup schedule was already removed. Uninstall again once the restore has finished; that removes the rest and the add-on.";
+        return { result: 99, error: msg, message: msg, type: "error" };
+      }
+
+      // 5) The task script itself.
+      try {
+        g = jelastic.dev.scripting.GetScript(appid, session, name);
+        if (g && g.result == 0) jelastic.dev.scripting.DeleteScript(appid, session, name);
+      } catch (e) {}
+      return { result: 0 };
+
+# Environment deletion: the platform removes the scheduler tasks with the
+# environment; the platform script has to be deleted explicitly.
+onBeforeDelete:
+  - script: |
+      var name = "${env.envName}-gfs-backup", g;
+      try {
+        g = jelastic.dev.scripting.GetScript(appid, session, name);
+        if (g && g.result == 0) jelastic.dev.scripting.DeleteScript(appid, session, name);
+      } catch (e) {}
+      return { result: 0 };
+
+onAfterConfirmTransfer:
+  - manage:
+      op: transfer
+
+actions:
+  manage:
+    - script: ${globals.base_path}/scripts/backup/manage.js?_r=${fn.random}
+      params:
+        op: ${this.op}
+        phase: ${this.phase}
+        job: ${this.job}
+        snapshotId: ${this.snapshotId}
+        restorePath: ${this.restorePath}
+        confirm: ${this.confirm}
+        envName: ${env.envName}
+        envAppid: ${env.appid}
+        basePath: ${globals.base_path}
+        scheduleType: ${settings.scheduleType}
+        cronTime: ${settings.cronTime}
+        backupTime: ${settings.backupTime}
+        tz: ${settings.tz}
+        sun: ${settings.sun}
+        mon: ${settings.mon}
+        tue: ${settings.tue}
+        wed: ${settings.wed}
+        thu: ${settings.thu}
+        fri: ${settings.fri}
+        sat: ${settings.sat}
+        storageName: ${settings.storageName}
         sourcePath: ${settings.sourcePath}
         backupCount: ${settings.backupCount}
-        # Capture but defer; we'll override for high-frequency below.
-        isAlwaysUmountRequested: ${settings.isAlwaysUmount}
-    - script: |
-        // If the schedule is sub-hourly, force keep-mount-permanent regardless
-        // of the user's umount toggle (avoid churn).
-        var cron = '${globals.cron}', sub = false;
-        if (/^\*\s/.test(cron) || /^\*\/\d+\s/.test(cron)) sub = true;
-        return { result: 0, onAfterReturn: { setGlobals: {
-          isAlwaysUmount: sub ? 'false' : '${globals.isAlwaysUmountRequested}',
-          isHighFrequency: sub ? 'true' : 'false'
-        } } };
-    - if ('${globals.isAlwaysUmount}' == 'true'):
-        - removeMount
-    - if ('${globals.isAlwaysUmount}' != 'true'):
-        - removeMount
-        - addMount
-    - writeBackupScripts
-    - writeCronEntry
-    - persistConfig
-
-  convertCustomToCron:
-    - script: |
-        var tz = '${settings.tz}' || 'UTC';
-        var offset = java.util.TimeZone.getTimeZone(tz).getRawOffset();
-        var time = '${settings.backupTime}'.split(':');
-        var d1 = new Date(2020, 1, 10, parseInt(time[0],10), parseInt(time[1],10));
-        var d2 = new Date(d1.getTime() - offset);
-        var dd = d2.getDate() - d1.getDate();
-        var picked = [${settings.sun:0}, ${settings.mon:0}, ${settings.tue:0}, ${settings.wed:0}, ${settings.thu:0}, ${settings.fri:0}, ${settings.sat:0}];
-        var days = [];
-        for (var i = 0; i < picked.length; i++) {
-          if (picked[i]) {
-            var day = i + dd;
-            if (day < 0) day += 7; else if (day > 6) day -= 7;
-            days.push(day);
-          }
-        }
-        if (!days.length) days = [0,1,2,3,4,5,6];
-        days.sort();
-        var cron = d2.getMinutes() + ' ' + d2.getHours() + ' * * ' + days.join(',');
-        return { result: 0, onAfterReturn: { setGlobals: { cron: cron } } };
-
-  # Resolve the backup-storage env's master node id. Tolerant: returns
-  # empty string instead of erroring out if the env isn't ready yet, so the
-  # addon install survives the race when the orchestrator created the
-  # storage env right before installing this addon.
-  getStorageCtid:
-    - script: |
-        try {
-          var nm = '${settings.storageName}';
-          if (!nm) return { result: 0, storageCtid: '' };
-          var r = jelastic.env.control.GetEnvInfo(nm, session);
-          if (!r || r.result != 0 || !r.nodes) return { result: 0, storageCtid: '' };
-          for (var l = 0; l < r.nodes.length; l++) {
-            if (r.nodes[l].ismaster) return { result: 0, storageCtid: r.nodes[l].id };
-          }
-        } catch (e) { /* fall through */ }
-        return { result: 0, storageCtid: '' };
-
-  # Best-effort mount of the backup storage. Never fails the install: if the
-  # mount can't be created (storage env not ready, IP not reachable yet, etc.),
-  # the runner script's `mount.glusterfs` fallback will try again at backup
-  # time, and the user can re-trigger setup via the Configure button.
-  addMount:
-    - getStorageCtid
-    - script: |
-        if (!'${response.storageCtid}') {
-          return { result: 0, warning: "Backup storage env not resolvable yet; skipping permanent mount. The runner will mount on demand." };
-        }
-        try {
-          var r = jelastic.env.file.AddMountPointById(
-            '${env.envName}', session, '${globals.backupNodeId}',
-            '/opt/backup', 'nfs4', null, '/data/', '${response.storageCtid}',
-            'GlusterFSBackup', false
-          );
-          // Tolerate "already mounted" and similar idempotency errors; the
-          // addon should always install cleanly.
-          return { result: 0, addMountResult: r ? r.result : -1, addMountError: r && r.error ? r.error : '' };
-        } catch (e) { return { result: 0, addMountException: String(e) }; }
-
-  removeMount:
-    - script: |
-        try {
-          var mp = jelastic.env.file.GetMountPoints('${env.envName}', session, '${globals.backupNodeId}');
-          if (!mp || mp.result != 0 || !mp.array) return { result: 0 };
-          for (var i = 0; i < mp.array.length; i++) {
-            if (mp.array[i].path == '/opt/backup' && mp.array[i].type == 'INTERNAL') {
-              jelastic.env.file.RemoveMountPointById('${env.envName}', session, '${globals.backupNodeId}', '/opt/backup');
-            }
-          }
-        } catch (e) { /* never fail uninstall on a stale mount */ }
-        return { result: 0 };
-
-  # Backup runner: vendor convention is one restic repo per source env, located
-  # at /data/<envName>/ on the storage server, with env name as the password.
-  # The whole runner is wrapped in flock so concurrent fires (cron drift,
-  # manual click during scheduled run, etc.) cannot collide.
-  writeBackupScripts:
-    - cmd[${globals.backupNodeId}]: |-
-        mkdir -p /opt/backup;
-        # Make sure the status-surfacing dir exists (for last-success.json)
-        mkdir -p /var/lib/glusterfs-backup;
-
-        cat > /root/glusterfs-backup-run.sh <<EOF
-        #!/bin/bash
-        set -e
-        REPO_ROOT=${globals.resticRepo}
-        REPO=\$REPO_ROOT/${env.envName}
-        SRC=${globals.sourcePath}
-        KEEP=${globals.backupCount}
-        ALWAYS_UMOUNT=${globals.isAlwaysUmount}
-        STATUS_DIR=/var/lib/glusterfs-backup
-        CRON_TAG='${globals.cron}'
-        export RESTIC_PASSWORD='${globals.resticPassword}'
-        export RESTIC_REPOSITORY="\$REPO"
-
-        mkdir -p "\$STATUS_DIR"
-        mountpoint -q "\$REPO_ROOT" || mount -t nfs4 -o vers=4,nolock,bg,intr "${settings.storageName}":/data /opt/backup || true
-        if ! mountpoint -q "\$REPO_ROOT"; then echo "ERROR: backup repo \$REPO_ROOT is not mounted"; exit 1; fi
-        mkdir -p "\$REPO"
-
-        # Initialise repo if empty
-        restic snapshots >/dev/null 2>&1 || restic init
-
-        # Backup the FUSE mount (live view of the sync stretched volume) with
-        # forensic metadata so cross-cluster shared storage stays disambiguable.
-        TS_START=\$(date -u +%Y-%m-%dT%H:%M:%SZ)
-        TMP_OUT=\$(mktemp)
-        restic backup "\$SRC" \\
-          --tag glusterfs-multiregion \\
-          --tag cluster=${globals.cluster_id} \\
-          --tag runner-env=${env.envName} \\
-          --tag runner-node=${globals.backupNodeId} \\
-          --tag backup-region=${globals.backup_region_name} \\
-          --tag volume=${globals.volume_name} \\
-          --tag schedule="\$CRON_TAG" \\
-          --host "\$(hostname)" --json | tee "\$TMP_OUT"
-        TS_END=\$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-        # Record the run's summary for the management addon's status panel.
-        SUMMARY_LINE=\$(grep -E '"message_type":"summary"' "\$TMP_OUT" | tail -1)
-        if [ -n "\$SUMMARY_LINE" ]; then
-          printf '{"started_at":"%s","finished_at":"%s","summary":%s}\\n' "\$TS_START" "\$TS_END" "\$SUMMARY_LINE" > "\$STATUS_DIR/last-success.json"
-        fi
-        rm -f "\$TMP_OUT"
-
-        restic forget --keep-last "\$KEEP" --prune
-
-        if [ "\$ALWAYS_UMOUNT" = "true" ]; then umount "\$REPO_ROOT" || true; fi
-        EOF
-        chmod +x /root/glusterfs-backup-run.sh;
-
-        # Wrapped runner: flock prevents overlapping invocations (critical for
-        # 1m/5m schedules where a previous run may still be in progress).
-        cat > /root/glusterfs-backup-locked.sh <<'EOF'
-        #!/bin/bash
-        exec /usr/bin/flock -n /var/lock/glusterfs-backup.lock /root/glusterfs-backup-run.sh "$@"
-        EOF
-        chmod +x /root/glusterfs-backup-locked.sh;
-
-        # Restore runners.
-        #   glusterfs-backup-restore-by-id.sh <snap-id> [target]  - CLI style
-        #   glusterfs-backup-restore-by-files.sh                  - reads /root/.restore-{snap,path}
-        cat > /root/glusterfs-backup-restore-by-id.sh <<EOF
-        #!/bin/bash
-        set -e
-        SNAP_ID="\$1"; TARGET="\$2"
-        REPO_ROOT=${globals.resticRepo}
-        REPO=\$REPO_ROOT/${env.envName}
-        export RESTIC_PASSWORD='${globals.resticPassword}'
-        export RESTIC_REPOSITORY="\$REPO"
-        [ -z "\$SNAP_ID" ] && { echo "usage: \$0 <snapshot-id> [target-path]"; exit 1; }
-        [ -z "\$TARGET" ] && TARGET=${globals.sourcePath}
-        mountpoint -q "\$REPO_ROOT" || mount -t nfs4 -o vers=4,nolock,bg,intr "${settings.storageName}":/data /opt/backup || true
-        if ! mountpoint -q "\$REPO_ROOT"; then echo "ERROR: backup repo \$REPO_ROOT is not mounted"; exit 1; fi
-        echo "Restoring snapshot \$SNAP_ID to \$TARGET"
-        restic restore "\$SNAP_ID" --target "\$TARGET" --verbose
-        EOF
-        chmod +x /root/glusterfs-backup-restore-by-id.sh;
-
-        cat > /root/glusterfs-backup-restore-by-files.sh <<EOF
-        #!/bin/bash
-        set -e
-        SNAP_ID=\$(cat /root/.restore-snap 2>/dev/null)
-        TARGET=\$(cat /root/.restore-path 2>/dev/null)
-        [ -z "\$TARGET" ] && TARGET=${globals.sourcePath}
-        exec /root/glusterfs-backup-restore-by-id.sh "\$SNAP_ID" "\$TARGET"
-        EOF
-        chmod +x /root/glusterfs-backup-restore-by-files.sh;
-
-        # Backwards compat: the old positional-args restore runner. Some
-        # versions of the addon (or the platform) pass the args via the
-        # action body's placeholders; keep working if they do.
-        ln -sf /root/glusterfs-backup-restore-by-id.sh /root/glusterfs-backup-restore.sh;
-
-        # JSON snapshot lister for the Restore button's onBeforeInit.
-        cat > /root/glusterfs-backup-list.sh <<EOF
-        #!/bin/bash
-        REPO_ROOT=${globals.resticRepo}
-        REPO=\$REPO_ROOT/${env.envName}
-        export RESTIC_PASSWORD='${globals.resticPassword}'
-        export RESTIC_REPOSITORY="\$REPO"
-        mountpoint -q "\$REPO_ROOT" || mount -t nfs4 -o vers=4,nolock,bg,intr "${settings.storageName}":/data /opt/backup 2>/dev/null || true
-        restic snapshots --json 2>/dev/null || echo '[]'
-        EOF
-        chmod +x /root/glusterfs-backup-list.sh;
-
-        # Verify runner.
-        cat > /root/glusterfs-backup-verify.sh <<EOF
-        #!/bin/bash
-        set -e
-        REPO_ROOT=${globals.resticRepo}
-        REPO=\$REPO_ROOT/${env.envName}
-        export RESTIC_PASSWORD='${globals.resticPassword}'
-        export RESTIC_REPOSITORY="\$REPO"
-        mountpoint -q "\$REPO_ROOT" || mount -t nfs4 -o vers=4,nolock,bg,intr "${settings.storageName}":/data /opt/backup || true
-        if ! mountpoint -q "\$REPO_ROOT"; then echo "ERROR: backup repo \$REPO_ROOT is not mounted"; exit 1; fi
-        restic check --read-data-subset=5%
-        EOF
-        chmod +x /root/glusterfs-backup-verify.sh;
-      user: root
-
-  writeCronEntry:
-    - cmd[${globals.backupNodeId}]: |-
-        # Cron runs on ONE node only - a secondary storage node in the backup
-        # region (role: ${globals.backupNodeRole}). Single writer to the restic
-        # repo; the runner's flock guards against overlapping fires.
-        crontab -l 2>/dev/null | grep -v 'glusterfs-backup-' > /tmp/cron.tmp || true
-        echo '${globals.cron} /root/glusterfs-backup-locked.sh >> /var/log/glusterfs-backup.log 2>&1' >> /tmp/cron.tmp
-        crontab /tmp/cron.tmp; rm -f /tmp/cron.tmp;
-        echo "Cron set on node ${globals.backupNodeId} (${globals.backupNodeName}, ${globals.backupNodeRole}): ${globals.cron} (high-frequency: ${globals.isHighFrequency})";
-      user: root
-
-  removeSchedule:
-    - cmd[${globals.backupNodeId}]: |-
-        crontab -l 2>/dev/null | grep -v 'glusterfs-backup-' | crontab -;
-        echo "Removed scheduled backup cron entry."
-      user: root
-
-  persistConfig:
-    - env.control.ApplyNodeGroupData[storage]:
-        data:
-          globals: ${globals.toJSON()}
-
-  # ---- buttons --------------------------------------------------------------
+        notifyOnFailure: ${settings.notifyOnFailure}
+        cluster_id: ${settings.cluster_id}
+        primary_region_name: ${settings.primary_region_name}
+        backup_region_name: ${settings.backup_region_name}
+        volume_name: ${settings.volume_name}
 
   configure:
-    - resolveBackupNode
-    - setSchedule
+    - manage:
+        op: apply
+        phase: configure
 
   backupNow:
-    - resolveBackupNode
-    - cmd[${globals.backupNodeId}]: |-
-        /root/glusterfs-backup-locked.sh
-      user: root
+    - manage:
+        op: run
+        job: backup
 
-  # Restore: stash the user's form selections to files via the same pattern
-  # the official jelastic-jps/backup-addon (wp-backup) uses — write them out
-  # in a separate cmd, then call the runner which reads from them. This
-  # decouples placeholder interpolation from the runner's argv parsing and
-  # gives us a clear, debuggable failure mode if interpolation misbehaves.
+  verify:
+    - manage:
+        op: run
+        job: verify
+
+  status:
+    - manage:
+        op: run
+        job: status
+
   restore:
-    - resolveBackupNode
-    - cmd[${globals.backupNodeId}]: |-
-        printf '%s' '${settings.snapshotId}' > /root/.restore-snap
-        printf '%s' '${settings.restorePath}' > /root/.restore-path
-        # Sanity: if the placeholders didn't get bound (form value not
-        # transmitted), refuse to call restic with bogus input.
-        SNAP=$(cat /root/.restore-snap)
-        if [ -z "$SNAP" ] || [ "${SNAP#\$\{}" != "$SNAP" ]; then
-          echo "ERROR: snapshot ID was not transmitted by the form (got: '$SNAP')." >&2
-          echo "Workaround: list snapshots manually and run restore from CLI:" >&2
-          echo "  /root/glusterfs-backup-list.sh   # find your snapshot id" >&2
-          echo "  /root/glusterfs-backup-restore-by-id.sh <snap-id> /data" >&2
-          exit 2
-        fi
-      user: root
-    - cmd[${globals.backupNodeId}]: /root/glusterfs-backup-restore-by-files.sh
-      user: root
+    - manage:
+        op: run
+        job: restore
+        snapshotId: ${settings.snapshotId}
+        restorePath: ${settings.restorePath}
 
-  verifyBackups:
-    - resolveBackupNode
-    - cmd[${globals.backupNodeId}]: |-
-        /root/glusterfs-backup-verify.sh
-      user: root
+  purge:
+    - manage:
+        op: run
+        job: purge
+        confirm: ${settings.confirm}
+
+success: |
+  **GlusterFS backups are configured.**
+
+  ${globals.backupReport}
+
+  Every scheduled run appears in the Tasks log as an *Executing command* entry for the storage node. The card on the storage layer has **Backup Now**, **Configure**, **Restore** and **Verify**; its menu has **Backup Status**, **Delete All Backups** and **Uninstall**.
