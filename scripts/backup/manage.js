@@ -201,12 +201,18 @@ function cronToQuartz(cron) {
 // for every UTC offset the zone uses in the coming year (standard, daylight,
 // and short periods such as Morocco's Ramadan time). Each trigger carries its
 // offset; at run time the task script lets only the trigger nearest to the
-// configured local time do the backup (dueCustom in backup-task.js).
+// configured local time do the backup (dueCustom in backup-task.js). The
+// time comes back normalised (HH:MM): it is saved and passed to the triggers
+// in that form.
 function customSchedule(time, tz, days) {
-    var m = /^(\d{1,2}):(\d{2})$/.exec(trim(time)), zone, now, offsets = [], crons = [], o, k, local, utc, shift, sel, i, d;
+    var m = /^(\d{1,2}):(\d{2})$/.exec(trim(time)), zone, now, offsets = [], crons = [], o, k, local, utc, shift, sel, i, d, hh, mm;
     if (!m) return null;
-    local = parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
-    if (local >= 1440) return null;
+    hh = parseInt(m[1], 10);
+    mm = parseInt(m[2], 10);
+    // java.time.LocalTime.of in the task script accepts nothing else: "07:75"
+    // would make every scheduled run fail.
+    if (hh > 23 || mm > 59) return null;
+    local = hh * 60 + mm;
     zone = java.util.TimeZone.getTimeZone(tz || "UTC");
     now = new Date().getTime();
     for (k = 0; k <= 366; k++) {
@@ -224,7 +230,7 @@ function customSchedule(time, tz, days) {
         sel.sort();
         crons.push((utc % 60) + " " + Math.floor(utc / 60) + " * * " + ((sel.length == 0 || sel.length == 7) ? "*" : sel.join(",")));
     }
-    return { crons: crons, offsets: offsets };
+    return { crons: crons, offsets: offsets, time: (hh < 10 ? "0" : "") + hh + ":" + (mm < 10 ? "0" : "") + mm };
 }
 
 // The scheduler triggers of a configuration: [{quartz, params}].
@@ -251,7 +257,7 @@ function buildConfig(existing) {
     var e = existing || {}, type, crons, offsets = [], cs, days, i, storage, src, keep, clusterId, triggers, dayNames, tz, time, cfg, dflt, text, names, sel;
     type = P.scheduleType || e.scheduleType || "1";
     tz = P.tz || e.tz || "UTC";
-    time = P.backupTime || e.backupTime || "02:00";
+    time = trim(P.backupTime || e.backupTime || "02:00");
     dayNames = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
     days = [];
     for (i = 0; i < 7; i++) {
@@ -261,6 +267,7 @@ function buildConfig(existing) {
     if (type == "2") {
         cs = customSchedule(time, tz, days);
         if (!cs) return fail("The backup time must look like HH:MM (24-hour).");
+        time = cs.time;
         crons = cs.crons; offsets = cs.offsets;
         names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]; sel = [];
         for (i = 0; i < 7; i++) if (days[i]) sel.push(names[i]);
@@ -402,15 +409,18 @@ function evalTask(params) {
 // The tasks of this environment's task script, or null when the scheduler
 // could not be read at all. Tasks are created under the scripting appid with
 // envName (the official backup add-ons' pattern) and looked up under both that
-// appid and the environment's.
+// appid and the environment's. The errors of the appids whose listing failed
+// go to TASKS_UNREAD: tasks under them could not be seen (nor removed).
+var TASKS_UNREAD = [];
 function listTasks() {
     var appids = [appid, P.envAppid], seen = {}, ids = {}, out = [], listed = 0, a, r, tasks, i, j;
+    TASKS_UNREAD = [];
     for (i = 0; i < appids.length; i++) {
         a = appids[i];
         if (!a || seen[a]) continue;
         seen[a] = true;
-        try { r = jelastic.utils.scheduler.GetTasks(a, session); } catch (e) { continue; }
-        if (!r || r.result != 0) continue;
+        try { r = jelastic.utils.scheduler.GetTasks(a, session); } catch (e) { TASKS_UNREAD.push(String(e)); continue; }
+        if (!r || r.result != 0) { TASKS_UNREAD.push(r && r.error ? String(r.error) : "result " + (r ? r.result : "?")); continue; }
         listed++;
         tasks = r.objects || r.array || [];
         for (j = 0; j < tasks.length; j++) {
@@ -445,7 +455,7 @@ function taskId(r) {
 // Create the new triggers first and remove the old ones only when all were
 // created, so a rejected trigger never leaves the environment unscheduled.
 function replaceTasks(cfg, triggers) {
-    var old = listTasks(), oldIds = {}, created = [], unknown = false, i, j, r, now, left, rollback;
+    var old = listTasks(), unread = TASKS_UNREAD, oldIds = {}, created = [], unknown = false, i, j, r, now, left, rollback, notes = [];
     if (old === null) return fail("Could not read the platform scheduler, so the schedule was not changed - try again.");
     for (i = 0; i < old.length; i++) oldIds[String(old[i].id)] = true;
     for (i = 0; i < triggers.length; i++) {
@@ -472,27 +482,36 @@ function replaceTasks(cfg, triggers) {
         if (taskId(r)) created.push(taskId(r));
     }
     left = removeTaskList(old);
+    // Either one means the previous schedule may still run next to the new
+    // one - the caller shows it as a warning.
     if (left.length) {
-        return ok({ note: "Warning: " + left.length + " old schedule trigger(s) could not be removed; save again to retry." });
+        notes.push("Warning: " + left.length + " trigger(s) of the previous schedule could not be removed, so the previous schedule " +
+                   "still runs next to the new one - open Configure and click Save again to remove it.");
     }
-    return ok();
+    if (unread.length) {
+        notes.push("Warning: part of the platform scheduler could not be read (" + unread.join("; ") + "), so a trigger of the " +
+                   "previous schedule may still run next to the new one - open Configure and click Save again.");
+    }
+    return notes.length ? ok({ note: notes.join(" ") }) : ok();
 }
 
 // ---- v1 add-on -------------------------------------------------------------------
 
 // The v1 add-on registered an env-level app ("glusterfs-backup") and a
 // permanent card ("glusterfs-backup-addon") that the dashboard offers no
-// Uninstall for. Remove both through the API.
-function migrateLegacy() {
-    var notes = [], r, apps, i, a, u, removed = 0, failed = [];
+// Uninstall for. Remove both through the API. What happened goes to notes
+// (informational) or warns (the user has to act).
+function migrateLegacy(notes, warns) {
+    var r, apps, i, a, u, removed = 0, failed = [];
     try {
         r = unwrap(jelastic.marketplace.app.GetAddonList({ search: {}, envName: P.envName, session: session }));
     } catch (e) {
-        return "Could not look for the previous version of this add-on (" + e + "); if its card is still listed, avoid its buttons.";
+        r = { result: 99, error: String(e) };
     }
     if (!r || r.result != 0) {
-        return "Could not look for the previous version of this add-on (" + (r && r.error ? r.error : "result " + (r ? r.result : "?")) +
-               "); if its card is still listed, avoid its buttons.";
+        warns.push("Could not look for the previous version of this add-on (" + (r && r.error ? r.error : "result " + (r ? r.result : "?")) +
+                   "); if its card is still listed, avoid its buttons.");
+        return;
     }
     apps = r.apps || [];
     for (i = 0; i < apps.length; i++) {
@@ -510,9 +529,8 @@ function migrateLegacy() {
         else failed.push(String(a.app_id) + " (" + (u && u.error ? u.error : "result " + (u ? u.result : "?")) + ")");
     }
     if (removed) notes.push("Removed the previous version of this add-on (" + removed + " installation" + (removed > 1 ? "s" : "") + ").");
-    if (failed.length) notes.push("The previous version's card could not be removed automatically: " + failed.join(", ") +
+    if (failed.length) warns.push("The previous version's card could not be removed automatically: " + failed.join(", ") +
         ". Its schedule and scripts were removed, so it no longer runs; avoid its buttons.");
-    return notes.join(" ");
 }
 
 // ---- operations -------------------------------------------------------------------
@@ -528,7 +546,7 @@ function undoFreshInstall(cfg) {
 }
 
 function opApply() {
-    var existing = loadConfig(), fresh, b, cfg, d, prep, s, t, legacy, lg, notes = [];
+    var existing = loadConfig(), fresh, b, cfg, d, prep, s, t, lg, notes = [], warns = [], report;
     // Only the install event may take its own work back; Configure never tears
     // down an install, whatever loadConfig answered.
     fresh = !existing && P.phase == "install";
@@ -539,7 +557,7 @@ function opApply() {
 
     d = deployTaskScript(cfg.basePath, existing ? existing.taskScriptSha : "");
     if (d.result != 0) return d;
-    if (d.note) notes.push("Note: " + d.note + ".");
+    if (d.note) warns.push("Note: " + d.note + ".");
     cfg.taskScriptSha = d.sha || cfg.taskScriptSha;
 
     prep = evalTask({ job: "prepare", envName: P.envName, config: toJSON(cfg), prevNode: existing && existing.nodeId ? String(existing.nodeId) : "" });
@@ -569,18 +587,33 @@ function opApply() {
         if (fresh) { undoFreshInstall(cfg); return fail(t.message + " Nothing was installed."); }
         return fail(t.message);
     }
-    if (t.note) notes.push(t.note);
+    if (t.note) warns.push(t.note);
 
-    // Only now that the new schedule is in place: retire the v1 add-on.
-    legacy = migrateLegacy();
-    if (legacy) notes.push(legacy);
+    // Only now that the new schedule is in place: retire the v1 add-on - once
+    // every storage node confirmed that no v1 job is running (the v1 card's
+    // own uninstall removes its backup storage mount unchecked).
     lg = evalTask({ job: "legacy", envName: P.envName });
-    if (lg && lg.result === 0 && lg.message) notes.push(String(lg.message));
+    if (lg.result === 0 && !lg.legacyBusy) {
+        if (lg.message) notes.push(String(lg.message));
+        migrateLegacy(notes, warns);
+    } else {
+        warns.push(lg.result === 0 ? String(lg.message)
+            : "Could not check the storage nodes for jobs of the previous version of this add-on (" + String(lg.message || lg.error || "no answer") +
+              "), so it was left in place - open Configure and click Save again to remove it.");
+    }
 
-    return ok({ onAfterReturn: { setGlobals: {
-        backupReport: "Schedule: " + cfg.scheduleText + ", keeping the newest " + cfg.keep + " snapshots. " +
-            String(prep.message || "") + (notes.length ? " " + notes.join(" ") : "")
-    } } });
+    report = "Schedule: " + cfg.scheduleText + ", keeping the newest " + cfg.keep + " snapshots. " +
+        String(prep.message || "") + (notes.length ? " " + notes.join(" ") : "") + (warns.length ? " " + warns.join(" ") : "");
+    // Install shows backupReport on its success page. The Configure button
+    // shows only its fixed successText on result 0 (the dashboard renders a
+    // custom message only for a non-zero result), so a Configure that has
+    // something to warn about returns it as a warning popup - the
+    // configuration and the schedule are saved at this point. (The regex is
+    // for a task script older than the "warn" flag, kept by a failed deploy.)
+    if (P.phase == "configure" && (warns.length || prep.warn || /WARNING|Note:|left it on node/.test(String(prep.message || "")))) {
+        return { result: "warning", type: "warning", message: "Backup configuration saved and the schedule updated, with warnings. " + report };
+    }
+    return ok({ onAfterReturn: { setGlobals: { backupReport: report } } });
 }
 
 function opRun() {

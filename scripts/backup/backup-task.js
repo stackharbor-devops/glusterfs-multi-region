@@ -21,8 +21,9 @@
  * (scripts/backup/glusterfs-backup.sh). That command is the run's entry in the
  * Tasks log ("Executing command in the ... node"), and its output holds the
  * details. The runner version is pinned too: Configure records its sha256,
- * and the node keeps every version it has had, so a run always executes
- * exactly the version its configuration names.
+ * and the node keeps its recent versions - always including the pinned one -
+ * in a store that a container redeploy keeps (redeploy.conf), so a run
+ * executes exactly the version its configuration names.
  */
 
 var MOUNT_NAME = "GlusterFSBackupStorage";
@@ -31,12 +32,25 @@ var LEGACY_MOUNT_NAME = "GlusterFSBackup";
 var GROUP = "storage";
 var RUNNER = "/usr/local/sbin/glusterfs-backup";
 var RUNNER_STORE = "/usr/local/lib/glusterfs-backup";
+// A redeploy keeps only volumes and the paths listed in redeploy.conf
+// (cluster-logic.jps lists the GlusterFS paths the same way). While the runner
+// is installed, it, its version store and its job state are listed there: a
+// redeployed node still has the pinned version, and a job the redeploy killed
+// is reported by the next run like one a restart killed.
+var REDEPLOY_CONF = "/etc/jelastic/redeploy.conf";
+var REDEPLOY_KEEP = [RUNNER, RUNNER_STORE + "/", "/var/lib/glusterfs-backup/"];
 var V2_JOBS = ["backup", "verify", "restore", "purge"];
 var LEGACY_CLEANUP =
     "(crontab -l 2>/dev/null | grep -v -e 'glusterfs-backup-locked.sh' -e '/root/glusterfs-backup-' | crontab - ) 2>/dev/null; " +
     "rm -f /root/glusterfs-backup-run.sh /root/glusterfs-backup-locked.sh /root/glusterfs-backup-restore-by-id.sh " +
     "/root/glusterfs-backup-restore-by-files.sh /root/glusterfs-backup-restore.sh /root/glusterfs-backup-list.sh " +
     "/root/glusterfs-backup-verify.sh /root/.restore-snap /root/.restore-path; true";
+// Is a restic job of the v1 add-on running on the node? v1 jobs never take the
+// runner's lock, so neither "busy" nor a restore check sees them; they export
+// RESTIC_REPOSITORY=/opt/backup/<env> before starting restic. (Not "pgrep
+// restic": that also matches this add-on's own jobs.)
+var LEGACY_CHECK = "if grep -qsz '^RESTIC_REPOSITORY=" + LEGACY_MOUNT_PATH + "/' /proc/[0-9]*/environ; " +
+    "then echo GFSB_LEGACY=busy; else echo GFSB_LEGACY=idle; fi";
 var PROBE = ": glusterfs-backup probe\nif [ -x " + RUNNER + " ]; then " + RUNNER + " busy; else echo GFSB_JOB=; fi; true";
 
 function param(name, dflt) {
@@ -68,8 +82,10 @@ function ok(msg, extra) {
     for (k in (extra || {})) r[k] = extra[k];
     return r;
 }
-function info(msg) { return { result: "info", message: msg }; }
-function warning(msg) { return { result: "warning", message: msg }; }
+// The dashboard picks the popup by "type" (an unknown or missing type shows as
+// an error), so the custom responses carry it explicitly.
+function info(msg) { return { result: "info", type: "info", message: msg }; }
+function warning(msg) { return { result: "warning", type: "warning", message: msg }; }
 function fail(msg, extra) {
     var r = { result: 99, error: msg, message: msg, type: "error" }, k;
     for (k in (extra || {})) r[k] = extra[k];
@@ -306,21 +322,28 @@ function fetchCmd(url) {
     return "{ timeout 25 wget -q -T 10 -t 1 -O \"$T\" " + q(url) + " || timeout 25 curl -fsS --connect-timeout 10 -m 20 -o \"$T\" " + q(url) + "; } 2>/dev/null";
 }
 
-// Runs the node runner. Every version the node has had is kept in
-// RUNNER_STORE under its sha256 (the newest 5), so a configuration can always
-// go back to the exact version it names - also after a Configure that failed
-// half-way, or after the package moved on.
+// Runs the node runner. The versions the node has had are kept in
+// RUNNER_STORE under their sha256 (the newest 5), so a configuration can
+// always go back to the exact version it names - also after a Configure that
+// failed half-way, or after the package moved on. The version a saved
+// configuration pins (keepSha, else the one this run wants) is touched first:
+// it stays the newest entry, so pruning never drops it, however many new
+// versions failed Configure attempts bring in.
 //   refresh=true (Install/Configure): install the current runner from the
 //   package if the download is complete (end marker) and parses.
 //   refresh=false: run exactly cfg.runnerSha256 - from the installed copy, the
 //   store, or a download, in that order.
-function runnerCmd(cfg, nodeId, args, refresh) {
+function runnerCmd(cfg, nodeId, args, refresh, keepSha) {
     var url = String(cfg.runnerUrl), want = refresh ? "" : String(cfg.runnerSha256 || ""),
-        valid = "head -n 1 \"$T\" | grep -q '^#!/bin/bash' && grep -q '^GFSB_RUNNER_API=2$' \"$T\"" +
-                " && tail -n 1 \"$T\" | grep -qx '# GFSB_EOF' && bash -n \"$T\"",
-        lines = [": glusterfs-backup " + args, "R=" + RUNNER, "S=" + RUNNER_STORE, "T=$(mktemp)",
-                 "if [ -f \"$R\" ]; then H=$(sha256sum \"$R\" | cut -c1-64); if [ ! -f \"$S/$H\" ]; then mkdir -p \"$S\" && install -m 0755 \"$R\" \"$S/$H\"; " +
-                 "ls -1t \"$S\" | tail -n +6 | while read -r o; do rm -f \"$S/$o\"; done; fi; fi"];
+        keep = [], valid, lines;
+    if (/^[0-9a-f]{64}$/.test(String(keepSha || ""))) keep.push(q(RUNNER_STORE + "/" + keepSha));
+    if (/^[0-9a-f]{64}$/.test(want) && want != keepSha) keep.push(q(RUNNER_STORE + "/" + want));
+    valid = "head -n 1 \"$T\" | grep -q '^#!/bin/bash' && grep -q '^GFSB_RUNNER_API=2$' \"$T\"" +
+            " && tail -n 1 \"$T\" | grep -qx '# GFSB_EOF' && bash -n \"$T\"";
+    lines = [": glusterfs-backup " + args, "R=" + RUNNER, "S=" + RUNNER_STORE, "T=$(mktemp)",
+             keep.length ? "touch -c " + keep.join(" ") + " 2>/dev/null" : ":",
+             "if [ -f \"$R\" ]; then H=$(sha256sum \"$R\" | cut -c1-64); if [ ! -f \"$S/$H\" ]; then mkdir -p \"$S\" && install -m 0755 \"$R\" \"$S/$H\"; " +
+             "ls -1t \"$S\" | tail -n +6 | while read -r o; do rm -f \"$S/$o\"; done; fi; fi"];
     if (!want) {
         lines.push("if " + fetchCmd(url) + " && " + valid + "; then install -m 0755 \"$T\" \"$R\"; else echo " +
                    q("note: could not download the backup runner from " + url + "; using the installed copy") + " >&2; echo GFSB_RUNNER_REFRESH=failed; fi");
@@ -336,6 +359,9 @@ function runnerCmd(cfg, nodeId, args, refresh) {
     lines.push("rm -f \"$T\"");
     lines.push("if [ ! -x \"$R\" ]; then echo 'GFSB_RESULT=failed'; echo " +
                q("GFSB_MESSAGE=the backup runner is not installed on node " + nodeId + " and could not be downloaded from " + url) + "; exit 1; fi");
+    // Idempotent; appends after a newline even when the file lacks a final one.
+    lines.push("C=" + REDEPLOY_CONF + "; if [ -f \"$C\" ]; then for p in " + REDEPLOY_KEEP.join(" ") + "; do grep -qxF \"$p\" \"$C\" || " +
+               "{ [ -z \"$(tail -c 1 \"$C\")\" ] || echo >> \"$C\"; echo \"$p\" >> \"$C\"; }; done; fi");
     lines.push("echo \"GFSB_RUNNER_SHA=$(sha256sum \"$R\" | cut -c1-64)\"");
     lines.push(runnerEnv(cfg, nodeId) + " \"$R\" " + args);
     return lines.join("\n");
@@ -368,7 +394,9 @@ function visibleFailure(cfg, nodeId, msg) {
 // date that has a trigger of its own. That gives exactly one backup per
 // selected day, also on DST switch days - never zero, never two.
 function dueCustom() {
-    var m = /^(\d{1,2}):(\d{2})$/.exec(P.backupTime), offs = [], own = parseInt(P.utcOffset, 10), i, parts,
+    // trimmed: a trigger saved before Configure normalised the time must not
+    // fall through to "due" on every offset
+    var m = /^(\d{1,2}):(\d{2})$/.exec(String(P.backupTime).replace(/^\s+|\s+$/g, "")), offs = [], own = parseInt(P.utcOffset, 10), i, parts,
         zone, now, lt, tmin, wall, delta, date, target, off, pick, k, cand, dow, days = String(P.days), any = false, late, note = "";
     if (!m) return { due: true };
     parts = String(P.offsets).split(",");
@@ -496,11 +524,35 @@ function jobStatus(cfg, nodes) {
     return info(text.replace(/\n/g, "  \n"));
 }
 
+// When Configure moves backups to another node, no run goes to the previous
+// node again, so nothing would ever report what it still holds: background
+// results that were not reported yet ("Earlier ..." lines of its status,
+// which only peeks, so they stay there if this Configure fails later) and a
+// queued job.
+function previousNodeReport(cfg, nodeId) {
+    var x = exec(nodeId, ": glusterfs-backup status of the previous backup node\nif [ -x " + RUNNER + " ]; then " +
+                 runnerEnv(cfg, nodeId) + " " + RUNNER + " status; fi; true"),
+        lines = String(x.out || "").split("\n"), i, m, queued = "", e = [], bad;
+    if (x.api != 0) {
+        return { queued: "", warn: true, text: " WARNING: the unreported results of the previous backup node " + nodeId +
+                 " could not be read (" + (tail(x.error, 200) || "result " + x.api) + ")." };
+    }
+    for (i = 0; i < lines.length; i++) {
+        if ((m = /^Queued: (\S+)/.exec(lines[i]))) queued = m[1];
+        else if (/^Earlier /.test(lines[i])) e.push(lines[i].replace(/\s+$/, ""));
+    }
+    if (!e.length) return { queued: queued, warn: false, text: "" };
+    bad = /: FAILED - | ended without /.test(e.join("\n"));
+    return { queued: queued, warn: bad, text: (bad ? " WARNING - " : " Note - ") + "not reported yet from the previous backup node " + nodeId + ": " + e.join(" ") };
+}
+
 // Install / Configure: pick and check the backup node, (re)point the backup
 // storage mount, check the repository. Never moves the backup away from a
 // node, or touches a mount, while a job of this add-on is using it.
+// The result's "warn" flag tells manage.js to show the message as a warning.
 function jobPrepare(cfg, nodes) {
-    var bn = preferredNode(nodes), pb, pre, c, st, tries, m, rep, rc, i, nd, notes = [], sha, pinned, stale, busyV2;
+    var bn = preferredNode(nodes), pb, pre, c, st, tries, m, rep, rc, i, nd, notes = [], sha, pinned, stale, busyV2,
+        saved, keepSha = "", prev = null, left = false;
     if (!bn) return fail("No storage node of " + P.envName + " is running.");
 
     // Jobs are not always on the node this Configure picks (the previous
@@ -508,17 +560,35 @@ function jobPrepare(cfg, nodes) {
     // every other running storage node first.
     for (i = 0; i < nodes.length; i++) {
         nd = nodes[i];
-        if (String(nd.id) == String(bn.node.id) || !isRunning(nd)) continue;
+        if (String(nd.id) == String(bn.node.id)) continue;
+        if (!isRunning(nd)) {
+            if (P.prevNode && String(P.prevNode) == String(nd.id)) {
+                prev = { queued: "", warn: true, text: " Note: the previous backup node " + nd.id +
+                         " is not running, so any results it had not reported yet cannot be read." };
+            }
+            continue;
+        }
         pb = probeNode(nd.id);
         if (pb.job && V2_JOBS.indexOf(pb.job) >= 0) {
             return fail("Not changed: a " + pb.job + " is running on storage node " + nd.id + ". Save again once it has finished (see Backup Status).");
         }
-        if (pb.job === undefined && P.prevNode && String(P.prevNode) == String(nd.id)) {
+        if (!P.prevNode || String(P.prevNode) != String(nd.id)) continue;
+        if (pb.job === undefined) {
             return fail("Not changed: could not check whether a job is running on the current backup node " + nd.id + " - try again.");
+        }
+        prev = previousNodeReport(cfg, nd.id);
+        if (prev.queued) {
+            return fail("Not changed: a " + prev.queued + " is queued on the current backup node " + nd.id +
+                        ". Save again once it has run (see Backup Status).");
         }
     }
 
-    pre = exec(bn.node.id, runnerCmd(cfg, bn.node.id, "doctor pre", true));
+    // The runner version the configuration still in force pins (this runs
+    // before manage.js saves the new one) must survive the store's pruning.
+    try { saved = loadConfig(); } catch (e) { saved = null; }
+    if (saved && saved.runnerSha256) keepSha = String(saved.runnerSha256);
+
+    pre = exec(bn.node.id, runnerCmd(cfg, bn.node.id, "doctor pre", true, keepSha));
     c = contract(pre.out);
     if (c.result != "ok") {
         return fail("Node " + bn.node.id + " is not ready for backups: " + (c.message || tail(pre.err || pre.error || pre.out, 600)));
@@ -547,7 +617,7 @@ function jobPrepare(cfg, nodes) {
 
     pinned = JSON.parse(JSON.stringify(cfg));
     pinned.runnerSha256 = sha;
-    rep = exec(bn.node.id, runnerCmd(pinned, bn.node.id, "doctor repo", !sha));
+    rep = exec(bn.node.id, runnerCmd(pinned, bn.node.id, "doctor repo", !sha, keepSha));
     rc = contract(rep.out);
     if (rc.result != "ok") {
         if (m.added) removeMount(bn.node.id, cfg.mountPath);
@@ -563,6 +633,7 @@ function jobPrepare(cfg, nodes) {
             pb = probeNode(nd.id);
             if (pb.job === undefined || V2_JOBS.indexOf(String(pb.job)) >= 0 || pb.active == "1") {
                 notes.push("left it on node " + nd.id + " (a job may still be using it)");
+                left = true;
                 continue;
             }
         }
@@ -570,8 +641,9 @@ function jobPrepare(cfg, nodes) {
     }
 
     return ok("Backups run on node " + bn.node.id + " (" + bn.role + ") into " + cfg.storageEnv + ". " + (rc.message || "") +
-              (notes.length ? " Backup storage mount: " + notes.join("; ") + "." : "") + stale,
-              { node: String(bn.node.id), role: bn.role, runnerSha256: rc.runner_sha || sha, mountAdded: m.added ? "1" : "" });
+              (notes.length ? " Backup storage mount: " + notes.join("; ") + "." : "") + stale + (prev ? prev.text : ""),
+              { node: String(bn.node.id), role: bn.role, runnerSha256: rc.runner_sha || sha, mountAdded: m.added ? "1" : "",
+                warn: (stale || left || rc.repo == "unreadable" || /WARNING/.test(String(rc.message || "")) || (prev && prev.warn)) ? "1" : "" });
 }
 
 // A first install that failed after "prepare": take back the backup storage
@@ -590,14 +662,38 @@ function jobUnprepare(cfg, nodes) {
 }
 
 // After the new schedule is in place: remove the v1 add-on's leftovers from
-// every storage node (crontab entry, /root scripts, /opt/backup mount).
+// every storage node (crontab entry, /root scripts, /opt/backup mount). The
+// crontab entry and the scripts go at once (a running job keeps its open
+// script). The mount goes only when every running node confirms that no v1
+// restic job uses it: a v1 restore that loses its repository leaves the live
+// volume partly restored. legacyBusy then tells manage.js to keep the v1 card
+// too (its own uninstall removes that mount unchecked).
 function jobLegacy(nodes) {
-    var i, removed = [];
-    execGroup(": glusterfs-backup v1 cleanup\n" + LEGACY_CLEANUP);
+    var i, removed = [], busy = [], unknown = [], answer = {}, r, c;
+    r = execGroup(": glusterfs-backup v1 cleanup\n" + LEGACY_CLEANUP + "\n" + LEGACY_CHECK);
+    for (i = 0; r && r.responses && i < r.responses.length; i++) {
+        c = contract(String(r.responses[i].out || ""));
+        // ExecCmd responses name the node "nodeid" (the dashboard and the official add-ons read that)
+        answer[String(r.responses[i].nodeid !== undefined ? r.responses[i].nodeid : r.responses[i].nodeId)] = c.legacy || "";
+    }
+    for (i = 0; i < nodes.length; i++) {
+        if (!isRunning(nodes[i]) || answer[String(nodes[i].id)] == "idle") continue;
+        if (answer[String(nodes[i].id)] == "busy") busy.push(nodes[i].id); else unknown.push(nodes[i].id);
+    }
+    if (busy.length || unknown.length) {
+        return ok("The previous version (v1) of this add-on was left in place: " +
+                  (busy.length ? "a restic job of it is running on node " + busy.join(", ") + " and would lose its backup storage" : "") +
+                  (busy.length && unknown.length ? "; " : "") +
+                  (unknown.length ? "node " + unknown.join(", ") + " could not be checked for a job of it" : "") +
+                  ". Its crontab schedule was removed from the nodes that answered. Open Configure and click Save again " +
+                  (busy.length ? "once that job has finished " : "") + "to remove the rest.",
+                  { legacyBusy: true });
+    }
     for (i = 0; i < nodes.length; i++) {
         if (removeMount(nodes[i].id, LEGACY_MOUNT_PATH, LEGACY_MOUNT_NAME)) removed.push(nodes[i].id);
     }
-    return ok(removed.length ? "Removed the v1 mount " + LEGACY_MOUNT_PATH + " from node(s) " + removed.join(", ") + "." : "");
+    return ok(removed.length ? "Removed the v1 mount " + LEGACY_MOUNT_PATH + " from node(s) " + removed.join(", ") + "." : "",
+              { legacyBusy: false });
 }
 
 // Uninstall pre-check: is a restore writing into the volume on any node?
@@ -605,7 +701,7 @@ function jobProbe() {
     var r = execGroup(PROBE), i, c, running = [];
     for (i = 0; r && r.responses && i < r.responses.length; i++) {
         c = contract(String(r.responses[i].out || ""));
-        if (c.job == "restore") running.push(r.responses[i].nodeId);
+        if (c.job == "restore") running.push(r.responses[i].nodeid !== undefined ? r.responses[i].nodeid : r.responses[i].nodeId);
     }
     if (running.length) {
         return ok("A restore is writing into the GlusterFS volume on node " + running.join(", ") +
@@ -619,20 +715,43 @@ function jobProbe() {
 // Uninstall: stop jobs and remove the runner, the backup storage mount and v1
 // leftovers from every storage node. A node where a restore is running (it
 // started after the pre-check) keeps its runner and mount so the restore can
-// finish. The backup repository is kept.
+// finish; so does a running node whose cleanup command got no answer (a
+// restore may be running there). Either one sets restoreRunning, which makes
+// onUninstall refuse and keep the card, so a later Uninstall finishes the
+// job. The backup repository is kept.
 function jobRemove(cfg, nodes) {
-    var i, x, mp = (cfg && cfg.mountPath) || "/opt/gfs-backup", kept = [],
-        cmd = ": glusterfs-backup uninstall\nif [ -x " + RUNNER + " ]; then " + RUNNER + " remove; fi\n" + LEGACY_CLEANUP;
+    var i, x, c, mp = (cfg && cfg.mountPath) || "/opt/gfs-backup", kept = [], unknown = [], legacyKept = [], msg = [],
+        cmd = ": glusterfs-backup uninstall\nif [ -x " + RUNNER + " ]; then " + RUNNER + " remove; fi\n" +
+              // the runner is gone (not kept for a restore): so are its redeploy.conf entries
+              "if [ ! -e " + RUNNER + " ] && [ -f " + REDEPLOY_CONF + " ]; then sed -i" +
+              REDEPLOY_KEEP.map(function (p) { return " -e '\\#^" + p + "$#d'"; }).join("") + " " + REDEPLOY_CONF + "; fi\n" +
+              LEGACY_CLEANUP + "\n" + LEGACY_CHECK;
     for (i = 0; i < nodes.length; i++) {
         x = exec(nodes[i].id, cmd);
-        if (/GFSB_RESTORE_RUNNING=1/.test(x.out)) { kept.push(nodes[i].id); continue; }
+        c = contract(x.out);
+        if (c.restore_running == "1") { kept.push(nodes[i].id); continue; }
+        // The command ends with an echo, so it answers result 0 whenever it
+        // ran. Anything else on a running node is unconfirmed.
+        if (x.api != 0 && !c.result && !c.legacy && isRunning(nodes[i])) {
+            unknown.push(nodes[i].id + " (" + (tail(x.error, 200) || "result " + x.api) + ")");
+            continue;
+        }
         removeMount(nodes[i].id, mp);
-        removeMount(nodes[i].id, LEGACY_MOUNT_PATH, LEGACY_MOUNT_NAME);
+        if (c.legacy == "busy") legacyKept.push(nodes[i].id);
+        else removeMount(nodes[i].id, LEGACY_MOUNT_PATH, LEGACY_MOUNT_NAME);
     }
-    return ok(kept.length
-        ? "A restore is still running on node " + kept.join(", ") + "; its runner and backup storage mount were left there so it can finish."
+    if (kept.length) {
+        msg.push("A restore is still running on node " + kept.join(", ") + "; its runner and backup storage mount were left there so it can finish. " +
+                 "If that restore is stuck, stop it on the node with '" + RUNNER + " stop'.");
+    }
+    if (unknown.length) {
+        msg.push("Storage node " + unknown.join(", ") + " did not answer the cleanup command, so its runner and backup storage mount were left " +
+                 "in place (a restore may be running there). If it stays unreachable, restart it.");
+    }
+    if (legacyKept.length) msg.push("The v1 mount " + LEGACY_MOUNT_PATH + " was left on node " + legacyKept.join(", ") + ", where a restic job of the v1 add-on is still running.");
+    return ok(msg.length ? msg.join(" ")
         : "Backup runner, mounts and v1 leftovers removed from the storage nodes; the backup repository was kept.",
-        { restoreRunning: kept.length > 0 });
+        { restoreRunning: kept.length > 0 || unknown.length > 0 });
 }
 
 var CFG = null;

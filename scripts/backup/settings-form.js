@@ -28,8 +28,16 @@ function byName(name) {
     return out;
 }
 var cfgError = "";
+function parseObject(s) {
+    var o;
+    try { o = JSON.parse(String(s)); } catch (x) { return null; }
+    return (o && typeof o === "object") ? o : null;
+}
+// Accepts exactly what loadConfig() in manage.js and backup-task.js accepts;
+// anything else stored is reported (cfgError) instead of being shown as the
+// install defaults, which a Save would then write over the live configuration.
 function currentConfig() {
-    var r, g, i, raw;
+    var r, g, i, raw, c;
     if (!envName) return null;
     try {
         r = jelastic.env.control.GetNodeGroups(envName, session);
@@ -39,7 +47,10 @@ function currentConfig() {
             if (String(g[i].name) != "storage") continue;
             raw = g[i].gfsBackup;
             if (raw === null || raw === undefined || String(raw) === "") return null;
-            try { return JSON.parse(String(raw)); } catch (x) { return JSON.parse(toJSON(raw)); }
+            c = parseObject(raw) || parseObject(toJSON(raw));
+            if (c) return c;
+            cfgError = "the stored configuration is not valid";
+            return null;
         }
     } catch (e) { cfgError = String(e); }
     return null;
@@ -60,10 +71,11 @@ var cfg = currentConfig();
 // Running storages first; the configured one is kept visible even when it is
 // stopped or gone, so Configure never silently switches to another storage.
 var current = cfg ? String(cfg.storageEnv || "") : "";
-var running = [], stopped = [], listed = false, resp, i, info, e, name, isBackup, scope, entry;
+var running = [], stopped = [], listed = false, envsError = "", resp, i, info, e, name, isBackup, scope, entry;
 try {
     resp = jelastic.environment.control.GetEnvs(appid, session);
-    for (i = 0; resp && resp.result == 0 && i < resp.infos.length; i++) {
+    if (!resp || resp.result != 0) envsError = (resp && resp.error) ? String(resp.error) : "result " + (resp ? resp.result : "empty");
+    for (i = 0; !envsError && i < (resp.infos || []).length; i++) {
         info = resp.infos[i];
         e = info && info.env;
         if (!e) continue;
@@ -80,17 +92,25 @@ try {
         if (name == current) listed = true;
         (e.status == 1 ? running : stopped).push(entry);
     }
-} catch (ex) { /* the list stays empty */ }
+} catch (ex) { envsError = String(ex); }
 var envs = running.concat(stopped);
-if (current && !listed) envs.unshift({ value: current, caption: current + " - deleted or not accessible, pick another" });
+// Only a successful listing can tell that the configured storage is gone.
+if (current && !listed) envs.unshift({ value: current, caption: current + (envsError
+    ? " - the environment list could not be read"
+    : " - deleted or not accessible, pick another") });
 var storageField = byName("storageName")[0];
 if (storageField) {
     storageField.values = envs;
-    storageField["default"] = current || (running.length ? running[0].value : "");
+    // After a failed config read the configured storage is unknown: pre-select
+    // none rather than another one (the required field keeps Save disabled
+    // until a storage is picked).
+    storageField["default"] = current || (!cfgError && running.length ? running[0].value : "");
     if (!envs.length) {
         // No selectable dummy entry: the required field stays empty, so
         // Install/Save stay disabled until a Backup Storage exists.
-        storageField.placeholder = "No Backup Storage found - install \"Backup Storage\" from the Marketplace first";
+        storageField.placeholder = envsError
+            ? "The environment list could not be read (" + envsError + ") - close this dialog and open it again"
+            : "No Backup Storage found - install \"Backup Storage\" from the Marketplace first";
     }
 }
 
@@ -138,10 +158,23 @@ if (cfg) {
     if (f) f.value = String(cfg.notify) != "false";
 }
 
+// ---- custom time -------------------------------------------------------------------
+// HH:MM on a 24-hour clock (00-23, 00-59): the values manage.js accepts, so a
+// bad time is refused in the form instead of on Save.
+var timeField = byName("backupTime")[0];
+if (timeField) {
+    timeField.regex = "^([01]?[0-9]|2[0-3]):[0-5][0-9]$";
+    timeField.regexText = "A time as HH:MM on a 24-hour clock, e.g. 02:00 or 23:30.";
+}
+
 // Never let the form look like the current configuration when it is not.
+if (envsError && form.fields) {
+    form.fields.unshift({ type: "displayfield", cls: "warning", hideLabel: true, height: 40,
+        markup: "The list of Backup Storage environments could not be read (" + envsError + "). Close this form and open it again." });
+}
 if (cfgError && form.fields) {
-    form.fields.unshift({ type: "displayfield", cls: "warning", hideLabel: true, height: 50,
-        markup: "The current backup configuration could not be read (" + cfgError + "). The form shows defaults - check every value before saving." });
+    form.fields.unshift({ type: "displayfield", cls: "warning", hideLabel: true, height: 60,
+        markup: "The current backup configuration could not be read (" + cfgError + "). The form shows defaults and no backup storage is pre-selected - close it and open it again, or check every value before saving." });
 }
 
 if (formCtx) return settings;

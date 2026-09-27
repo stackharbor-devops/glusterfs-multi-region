@@ -19,10 +19,18 @@
 #     and a dashboard button gives up after about 19 minutes, while the first
 #     full backup of a large volume can take hours.
 #   - Scheduled backups never queue: if a job is running they are SKIPPED -
-#     unless that job has run for GFSB_STALL_HOURS, then they FAIL, so a hung
-#     job cannot stop the schedule silently. Manual backups and verifies queue
-#     behind the running job (one queued job at most). Restores and purges are
-#     never queued: they must not run unattended later.
+#     unless that job has run for GFSB_STALL_HOURS and made no progress (no
+#     I/O, no CPU) over the last 30+ minutes (or its progress cannot be
+#     sampled), or the lock is held that long by a process that is not a job
+#     of this runner; then they FAIL, so a hung job cannot stop the schedule
+#     silently. Progress is sampled by a heartbeat next to every job, so the
+#     verdict does not depend on how often the schedule runs. Manual backups
+#     and verifies queue behind the running job (one queued job at most).
+#     Restores and purges are never queued: they must not run unattended
+#     later.
+#   - A backup storage that stops answering while its (soft) NFS mount is
+#     still listed is reported as unreachable - never as "no repository",
+#     "no snapshots" or "deleted".
 #   - A job that failed in the background turns the next run's result into
 #     "failed" (red Tasks entry, failure e-mail) exactly once.
 #   - restic >= 0.16 is required (--retry-lock, <snapshot>:<path>); restores
@@ -48,10 +56,11 @@
 #                 selection must not depend on which node happens to run)
 #   GFSB_CLUSTER, GFSB_REGION, GFSB_VOLUME, GFSB_NODE_ID  - snapshot tags
 #   GFSB_PRUNE_HOURS (24), GFSB_CHECK_SUBSET (5%), GFSB_QUEUE_MAX (21600 s),
-#   GFSB_RETRY_LOCK (30m), GFSB_STALL_HOURS (24), GFSB_PARTIAL_MAX (3)
+#   GFSB_RETRY_LOCK (30m), GFSB_STALL_HOURS (24), GFSB_PARTIAL_MAX (3),
+#   GFSB_PROGRESS_EVERY (300 s), GFSB_PROGRESS_WINDOW (1800 s), GFSB_PROGRESS_CPU (10 s)
 # =============================================================================
 GFSB_RUNNER_API=2
-GFSB_RUNNER_VERSION=2.2.0
+GFSB_RUNNER_VERSION=2.3.0
 
 set -u -o pipefail
 umask 022
@@ -77,6 +86,15 @@ QUEUE_MAX=${GFSB_QUEUE_MAX:-21600}
 RETRY_LOCK=${GFSB_RETRY_LOCK:-30m}
 STALL_HOURS=${GFSB_STALL_HOURS:-24}
 PARTIAL_MAX=${GFSB_PARTIAL_MAX:-3}
+# Stall detection: the heartbeat samples a job's I/O and CPU every
+# PROGRESS_EVERY s; a job that moved less than 1 MiB and used less than
+# PROGRESS_CPU s of CPU over at least PROGRESS_WINDOW s made no progress.
+PROGRESS_EVERY=${GFSB_PROGRESS_EVERY:-300}
+PROGRESS_WINDOW=${GFSB_PROGRESS_WINDOW:-1800}
+PROGRESS_CPU=${GFSB_PROGRESS_CPU:-10}
+case $PROGRESS_EVERY in ''|*[!0-9]*|0) PROGRESS_EVERY=300 ;; esac
+case $PROGRESS_WINDOW in ''|*[!0-9]*|0) PROGRESS_WINDOW=1800 ;; esac
+case $PROGRESS_CPU in ''|*[!0-9]*) PROGRESS_CPU=10 ;; esac
 
 STATE=/var/lib/glusterfs-backup
 RUNS=$STATE/runs
@@ -112,13 +130,22 @@ upper()   { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
 # getf FILE KEY - read one key from a key=value state file.
 getf() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -n 1; }
 
-# write_kv FILE key=value... - write a state file atomically.
+# write_kv FILE key=value... - write a state file atomically. A failed write
+# (full disk) leaves no file behind: mktemp still succeeds on a full
+# filesystem, and an empty result file would read as "no status".
 write_kv() {
     local f=$1 tmp kv
     shift
     tmp=$(mktemp "$f.XXXXXX") || return 1
-    for kv in "$@"; do printf '%s\n' "$(oneline "$kv")" >> "$tmp"; done
-    mv -f "$tmp" "$f"
+    for kv in "$@"; do
+        printf '%s\n' "$(oneline "$kv")" >> "$tmp" || { rm -f "$tmp"; return 1; }
+    done
+    mv -f "$tmp" "$f" || { rm -f "$tmp"; return 1; }
+}
+
+# disk_hint - free space where the runner keeps its state (for messages).
+disk_hint() {
+    df -Pk "$STATE" 2>/dev/null | awk 'NR == 2 { printf "%d MiB free on %s", $4 / 1024, $6 }'
 }
 
 pid_alive() {
@@ -198,24 +225,33 @@ holder_age() {
     printf '%s' $(( $(date +%s) - s ))
 }
 
-# job_io PGID - bytes read + written so far by the processes of that process
-# group (the worker is a session leader; restic runs in its group).
-job_io() {
-    local sum=0 p v g
+# job_sample PGID - "IO CPU" of the processes in that process group (the
+# worker is a session leader; restic runs in its group): bytes read + written
+# (rchar + wchar) and CPU time in clock ticks. Both include the children the
+# group has already reaped (the kernel adds a reaped child's I/O and CPU time
+# to its parent), so the totals do not drop when one restic call ends and the
+# next begins. Builtins only: the heartbeat runs this every few minutes.
+job_sample() {
+    local g=$1 p st io=0 cpu=0 k v
     for p in /proc/[0-9]*; do
-        g=$(awk '{ sub(/.*\) /, ""); print $3 }' "$p/stat" 2>/dev/null)
-        [ "$g" = "$1" ] || continue
-        v=$(awk '/^(rchar|wchar):/ { s += $2 } END { print s + 0 }' "$p/io" 2>/dev/null)
-        sum=$((sum + ${v:-0}))
+        { read -r st < "$p/stat"; } 2>/dev/null || continue
+        st=${st##*) }
+        set -- $st
+        [ "${3:-}" = "$g" ] || continue
+        # utime stime cutime cstime (fields 14-17 of /proc/PID/stat)
+        case "${12:-}.${13:-}.${14:-}.${15:-}" in *[!0-9.]*|*..*|.*|*.) continue ;; esac
+        cpu=$((cpu + ${12} + ${13} + ${14} + ${15}))
+        { while read -r k v; do
+            case $k in rchar:|wchar:) case $v in ''|*[!0-9]*) ;; *) io=$((io + v)) ;; esac ;; esac
+        done < "$p/io"; } 2>/dev/null
     done
-    printf '%s' "$sum"
+    printf '%s %s' "$io" "$cpu"
 }
 
-# lock_holders - "PID COMMAND" of every other process that has the lock file
-# open: a v1 job, or restic/helpers left over from a worker that died.
-lock_holders() {
+# file_holders FILE - "PID COMMAND" of every other process that has FILE open.
+file_holders() {
     local lk f p
-    lk=$(readlink -f "$LOCK" 2>/dev/null) || return 0
+    lk=$(readlink -f "$1" 2>/dev/null) || return 0
     find /proc/[0-9]*/fd -maxdepth 1 -lname "$lk" 2>/dev/null | while read -r f; do
         p=${f#/proc/}; p=${p%%/*}
         [ "$p" = "$$" ] && continue
@@ -223,39 +259,145 @@ lock_holders() {
     done | sort -u -k1,1n
 }
 
-# stall_check - once the lock has been held for STALL_HOURS: "running H" while
-# the job still reads or writes (I/O between two checks at least 30 min apart),
-# "stuck H" when it did not, "held H" when the holder is not a job of this
-# runner. Prints nothing below the limit.
+# lock_holders - "PID COMMAND" of every other process that has the lock file
+# open: a v1 job, or restic/helpers left over from a worker that died.
+lock_holders() { file_holders "$LOCK"; }
+
+# restore_holder - a "restic restore" has the lock file open (e.g. a restore
+# whose worker died, still writing into the volume). Only the subcommand
+# counts: a backup's argv carries user-chosen names (--host glusterfs-<cluster>,
+# runner-env=, cluster=, volume=) that may themselves contain "restore". The
+# restic binary is argv[0], or argv[1] when restic is a script run by an
+# interpreter ("/bin/bash /usr/local/bin/restic restore ...").
+restore_holder() {
+    lock_holders | awk '{ for (i = 2; i <= 3; i++) { n = $i; sub(/.*\//, "", n); if (n ~ /^restic/ && $(i + 1) == "restore") f = 1 } }
+        END { exit !f }'
+}
+
+# heartbeat_start PID RUN_ID - sample that job's progress in the background.
+# Own session (its reads of /proc are not the job's progress) and no lock fds
+# (it must never keep the job lock alive).
+heartbeat_start() {
+    setsid "$SELF" heartbeat "$1" "$2" > /dev/null 2>&1 < /dev/null 7>&- 8>&- 9>&- &
+}
+
+# heartbeat_age PID RUN_ID - seconds the oldest heartbeat of that run has been
+# running ("" when none runs).
+heartbeat_age() {
+    local p a age=""
+    for p in $(pgrep -f -- " heartbeat $1 $2( |\$)" 2>/dev/null); do
+        a=$(ps -o etimes= -p "$p" 2>/dev/null | tr -d ' ')
+        case $a in ''|*[!0-9]*) continue ;; esac
+        if [ -z "$age" ] || [ "$a" -gt "$age" ]; then age=$a; fi
+    done
+    printf '%s' "$age"
+}
+
+# heartbeat_ensure PID RUN_ID - when the newest sample of that run is missing or
+# stale: restart its heartbeat (a job started by an older runner, or a
+# heartbeat that was killed), or return 1 when a heartbeat has been running
+# for a while and still recorded nothing - it cannot write its samples (full
+# disk, read-only filesystem), so no verdict would ever come.
+heartbeat_ensure() {
+    local last="" hba
+    if [ "$(getf "$STATE/progress" run_id)" = "$2" ]; then
+        last=$(sed -n 's/^s=\([0-9]*\) .*/\1/p' "$STATE/progress" 2>/dev/null | tail -n 1)
+    fi
+    case $last in ''|*[!0-9]*) last=0 ;; esac
+    [ $(( $(date +%s) - last )) -gt $((3 * PROGRESS_EVERY)) ] || return 0
+    # A heartbeat writes its first sample at most 60 s after it starts (it may
+    # wait that long for the previous job's heartbeat to end).
+    hba=$(heartbeat_age "$1" "$2")
+    if [ -n "$hba" ]; then
+        [ "$hba" -lt 90 ] || return 1
+        return 0
+    fi
+    heartbeat_start "$1" "$2"
+}
+
+# stall_check - verdict on whatever holds the lock, once it has held it for
+# about GFSB_STALL_HOURS (15 min early, so that a daily trigger that fires a
+# few seconds before the 24 h mark does not report one day late); nothing
+# below that. Printed as "VERDICT HOURS [MINUTES IO_BYTES CPU_SECONDS]":
+#   running H M IO CPU - the job moved IO bytes / used CPU s in the last M min
+#   stuck H M IO CPU   - under 1 MiB and PROGRESS_CPU s in the last M (>= 30) min
+#   measuring H        - no heartbeat sample old enough to compare with yet
+#   unmeasured H       - its heartbeat cannot record samples (full disk?):
+#                        "measuring" would last forever, so this is a failure
+#   held H             - the holder is not a job of this runner
+# The comparison uses the heartbeat's samples, so the first check past the
+# limit already has a verdict, and every later check repeats a real one.
 stall_check() {
-    local pid rid io pio pat age since now
+    local pid rid age lim now io=0 cpu=0 at a b sat="" sio=0 scpu=0 d dc tck qp p since pend=measuring
+    # (hours are rounded: a job 23 h 50 min old reads as 24 h)
     [ "$STALL_HOURS" -gt 0 ] || return 0
+    lim=$((STALL_HOURS * 3600 - 900))
     now=$(date +%s)
     if pid=$(job_pid "$STATE/current"); then
         rm -f "$STATE/busy-since"
         age=$(holder_age)
-        [ -n "$age" ] && [ "$age" -ge $((STALL_HOURS * 3600)) ] || return 0
+        [ -n "$age" ] && [ "$age" -ge "$lim" ] || return 0
         rid=$(getf "$STATE/current" run_id)
-        io=$(job_io "$pid")
-        pio=""; pat=0
+        heartbeat_ensure "$pid" "$rid" || pend=unmeasured
+        # (< <(...), not <<<: before bash 5.1 a here-string is a temp file,
+        # which cannot be created on the full disk this may have to report)
+        read -r io cpu < <(job_sample "$pid")
         if [ "$(getf "$STATE/progress" run_id)" = "$rid" ]; then
-            pio=$(getf "$STATE/progress" io); pat=$(getf "$STATE/progress" at)
+            # the newest sample that is at least PROGRESS_WINDOW old
+            while read -r at a b; do
+                case "$at.$a.$b" in *[!0-9.]*|*..*|.*|*.) continue ;; esac
+                [ $((now - at)) -ge "$PROGRESS_WINDOW" ] && { sat=$at; sio=$a; scpu=$b; }
+            done < <(sed -n 's/^s=//p' "$STATE/progress" 2>/dev/null)
         fi
-        case $pat in ''|*[!0-9]*) pat=0 ;; esac
-        if [ -z "$pio" ]; then
-            write_kv "$STATE/progress" "run_id=$rid" "io=$io" "at=$now"
-            printf 'running %s' $((age / 3600)); return 0
+        if [ -z "$sat" ]; then printf '%s %s' "$pend" $(((age + 1800) / 3600)); return 0; fi
+        tck=$(getconf CLK_TCK 2>/dev/null); case $tck in ''|*[!0-9]*|0) tck=100 ;; esac
+        d=$((io - sio)); dc=$((cpu - scpu))
+        if [ "$d" -lt 0 ] || [ "$dc" -lt 0 ]; then
+            # a process left the group unreaped between samples: no verdict
+            printf '%s %s' "$pend" $(((age + 1800) / 3600))
+        elif [ "$d" -lt 1048576 ] && [ "$dc" -lt $((PROGRESS_CPU * tck)) ]; then
+            printf 'stuck %s %s %s %s' $(((age + 1800) / 3600)) $(((now - sat) / 60)) "$d" $((dc / tck))
+        elif [ $((now - sat)) -gt $((PROGRESS_WINDOW + 3 * PROGRESS_EVERY)) ]; then
+            # the heartbeat was missing for a while: that progress may be old
+            printf '%s %s' "$pend" $(((age + 1800) / 3600))
+        else
+            printf 'running %s %s %s %s' $(((age + 1800) / 3600)) $(((now - sat) / 60)) "$d" $((dc / tck))
         fi
-        if [ $((now - pat)) -lt 1800 ]; then printf 'running %s' $((age / 3600)); return 0; fi
-        write_kv "$STATE/progress" "run_id=$rid" "io=$io" "at=$now"
-        if [ $((io - pio)) -lt 1048576 ]; then printf 'stuck %s' $((age / 3600)); else printf 'running %s' $((age / 3600)); fi
         return 0
     fi
-    since=$(cat "$STATE/busy-since" 2>/dev/null)
-    case $since in ''|*[!0-9]*) printf '%s\n' "$now" > "$STATE/busy-since"; return 0 ;; esac
-    age=$((now - since))
-    [ "$age" -ge $((STALL_HOURS * 3600)) ] && printf 'held %s' $((age / 3600))
+    # Not a job of this runner (a v1 job, or restic left behind by a worker
+    # that died): its age is that of the oldest process holding the lock file
+    # (not counting our queued worker, which only waits for it). busy-since,
+    # when this runner first found the lock busy, is the fallback.
+    qp=$(job_pid "$STATE/queued")
+    age=""
+    for p in $(lock_holders | awk '{ print $1 }'); do
+        [ "$p" = "$qp" ] && continue
+        a=$(ps -o etimes= -p "$p" 2>/dev/null | tr -d ' ')
+        case $a in ''|*[!0-9]*) continue ;; esac
+        if [ -z "$age" ] || [ "$a" -gt "$age" ]; then age=$a; fi
+    done
+    if [ -z "$age" ]; then
+        since=$(cat "$STATE/busy-since" 2>/dev/null)
+        case $since in ''|*[!0-9]*) printf '%s\n' "$now" > "$STATE/busy-since"; return 0 ;; esac
+        age=$((now - since))
+    fi
+    [ "$age" -ge "$lim" ] && printf 'held %s' $(((age + 1800) / 3600))
     return 0
+}
+
+# stall_text VERDICT... - the stall_check verdict as a sentence ("" for none).
+stall_text() {
+    case ${1:-} in
+        stuck)     printf 'WARNING: it has been running for %s h and read or wrote less than 1 MiB and used less than %s s of CPU in the last %s min - it may be stuck (for example on a hung backup storage mount). To stop it, run %s on node %s.' \
+                       "$2" "$PROGRESS_CPU" "$3" "'$SELF stop'" "${NODE_ID:-?}" ;;
+        held)      printf 'WARNING: the backup lock has been held for %s h by a process that is not a job of this runner: %s. To stop it, run %s on node %s.' \
+                       "$2" "$(lock_holders | head -n 3 | oneline)" "'$SELF stop'" "${NODE_ID:-?}" ;;
+        unmeasured) printf 'WARNING: it has been running for %s h, and its progress cannot be checked: the progress samples are not being written to %s (%s) - is the disk of node %s full?' \
+                       "$2" "$STATE" "$(disk_hint)" "${NODE_ID:-?}" ;;
+        running)   printf 'Progress: it has been running for %s h; in the last %s min it read/wrote %s and used %s s of CPU.' "$2" "$3" "$(human "$4")" "$5" ;;
+        measuring) printf 'It has been running for %s h; its progress is being checked.' "$2" ;;
+    esac
 }
 
 human() {
@@ -291,6 +433,12 @@ json_msg() {
 restic_reason() {
     local r
     r=$(json_msg "$(grep '"message_type":"exit_error"' "$1" 2>/dev/null | tail -n 1)" | oneline)
+    # Plain text (restic < 0.18, or a command run without --json): a lock
+    # conflict takes 4 lines and only the first names the holder (PID, host) -
+    # start there instead of taking the last 3 lines.
+    [ -n "$r" ] || r=$(grep -v '"message_type":"error"' "$1" 2>/dev/null | grep -v '^$' \
+        | awk '/repository is already locked/ { b = "" } b != "" || /repository is already locked/ { b = b $0 "\n" } END { printf "%s", b }' \
+        | oneline)
     [ -n "$r" ] || r=$(grep -v '"message_type":"error"' "$1" 2>/dev/null | grep -v '^$' | tail -n 3 | oneline)
     printf '%s' "$r"
 }
@@ -405,17 +553,33 @@ version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n 1)" = "$2" ]
 # installs/updates it with the Jelastic backup-storage helper (the same one the
 # v1 add-on used) if needed.
 ensure_restic() {
-    local v min=${1:-0.16.0} helper
+    local v min=${1:-0.16.0} helper dir out why rc
     v=$(restic_version)
     if [ -n "$v" ] && version_ge "$v" "$min"; then return 0; fi
     log "restic ${v:-is not installed} - installing a current release"
-    helper=$(mktemp /usr/sbin/.installUpdateRestic.XXXXXX 2>/dev/null) || helper=""
+    why="the installer could not be downloaded - check that this node can reach github.com"
+    helper=$(mktemp /usr/sbin/.installUpdateRestic.XXXXXX 2>/dev/null) || { helper=""; why="cannot write to /usr/sbin"; }
     if [ -n "$helper" ] \
         && timeout 60 wget -q -T 20 -t 2 -O "$helper" \
             https://raw.githubusercontent.com/jelastic-jps/backup-storage/main/scripts/installUpdateRestic \
         && [ "$(head -c 2 "$helper")" = '#!' ] \
         && chmod 0755 "$helper" && mv -f "$helper" /usr/sbin/installUpdateRestic; then
-        timeout 600 /usr/sbin/installUpdateRestic > /dev/null 2>&1
+        # The helper downloads and unpacks restic.bz2 in its working directory:
+        # give it a scratch one (a leftover "restic" there makes every retry
+        # fail), and keep its output - the download is not the only step that
+        # can fail (bzip2 or strip missing, GitHub API rate limit, full disk).
+        if dir=$(mktemp -d 2>/dev/null); then
+            out=$(cd "$dir" && timeout 600 /usr/sbin/installUpdateRestic 2>&1); rc=$?
+            rm -rf -- "$dir"
+        else
+            out="cannot create a temporary directory"; rc=1
+        fi
+        out=$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -n 3 | oneline)
+        case $rc in
+            0)   why="/usr/sbin/installUpdateRestic ran, but restic is still missing or too old: ${out:-no output}" ;;
+            124) why="/usr/sbin/installUpdateRestic did not finish within 10 min: ${out:-no output}" ;;
+            *)   why="/usr/sbin/installUpdateRestic failed: ${out:-exit code $rc}" ;;
+        esac
     fi
     [ -z "$helper" ] || rm -f "$helper"
     v=$(restic_version)
@@ -423,50 +587,115 @@ ensure_restic() {
         log "restic $v installed"
         return 0
     fi
-    ERR="restic $min or newer is required (found: ${v:-none}) and could not be installed - check that this node can reach github.com"
+    ERR="restic $min or newer is required (found: ${v:-none}) and could not be installed: $why"
     return 1
 }
 
-# mount_fstype DIR - filesystem type of the TOP mount at DIR ("" if none). On
-# Jelastic both mounts sit on an automount trigger: the backup storage is an
-# autofs direct map (AddMountPointById), the volume uses x-systemd.automount.
-# Touching DIR triggers the real mount; the last line is the one on top.
-mount_fstype() {
-    timeout 60 stat -c %i "$1/." > /dev/null 2>&1
-    findmnt -rn -o FSTYPE --mountpoint "$1" 2>/dev/null | tail -n 1
+# io_reason TEXT - the error at the end of a failed command's message
+# ("stat: cannot statx '/x': Input/output error" -> "Input/output error");
+# no text means the command was killed by its timeout.
+io_reason() {
+    local r
+    r=$(oneline "${1:-}")
+    r=${r##*: }
+    printf '%s' "${r:-no answer within 60 s}"
+}
+
+# mount_probe DIR - MOUNT_FS = filesystem type of the TOP mount at DIR ("" if
+# none), MOUNT_ERR = why DIR could not be read ("" when it could). On Jelastic
+# both mounts sit on an automount trigger: the backup storage is an autofs
+# direct map (AddMountPointById), the volume uses x-systemd.automount.
+# Touching DIR triggers the real mount; the last line is the one on top. The
+# answer of that touch is kept: a soft NFS mount whose server stopped
+# answering, or a FUSE mount whose client died, stays listed as mounted while
+# every access fails. Runs in the caller's shell, not in $(...), so both
+# variables reach it.
+MOUNT_FS=""
+MOUNT_ERR=""
+mount_probe() {
+    local e
+    if e=$(timeout -k 5 60 stat -c %i "$1/." 2>&1 > /dev/null); then
+        MOUNT_ERR=""
+    else
+        MOUNT_ERR=$(io_reason "$e")
+    fi
+    MOUNT_FS=$(findmnt -rn -o FSTYPE --mountpoint "$1" 2>/dev/null | tail -n 1)
 }
 
 check_source() {
-    local fstype
-    fstype=$(mount_fstype "$SRC")
-    case $fstype in
-        fuse.glusterfs|glusterfs) return 0 ;;
+    mount_probe "$SRC"
+    case $MOUNT_FS in
+        fuse.glusterfs|glusterfs)
+            [ -z "$MOUNT_ERR" ] && return 0
+            ERR="the GlusterFS volume at $SRC does not respond ($MOUNT_ERR) - its FUSE client on this node died, hangs or reaches no brick; remount it on this node (umount -l $SRC, then ls $SRC) or restart the node"
+            return 1 ;;
         ''|autofs) ERR="the GlusterFS volume is not mounted at $SRC on this node - refusing to back up an empty directory, which would rotate good snapshots out of retention"; return 1 ;;
-        *) ERR="$SRC is mounted as '$fstype', not as the GlusterFS volume - is this add-on installed on a GlusterFS region environment?"; return 1 ;;
+        *) ERR="$SRC is mounted as '$MOUNT_FS', not as the GlusterFS volume - is this add-on installed on a GlusterFS region environment?"; return 1 ;;
     esac
+}
+
+# storage_unreachable REASON - ERR for a backup storage that does not answer.
+storage_unreachable() {
+    ERR="the backup storage mounted at $MOUNT does not answer ($1) - is the Backup Storage node running and reachable from this node?"
 }
 
 check_repo_mount() {
-    local fstype
-    fstype=$(mount_fstype "$MOUNT")
-    case $fstype in
-        nfs*) return 0 ;;
+    mount_probe "$MOUNT"
+    case $MOUNT_FS in
+        nfs*)
+            [ -z "$MOUNT_ERR" ] && return 0
+            storage_unreachable "$MOUNT_ERR"; return 1 ;;
         ''|autofs) ERR="the backup storage is not mounted at $MOUNT on this node (is the Backup Storage environment running?)"; return 1 ;;
-        *) ERR="$MOUNT is mounted as '$fstype', expected an NFS mount of the backup storage"; return 1 ;;
+        *) ERR="$MOUNT is mounted as '$MOUNT_FS', expected an NFS mount of the backup storage"; return 1 ;;
     esac
 }
 
+# path_state PATH - PATH_STATE = yes | no | error. Only "No such file or
+# directory" / "Not a directory" mean "no": [ -e ] and friends are also false
+# on EIO/ESTALE, or when a soft NFS mount gives up. PATH_ERR says why for
+# "error". LC_ALL=C keeps stat's messages in English.
+PATH_STATE=""
+PATH_ERR=""
+path_state() {
+    local e
+    PATH_ERR=""
+    if e=$(timeout -k 5 60 stat -c %F -- "$1" 2>&1 > /dev/null); then PATH_STATE=yes; return 0; fi
+    case $e in
+        *'No such file or directory'*|*'Not a directory'*) PATH_STATE=no ;;
+        *) PATH_STATE=error; PATH_ERR=$(io_reason "$e") ;;
+    esac
+}
+
+# repo_state - REPO_STATE = ready | foreign | new | error. "error" (the
+# storage does not answer; ERR says so) is never reported as "new": that would
+# list no snapshots, and let Delete All Backups report a deletion that did not
+# happen.
+REPO_STATE=""
 repo_state() {
-    if [ -f "$REPO/config" ]; then printf 'ready'
-    elif [ -d "$REPO" ] && [ -n "$(ls -A "$REPO" 2>/dev/null)" ]; then printf 'foreign'
-    else printf 'new'; fi
+    local l
+    REPO_STATE=error
+    path_state "$REPO/config"
+    case $PATH_STATE in
+        error) storage_unreachable "$PATH_ERR"; return 0 ;;
+        yes) if [ -f "$REPO/config" ]; then REPO_STATE=ready; return 0; fi ;;
+    esac
+    path_state "$REPO"
+    case $PATH_STATE in
+        error) storage_unreachable "$PATH_ERR"; return 0 ;;
+        no) REPO_STATE=new; return 0 ;;
+    esac
+    if [ ! -d "$REPO" ]; then REPO_STATE=foreign; return 0; fi
+    if ! l=$(timeout -k 5 60 ls -A "$REPO" 2>&1); then
+        storage_unreachable "$(io_reason "$l")"; return 0
+    fi
+    if [ -n "$l" ]; then REPO_STATE=foreign; else REPO_STATE=new; fi
 }
 
 # repo_opens - the repository can actually be opened (password, keys, NFS).
 repo_opens() {
     local e rc
     e=$(mktemp)
-    restic cat config --no-lock > /dev/null 2> "$e"
+    restic cat config --no-lock "${CACHE_ARGS[@]}" > /dev/null 2> "$e"
     rc=$?
     if [ "$rc" != 0 ]; then
         ERR="the repository at $REPO cannot be opened ($(rc_text "$rc")): $(restic_reason "$e")"
@@ -477,22 +706,47 @@ repo_opens() {
     return 0
 }
 
-# snapshot_count - SNAP_N = number of snapshots; returns 1 with ERR set when the
-# repository cannot be read, so an error is never shown as "0 snapshots".
+# snapshots_rc RC ERRFILE - the exit status of a "restic snapshots" run, made
+# non-zero when restic could not list the snapshot files at all: it then
+# prints "could not load snapshots: ..." and "[]" but still exits 0.
+snapshots_rc() {
+    if [ "$1" = 0 ] && grep -q '^could not load snapshots' "$2" 2>/dev/null; then printf '1'; else printf '%s' "$1"; fi
+}
+
+# damaged_snaps FILE - short ids of the snapshot files a "restic snapshots" run
+# skipped because it could not load them ('Ignoring "<id>": ...'; restic still
+# exits 0 then, and every backup fails while such a file is there).
+damaged_snaps() {
+    sed -n 's/^Ignoring "\([0-9a-f]\{8\}\)[0-9a-f]*".*/\1/p' "$1" 2>/dev/null | sort -u | tr '\n' ' ' | sed 's/ $//'
+}
+
+# snapshot_count - SNAP_N = number of snapshots, SNAP_BAD = damaged snapshot
+# files (not counted); returns 1 with ERR set when the repository cannot be
+# read, so an error is never shown as "0 snapshots".
 SNAP_N=""
+SNAP_BAD=""
 snapshot_count() {
     local out e rc
-    SNAP_N=""
+    SNAP_N=""; SNAP_BAD=""
     e=$(mktemp)
     out=$(restic snapshots --json --no-lock "${CACHE_ARGS[@]}" 2> "$e")
-    rc=$?
+    rc=$(snapshots_rc $? "$e")
     if [ "$rc" != 0 ]; then
         ERR="restic cannot read the snapshots in $REPO ($(rc_text "$rc")): $(restic_reason "$e")"
         rm -f "$e"
         return 1
     fi
+    SNAP_BAD=$(damaged_snaps "$e")
     rm -f "$e"
     SNAP_N=$(printf '%s' "$out" | grep -o '"short_id"' | wc -l | tr -d ' ')
+    # (grep finds nothing in an empty repository - not an error)
+    return 0
+}
+
+# damaged_text - warning about SNAP_BAD ("" when there is none).
+damaged_text() {
+    [ -n "$SNAP_BAD" ] || return 0
+    printf 'WARNING: snapshot file(s) %s in %s could not be loaded (damaged?) - they are not counted or offered for restore, and backups fail while they are there; run Verify.' "$SNAP_BAD" "$REPO"
 }
 
 # ---- worker jobs --------------------------------------------------------------
@@ -512,13 +766,16 @@ new_tmp() {
 }
 
 repo_init_if_needed() {
-    case $(repo_state) in
+    local e
+    repo_state
+    case $REPO_STATE in
         ready) return 0 ;;
+        error) wfail "$ERR"; return 1 ;;
         foreign)
             wfail "$REPO exists but holds no restic repository (no config file) - refusing to initialise over it; move that directory aside on the backup storage first"
             return 1 ;;
     esac
-    if ! mkdir -p "$REPO"; then wfail "cannot create $REPO on the backup storage"; return 1; fi
+    if ! e=$(mkdir -p "$REPO" 2>&1); then wfail "cannot create $REPO on the backup storage: $(io_reason "$e")"; return 1; fi
     if restic init -q > "$TMP_OUT" 2> "$TMP_ERR"; then
         log "Initialised a new restic repository at $REPO (password: the environment name, per the Jelastic backup-storage convention)"
         return 0
@@ -654,9 +911,12 @@ do_backup() {
 do_verify() {
     local rc n
     if ! check_repo_mount || ! ensure_restic; then wfail "$ERR"; return 1; fi
-    if [ "$(repo_state)" != ready ]; then
-        wfail "there is no backup repository at $REPO yet - run a backup first"; return 1
-    fi
+    repo_state
+    case $REPO_STATE in
+        ready) ;;
+        error) wfail "$ERR"; return 1 ;;
+        *) wfail "there is no backup repository at $REPO yet - run a backup first"; return 1 ;;
+    esac
     set_cache_args wipe
     restic_unlock
     # --no-cache: re-read every index and tree from the backup storage (a cache
@@ -668,18 +928,24 @@ do_verify() {
     tail -n 40 "$TMP_OUT" | sed 's/^/    /'
     if [ "$rc" = 0 ]; then
         W_STATUS=ok
-        if snapshot_count; then n="$SNAP_N snapshot(s)"; else n="snapshot count unavailable"; fi
+        if snapshot_count; then n="$SNAP_N snapshot(s)"; else n="snapshot count unavailable ($ERR)"; fi
         W_MSG="Repository check passed: structure verified and $CHECK_SUBSET of the stored data read back and checked; $n."
+        if [ -n "$SNAP_BAD" ]; then W_STATUS=warning; W_MSG="$W_MSG $(damaged_text)"; fi
         return 0
     fi
-    wfail "repository check FAILED ($(rc_text "$rc")): $(grep -v '^$' "$TMP_OUT" | tail -n 3 | oneline)"
+    wfail "repository check FAILED ($(rc_text "$rc")): $(restic_reason "$TMP_OUT")"
     return 1
 }
 
 do_restore() {
     local snap=$1 target=${2%/} js path when rc why
     if ! check_repo_mount || ! ensure_restic 0.17.0; then wfail "$ERR"; return 1; fi
-    if [ "$(repo_state)" != ready ]; then wfail "there is no backup repository at $REPO"; return 1; fi
+    repo_state
+    case $REPO_STATE in
+        ready) ;;
+        error) wfail "$ERR - nothing was restored"; return 1 ;;
+        *) wfail "there is no backup repository at $REPO"; return 1 ;;
+    esac
     if ! check_source; then wfail "$ERR - refusing to restore onto the node's own disk"; return 1; fi
     if ! within_src "$target"; then
         wfail "the restore target $target resolves to $(readlink -m "$target"), outside the volume $SRC (a symlink inside the volume?) - refusing"; return 1
@@ -718,25 +984,41 @@ do_restore() {
 }
 
 do_purge() {
-    local trash d
-    if ! check_repo_mount; then wfail "$ERR"; return 1; fi
-    if [ -e "$REPO" ]; then
-        # Move aside first so a half-deleted repository never sits at the
-        # live path. '@' cannot occur in env names, so this only ever
-        # matches this environment's leftovers.
-        trash="$MOUNT/.gfsb-deleted@$ENV_NAME@$(date -u +%Y%m%dT%H%M%SZ)"
-        if ! mv "$REPO" "$trash"; then wfail "could not move $REPO aside"; return 1; fi
-        log "Deleting $trash"
-        rm -rf "$trash" || { W_STATUS=warning; W_MSG="The repository was moved aside to $trash but could not be fully deleted; remove it on the backup storage."; return 0; }
-    fi
+    local trash d e st=ok msg="Deleted every snapshot of $ENV_NAME from the backup storage ($REPO removed). The next backup starts a new repository."
+    if ! check_repo_mount; then wfail "$ERR - nothing was deleted"; return 1; fi
+    # Only "No such file or directory" means there is nothing to delete: on
+    # the soft NFS mount of a storage that stopped answering, [ -e ] is false
+    # too, and that must never be reported as a deletion.
+    path_state "$REPO"
+    case $PATH_STATE in
+        error) storage_unreachable "$PATH_ERR"; wfail "$ERR - nothing was deleted"; return 1 ;;
+        yes)
+            # Move aside first so a half-deleted repository never sits at the
+            # live path. '@' cannot occur in env names, so this only ever
+            # matches this environment's leftovers.
+            trash="$MOUNT/.gfsb-deleted@$ENV_NAME@$(date -u +%Y%m%dT%H%M%SZ)"
+            if ! e=$(mv "$REPO" "$trash" 2>&1); then wfail "could not move $REPO aside ($(io_reason "$e")) - nothing was deleted"; return 1; fi
+            log "Deleting $trash"
+            if ! rm -rf "$trash"; then
+                st=warning
+                msg="The repository was moved aside to $trash but could not be fully deleted; remove it on the backup storage. The next backup starts a new repository."
+            fi ;;
+    esac
     for d in "$MOUNT/.gfsb-deleted@$ENV_NAME@"*; do
         [ -d "$d" ] && rm -rf "$d"
     done
     # The local cache belonged to the deleted repository.
     rm -rf -- "${RESTIC_CACHE_DIR:?}"
     rm -f "$STATE/last-prune" "$STATE/partial-streak"
-    W_STATUS=ok
-    W_MSG="Deleted every snapshot of $ENV_NAME from the backup storage ($REPO removed). The next backup starts a new repository."
+    # Confirm on the storage itself before reporting a deletion.
+    path_state "$REPO"
+    case $PATH_STATE in
+        no) ;;
+        error) storage_unreachable "$PATH_ERR"; wfail "could not confirm that $REPO is gone: $ERR Run Delete All Backups again once the storage answers."; return 1 ;;
+        *) wfail "$REPO still exists on the backup storage after the deletion (was it created again meanwhile?)"; return 1 ;;
+    esac
+    W_STATUS=$st
+    W_MSG=$msg
     return 0
 }
 
@@ -756,23 +1038,41 @@ report_unreported() {
         res=$RUNS/$id.result
         if [ -f "$res" ]; then
             st=$(getf "$res" status); msg=$(getf "$res" message); job=$(getf "$res" job)
+            if [ -z "$st" ]; then
+                # an empty or cut-off result file: the worker could not write it
+                st=failed
+                [ -n "$job" ] || { job=${id#*-}; job=${job%-*}; }
+                msg="its result could not be read - is the disk of node ${NODE_ID:-?} full? ($(disk_hint))"
+            fi
             say "Earlier $job run $id finished in the background: $(upper "$st") - $msg"
             PREV_NOTE="$PREV_NOTE [Earlier $job run $id: $st - $msg]"
             [ "$st" = failed ] && PREV_FAILED=1
             [ "$mode" = peek ] && keep="$keep$id
 "
-        elif worker_alive "$(cat "$RUNS/$id.pid" 2>/dev/null)" "$id"; then
+        elif run_alive "$id"; then
             keep="$keep$id
 "
         else
-            say "Earlier run $id ended without recording a result (node restart?)."
-            PREV_NOTE="$PREV_NOTE [Earlier run $id ended without a result - node restarted?]"
+            say "Earlier run $id ended without recording a result (node restart, or a full disk? $(disk_hint))."
+            PREV_NOTE="$PREV_NOTE [Earlier run $id ended without a result - node restarted, or disk full?]"
             PREV_FAILED=1
             [ "$mode" = peek ] && keep="$keep$id
 "
         fi
     done < "$f"
-    printf '%s' "$keep" > "$f"
+    # Replace the list only when the new one could be written in full: on a
+    # full disk a plain "> file" would truncate it and lose the runs that are
+    # still running (reporting one twice is the lesser evil).
+    if ! { printf '%s' "$keep" > "$f.new" && mv -f "$f.new" "$f"; } 2>/dev/null; then
+        rm -f "$f.new"
+    fi
+}
+
+# run_alive RUN_ID - the worker of that run is still running. Its pid file can
+# be empty when the disk was full as it started: then look for the process.
+run_alive() {
+    worker_alive "$(cat "$RUNS/$1.pid" 2>/dev/null)" "$1" && return 0
+    pgrep -f -- " worker [a-z]+ [a-z]+ $1( |\$)" > /dev/null 2>&1
 }
 
 # finish_start STATUS MESSAGE - an earlier background run that failed turns any
@@ -791,6 +1091,7 @@ finish_start() {
 
 cmd_start() {
     local job=${1:-} mode=${2:-manual} wait=${3:-600} id waited=0 queued=0 h res started st wpid alive
+    local sv="" sh sm sio scpu note=""
     if [ $# -ge 3 ]; then shift 3; else shift $#; fi
     case $job in backup|verify|restore|purge) ;; *) emit failed "unknown job '$job'" ;; esac
     case $mode in auto|manual) ;; *) emit failed "unknown mode '$mode'" ;; esac
@@ -809,28 +1110,33 @@ cmd_start() {
         rm -f "$STATE/busy-since"
     else
         h=$(holder_desc)
+        # Past GFSB_STALL_HOURS a scheduled run fails loudly (red entry,
+        # e-mail) when the holder made no progress over the last 30+ min, or
+        # is not a job of this runner, instead of skipping silently forever; a
+        # long job that still reads, writes or computes is left alone. Every
+        # run repeats a measured verdict (from the heartbeat's samples).
+        read -r sv sh sm sio scpu < <(stall_check)
         if [ "$mode" = auto ]; then
-            # Past GFSB_STALL_HOURS a scheduled run fails loudly (red entry,
-            # e-mail) when the holder made no progress, instead of skipping
-            # silently forever; a long job that still moves data is left alone.
-            st=$(stall_check)
-            case $st in
-                stuck*) finish_start failed "Scheduled backup NOT taken: $h has been running for ${st#stuck } h and made no progress since the previous check - it may be stuck (for example on a hung backup storage mount). No new backups are taken until it ends; see Backup Status. To stop it, run '$SELF stop' on node ${NODE_ID:-?}." ;;
-                held*)  finish_start failed "Scheduled backup NOT taken: the backup lock has been held for ${st#held } h by a process that is not a job of this runner: $(lock_holders | head -n 3 | oneline). To stop it, run '$SELF stop' on node ${NODE_ID:-?}." ;;
-                running*) finish_start skipped "Scheduled backup skipped: $h is still running (for ${st#running } h and still moving data)." ;;
+            case $sv in
+                stuck) finish_start failed "Scheduled backup NOT taken: $h has been running for $sh h and read or wrote less than 1 MiB and used less than $PROGRESS_CPU s of CPU in the last $sm min - it may be stuck (for example on a hung backup storage mount). No new backups are taken until it ends; see Backup Status. To stop it, run '$SELF stop' on node ${NODE_ID:-?}." ;;
+                held)  finish_start failed "Scheduled backup NOT taken: the backup lock has been held for $sh h by a process that is not a job of this runner: $(lock_holders | head -n 3 | oneline). To stop it, run '$SELF stop' on node ${NODE_ID:-?}." ;;
+                unmeasured) finish_start failed "Scheduled backup NOT taken: $h has been running for $sh h, and whether it still makes progress cannot be checked: its progress samples are not being written to $STATE ($(disk_hint)) - is the disk of node ${NODE_ID:-?} full? No new backups are taken until it ends; see Backup Status. To stop it, run '$SELF stop' on node ${NODE_ID:-?}." ;;
+                running) finish_start skipped "Scheduled backup skipped: $h is still running (for $sh h; in the last $sm min it read/wrote $(human "$sio") and used $scpu s of CPU)." ;;
+                measuring) finish_start skipped "Scheduled backup skipped: $h is still running (for $sh h); its progress is being checked - if it makes none for $((PROGRESS_WINDOW / 60)) min, scheduled backups fail." ;;
             esac
             finish_start skipped "Scheduled backup skipped: $h is still running."
         fi
+        case $sv in stuck|held|unmeasured) note=" $(stall_text "$sv" "$sh" "$sm")" ;; esac
         case $job in restore|purge)
-            finish_start skipped "Not started - nothing was changed: $h is running. A $job is never queued, so it cannot run unattended later; start it again when Backup Status shows no running job." ;;
+            finish_start skipped "Not started - nothing was changed: $h is running.$note A $job is never queued, so it cannot run unattended later; start it again when Backup Status shows no running job." ;;
         esac
         if queued_alive; then
-            finish_start skipped "Not started: $h is running and a $(getf "$STATE/queued" job) is already queued behind it."
+            finish_start skipped "Not started: $h is running and a $(getf "$STATE/queued" job) is already queued behind it.$note"
         fi
         queued=1
         # A queued job's result is reported later; do not keep the caller waiting.
         [ "$wait" -gt 20 ] && wait=20
-        say "Waiting: $h is running; this $job starts as soon as it finishes."
+        say "Waiting: $h is running; this $job starts as soon as it finishes.$note"
     fi
 
     id="$(date -u +%Y%m%dT%H%M%SZ)-$job-$$"
@@ -849,21 +1155,26 @@ cmd_start() {
     proc_running "$wpid" || alive=0
     if [ -f "$res" ]; then
         tail -n 150 "$RUNS/$id.log"
-        finish_start "$(getf "$res" status)" "$(getf "$res" message)"
+        st=$(getf "$res" status)
+        [ -n "$st" ] || finish_start failed "The $job (run $id) ended, but its result could not be read - is the disk of node ${NODE_ID:-?} full? ($(disk_hint))"
+        finish_start "$st" "$(getf "$res" message)"
     fi
     if [ "$alive" = 0 ]; then
         tail -n 30 "$RUNS/$id.log" 2>/dev/null
-        finish_start failed "The $job (run $id) ended without recording a result: $(tail -n 3 "$RUNS/$id.log" 2>/dev/null | oneline)"
+        finish_start failed "The $job (run $id) ended without recording a result ($(disk_hint)): $(tail -n 3 "$RUNS/$id.log" 2>/dev/null | oneline)"
     fi
 
-    printf '%s\n' "$id" >> "$STATE/unreported"
+    # The run must be recorded, or its result would never be reported.
+    if ! printf '%s\n' "$id" 2>/dev/null >> "$STATE/unreported"; then
+        finish_start failed "The $job (run $id) continues in the background on node ${NODE_ID:-?}, but it could not be recorded for reporting - is the disk of that node full? ($(disk_hint)). Its result will NOT be reported automatically; see Backup Status.$note"
+    fi
     tail -n 30 "$RUNS/$id.log" 2>/dev/null
     if [ "$(getf "$STATE/current" run_id)" = "$id" ]; then
         started=$(getf "$STATE/current" started)
         finish_start background "The $job is still running in the background on node ${NODE_ID:-?} (run $id, started $started). Its result will be reported by the next backup run and shown in Backup Status; live log: $RUNS/$id.log."
     fi
     if [ "$queued" = 1 ]; then
-        finish_start queued "The $job is queued behind $h and starts as soon as that finishes (run $id). Its result will be reported by the next backup run and shown in Backup Status."
+        finish_start queued "The $job is queued behind $h and starts as soon as that finishes (run $id). Its result will be reported by the next backup run and shown in Backup Status.$note"
     fi
     finish_start background "The $job was started in the background (run $id). Its result will be reported by the next backup run and shown in Backup Status; live log: $RUNS/$id.log."
 }
@@ -914,6 +1225,7 @@ cmd_worker() {
             fi ;;
     esac
     write_kv "$STATE/current" "pid=$$" "job=$JOB" "mode=$MODE" "run_id=$RUN_ID" "started=$(ts)"
+    heartbeat_start "$$" "$RUN_ID"
     log "== $JOB ($MODE) run $RUN_ID - runner $GFSB_RUNNER_VERSION, node ${NODE_ID:-?} ($(hostname)) =="
 
     case $JOB in
@@ -930,6 +1242,7 @@ worker_exit() {
     log "== result: $(upper "$W_STATUS") - $W_MSG =="
     rm_if_mine current
     rm_if_mine queued
+    [ "$(getf "$STATE/progress" run_id)" = "$RUN_ID" ] && rm -f "$STATE/progress"
     rm -f "$TMP_OUT" "$TMP_ERR"
     cat "$RUNS/$RUN_ID.log" >> "$LOG" 2>/dev/null
     write_kv "$RESULT" "run_id=$RUN_ID" "job=$JOB" "mode=$MODE" "status=$W_STATUS" \
@@ -945,19 +1258,23 @@ cmd_list() {
     check_config || emit failed "$ERR"
     mkdir -p "$STATE"
     check_repo_mount || emit failed "$ERR"
-    case $(repo_state) in
+    repo_state
+    case $REPO_STATE in
         new)     say 'GFSB_JSON=[]'; emit ok "no repository at $REPO yet - the first backup creates it" ;;
         foreign) emit failed "$REPO exists on the backup storage but is not a restic repository" ;;
+        error)   emit failed "$ERR" ;;
     esac
     ensure_restic > /dev/null 2>&1 || emit failed "$ERR"
     set_cache_args > /dev/null
     errf=$(mktemp)
     out=$(restic snapshots --json --no-lock "${CACHE_ARGS[@]}" 2> "$errf")
-    rc=$?
+    rc=$(snapshots_rc $? "$errf")
     if [ "$rc" = 0 ]; then
+        SNAP_BAD=$(damaged_snaps "$errf")
         rm -f "$errf"
         say "GFSB_JSON=$(printf '%s' "$out" | tr -d '\n')"
-        emit ok "snapshots listed"
+        # Stays "ok": a failed list would hide every snapshot that can be restored.
+        emit ok "snapshots listed$([ -n "$SNAP_BAD" ] && printf '. %s' "$(damaged_text)")"
     fi
     ERR="restic cannot read the repository at $REPO ($(rc_text "$rc")): $(restic_reason "$errf")"
     rm -f "$errf"
@@ -965,7 +1282,7 @@ cmd_list() {
 }
 
 cmd_status() {
-    local f v last hold
+    local f v last hold sv
     check_config || emit failed "$ERR"
     mkdir -p "$RUNS"
     say "Runner $GFSB_RUNNER_VERSION on node ${NODE_ID:-?} ($(hostname))"
@@ -977,6 +1294,9 @@ cmd_status() {
             hold=$(lock_holders | head -n 3 | oneline)
             [ -n "$hold" ] && say "Lock held by: $hold"
         fi
+        # Past GFSB_STALL_HOURS: is it still making progress?
+        sv=$(stall_check)
+        [ -n "$sv" ] && say "$(stall_text $sv)"
     fi
     if queued_alive; then
         say "Queued: $(getf "$STATE/queued" job) (run $(getf "$STATE/queued" run_id), waiting since $(getf "$STATE/queued" since))"
@@ -990,16 +1310,19 @@ cmd_status() {
     say "restic: ${v:-not installed}"
     if check_repo_mount; then
         set_cache_args
-        case $(repo_state) in
+        repo_state
+        case $REPO_STATE in
             ready)
                 if snapshot_count; then
                     last=$(restic snapshots --json --no-lock --latest 1 "${CACHE_ARGS[@]}" 2>/dev/null | sed -n 's/.*"time":"\([^".]*\).*/\1/p' | tail -n 1)
-                    say "Repository: $REPO - $SNAP_N snapshot(s), newest ${last:-?}"
+                    say "Repository: $REPO - $SNAP_N snapshot(s), newest ${last:-none yet}"
+                    [ -n "$SNAP_BAD" ] && say "$(damaged_text)"
                 else
                     say "Repository: $REPO - UNREADABLE: $ERR"
                 fi ;;
             foreign) say "Repository: $REPO exists but is not a restic repository" ;;
             new)     say "Repository: $REPO - not created yet (the first backup creates it)" ;;
+            error)   say "Repository: $REPO - UNREADABLE: $ERR" ;;
         esac
     else
         say "Repository: $ERR"
@@ -1029,7 +1352,11 @@ cmd_doctor() {
     fi
     check_repo_mount || emit failed "$ERR"
     ensure_restic || emit failed "$ERR"
-    case $(repo_state) in
+    # The no-cache guard also applies here: a full brick filesystem must not
+    # make restic fail to write its cache and read as an unreadable repository.
+    set_cache_args > /dev/null
+    repo_state
+    case $REPO_STATE in
         ready)
             if ! repo_opens; then
                 # Warn, do not fail: only an installed add-on offers Delete All
@@ -1039,7 +1366,7 @@ cmd_doctor() {
             fi
             say "GFSB_REPO=ready"
             if snapshot_count; then
-                emit ok "Existing repository at $REPO with $SNAP_N snapshot(s) - backups continue in it."
+                emit ok "Existing repository at $REPO with $SNAP_N snapshot(s) - backups continue in it.$([ -n "$SNAP_BAD" ] && printf ' %s' "$(damaged_text)")"
             fi
             emit ok "Existing repository at $REPO - backups continue in it (WARNING: $ERR)." ;;
         new)
@@ -1047,6 +1374,8 @@ cmd_doctor() {
             emit ok "No repository at $REPO yet - the first backup creates it." ;;
         foreign)
             emit failed "$REPO exists on the backup storage but is not a restic repository - move it aside first" ;;
+        error)
+            emit failed "$ERR" ;;
     esac
 }
 
@@ -1056,8 +1385,37 @@ busy_job() {
     if job_pid "$STATE/current" > /dev/null; then
         getf "$STATE/current" job
     elif ! lock_free; then
-        if lock_holders | grep -q 'restic .*restore'; then printf 'restore'; else printf 'other'; fi
+        if restore_holder; then printf 'restore'; else printf 'other'; fi
     fi
+}
+
+# heartbeat PID RUN_ID - internal (see heartbeat_start): every
+# PROGRESS_EVERY s, record an "<epoch> <io> <cpu>" sample of that job's process
+# group in $STATE/progress (as many as cover PROGRESS_WINDOW plus a margin:
+# 10 with the defaults), until the job ends.
+cmd_heartbeat() {
+    local pid=${1:-} rid=${2:-} f=$STATE/progress step=15 n i
+    local nkeep=$((PROGRESS_WINDOW / PROGRESS_EVERY + 3))
+    local -a keep
+    worker_alive "$pid" "$rid" || exit 0
+    # One heartbeat at a time: a new job's heartbeat waits until the previous
+    # one has noticed that its job ended; a duplicate one gives up.
+    exec 7>> "$STATE/heartbeat.lock" || exit 0
+    flock -w 60 7 || exit 0
+    [ "$PROGRESS_EVERY" -lt "$step" ] && step=$PROGRESS_EVERY
+    n=$((PROGRESS_EVERY / step))
+    while worker_alive "$pid" "$rid"; do
+        keep=()
+        if [ "$(getf "$f" run_id)" = "$rid" ]; then
+            mapfile -t keep < <(grep '^s=' "$f" 2>/dev/null | tail -n "$nkeep")
+        fi
+        write_kv "$f" "run_id=$rid" "${keep[@]}" "s=$(date +%s) $(job_sample "$pid")"
+        for i in $(seq 1 "$n"); do
+            sleep "$step"
+            worker_alive "$pid" "$rid" || break 2
+        done
+    done
+    exit 0
 }
 
 # busy - GFSB_JOB=<busy_job>.
@@ -1093,6 +1451,9 @@ cmd_stop() {
         sleep 2
     done
     for pid in $(lock_holders | awk '{ print $1 }'); do kill -KILL "$pid" 2>/dev/null; done
+    # Heartbeats (they all keep heartbeat.lock open) would end on their own
+    # within seconds; "remove" must not race with their writes into $STATE.
+    for pid in $(file_holders "$STATE/heartbeat.lock" | awk '{ print $1 }'); do kill -TERM "$pid" 2>/dev/null; done
     emit ok "stopped $n process(es)"
 }
 
@@ -1102,14 +1463,16 @@ cmd_stop() {
 cmd_remove() {
     local qp
     if { [ "$(getf "$STATE/current" job)" = restore ] && job_pid "$STATE/current" > /dev/null; } \
-        || lock_holders | grep -q 'restic .*restore'; then
+        || restore_holder; then
         if qp=$(job_pid "$STATE/queued"); then kill -TERM -- "-$qp" 2>/dev/null; fi
         say "GFSB_RESTORE_RUNNING=1"
         emit failed "$(holder_desc) is writing into the GlusterFS volume - stopping it would leave the volume partly restored, so nothing was removed. Uninstall again once it has finished (see Backup Status)."
     fi
     (cmd_stop) > /dev/null
     cleanup_legacy
-    rm -rf -- "$STATE" "${RESTIC_CACHE_DIR:?}"
+    # (a second try: a heartbeat that was just starting may still write once)
+    rm -rf -- "$STATE" 2>/dev/null || { sleep 2; rm -rf -- "$STATE"; }
+    rm -rf -- "${RESTIC_CACHE_DIR:?}"
     rm -rf /usr/local/sbin/glusterfs-backup /usr/local/lib/glusterfs-backup
     emit ok "backup runner removed from this node (restic and $LOG were kept)"
 }
@@ -1117,6 +1480,7 @@ cmd_remove() {
 case ${1:-} in
     start)          shift; cmd_start "$@" ;;
     worker)         shift; cmd_worker "$@" ;;
+    heartbeat)      shift; cmd_heartbeat "$@" ;;
     list)           cmd_list ;;
     status)         cmd_status ;;
     doctor)         shift; cmd_doctor "$@" ;;
