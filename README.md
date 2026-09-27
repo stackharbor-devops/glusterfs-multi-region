@@ -628,86 +628,15 @@ success/success.md                 post-install summary shown to the user
 
 ## Versioning
 
-- **v3.2** (current): backup add-on rebuilt (v2.0).
-  - **Uninstallable and reinstallable**: the add-on is now the card on the
-    storage layer (the old one was a permanent inner card). Uninstall keeps the
-    cluster and the backup repository; reinstalling continues in it. New
-    **Delete All Backups** clears the repository.
-  - **Scheduled by the platform**, so every run is in the Tasks log (the old
-    node crontab was invisible); failures turn the entry red and can e-mail.
-  - **Backup Now no longer fails** when a scheduled backup is running: jobs run
-    detached under one lock; manual backups queue, scheduled ones skip with a
-    message (and fail loudly if a job hangs for 24 h), restores are never
-    queued, long jobs continue in the background and report later. Uninstall
-    refuses while a restore is running.
-  - Restores land in the right place (`restic restore <id>:/data`), require
-    restic ≥ 0.17 and a target that resolves inside the volume. The runner is
-    pinned by checksum at Configure, so repository changes never reach a
-    cluster's restore code without a Configure → Save.
-  - Fixed: a failed `restic backup` was reported as success (pipe without
-    pipefail); an unmounted GlusterFS volume would have been backed up as an
-    empty directory and rotated good snapshots out; restores into `/data`
-    landed in `/data/data/...`; retention leaked per hostname; `prune` ran every
-    hour; Verify collided with running backups.
-  - Fixed: the old add-on overwrote the cluster parameters on the primary env
-    when the backup storage was in the first region, breaking Add Region /
-    Forget Region / Add Capacity Slice. It no longer writes them, and those
-    add-ons rebuild damaged parameters from the live cluster
-    (`scripts/loadClusterGlobals.js`).
-  - The orchestrator installs the add-on on the `storage` layer. Existing
-    clusters upgrade by importing the new `addons/backup.jps` (it removes the old
-    version and keeps the snapshots).
-  - Remove Region / Forget Region: a refused `remove-brick` was reported as
-    success, and Forget Region could then delete an environment whose bricks
-    were still in the volume. The step now fails, and the environment is only
-    deleted when the volume's brick list could be read and none of its nodes
-    holds a brick. Add Region sizes a new region from the volume's live bricks
-    per region (also on a volume reduced to a single region, replica 1), and
-    stops before creating anything when the `<prefix>-N` environments do not
-    match the volume's regions (e.g. a forgotten region's environment was kept).
-- **v3.1**: *Manage Cluster* — the **Run** button is now enabled for
-  the pre-selected default operation (Cluster status). The dashboard only enables
-  an add-on form's submit button once the form has been changed, unless the form
-  sets `submitUnchanged: true`; it now does (management add-on v1.8). No storage
-  or install-flow changes.
-- **v3.0**: native dashboard mounts. Every region's storage layer is
-  flagged as a storage cluster in node-group data (`cluster.enabled` +
-  `cluster.settings.replicatedPath` / `replicatedVolume` — the exact condition
-  the dashboard checks, taken from its source), so *Volumes → Data Container*
-  lists it as *Storage Containers × N* and offers **Gluster Native (FUSE)**, with
-  nothing installed on client environments. Done by the new
-  `addons/native-fuse.jps`; the region envs keep `cluster: false`, so the
-  platform's built-in per-environment gluster clustering never runs and the
-  stretched volume is unchanged. Older deployments upgrade by importing that
-  add-on onto each region env. Verified on a live platform: the region is listed
-  with Gluster Native (FUSE), the mount works, and `auth.allow` stays `*`.
-- **v2.6**: new `addons/client.jps` — Gluster-native FUSE mount of the
-  volume into any app environment, by region, with the region master as volfile
-  server and the other region nodes as `backup-volfile-servers`. Added because
-  Jelastic's Volumes dialog only offers FUSE for `cluster: true` storage (which
-  is incompatible with the cross-region stretched volume) and exposes NFS only
-  for this package.
-- **v2.5**: volume access opened for FUSE clients — `auth.allow` is
-  left at `*` (no peer-IP hardening; access governed by Jelastic network
-  isolation + the storage firewall). "Re-tighten auth.allow" operation removed.
-- **v2.4**: internal-only networking (public-WAN option removed — all
-  replication over GRE). Backup re-added in a region-targeted form: deploy a
-  backup-storage node inside a chosen cluster region and back up from one
-  secondary node in that region.
-- **v2.3**: backup addon + "deploy backup server" install option removed.
-- **v2.2**: optional `deployBackupServer` install flag + integrated restic
-  backup addon (backed up from the primary env's master).
-- **v2.0**: synchronous stretched cluster only. Write-anywhere from
-  any node in any region. Async geo-replication code removed.
-- **v1.x**: dual-model (sync OR async geo-replication). Async master/secondary
-  topology, geo-rep sessions, promoteRegion failover. Deprecated.
-
-Clusters deployed by v1.x in async mode still work but the v2.x day-2 addons
-won't manage them (they assume sync). Redeploy with v2.x for the new feature set.
+The version history is in [CHANGELOG.md](CHANGELOG.md). Releases are tagged `vX.Y`
+on the main branch.
 
 ---
 
 ## License & contribution
 
-MIT. PRs welcome. File issues at
-<https://github.com/stackharbor-devops/glusterfs-multi-region/issues>.
+MIT, see [LICENSE](LICENSE). Bug reports, test results, ideas and pull requests are
+welcome: see [CONTRIBUTING.md](CONTRIBUTING.md) for how to test a change on a branch.
+File bugs and feature requests at
+<https://github.com/stackharbor-devops/glusterfs-multi-region/issues>. Report security
+problems privately, as described in [SECURITY.md](SECURITY.md).
