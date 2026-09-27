@@ -28,10 +28,12 @@ globals:
 
 onInstall:
   - setupFirewall
+  - pinBrickPortRange
   - prepNodesForSync
 
 onAfterStart:
   - cmd[storage]: mount -a; exportfs -ra;
+    user: root
 
 # In-region scale-out is intentionally NOT handled here. Sync stretched cluster
 # scaling needs one new node per region in lock-step (so the brick count stays
@@ -45,18 +47,34 @@ onBeforeScaleIn[storage]:
       message: |-
         Automatic scale-in is disabled in the synchronous stretched cluster: removing bricks without first migrating their data risks data loss. To shrink capacity, use the controlled procedure (gluster volume remove-brick <vol> <bricks...> start -> status -> commit) from the primary env's "Manage Cluster" -> custom command, then peer-detach.
 
+# A redeploy replaces /etc/glusterfs/glusterd.vol with the new image's copy, so
+# the brick port range is pinned again before glusterd starts. Volume options
+# (network.ping-timeout among them) are NOT set here: they live in
+# /var/lib/glusterd on every peer, which survives the redeploy, and belong to
+# syncClusterManager (install) or the operator.
+# A redeploy keeps the paths in /etc/jelastic/redeploy.conf and the image
+# volumes (/data is one), and the new image leaves glusterd disabled. The
+# storage image ships no /etc/fstab and fstab is on no preserved list, so the
+# node normally comes back with a plain local mount point; if fstab was kept
+# (added to redeploy.conf), systemd arms the automount at boot and a listing of
+# the mount point is a listing of the VOLUME. The old mountDirectoryToVolume
+# listed and moved `<path>/*` to /tmp and back, i.e. the whole replicated volume
+# out of every region and back (files lost or truncated in every region when
+# the local disk filled up or the run was cut short - reproduced).
+# restoreClientMount decides from /proc/self/mountinfo,
+# never moves or deletes anything on the volume and sets up the mount exactly
+# like the install (see there).
 onAfterRedeployContainer[storage]:
+  - pinBrickPortRange
   - cmd[storage]: /bin/systemctl start glusterd.service && /bin/systemctl enable glusterd.service;
+    user: root
   - cmd[${nodes.storage.master.id}]: set -o pipefail; gluster --log-level=TRACE --log-file=/dev/stdout volume start ${globals.replicatedVolume} force | tee -a /var/log/glusterfs/glusterd.log;
-  - cmd[${nodes.storage.master.id}]: gluster volume set ${globals.replicatedVolume} network.ping-timeout 10;
+    user: root
   - getnodes: ${event.response.responses.join(nodeid,)}
   - forEach(node:response.nodes):
-      - mountDirectoryToVolume:
-          id: ${@node.id}
-          address: ${@node.address}
-      - addAutoMount:
-          id: ${@node.id}
-          address: ${@node.address}
+      - restoreClientMount:
+          nodeIds: ${@node.id}
+          from: onAfterRedeployContainer
 
 onAfterClone:
   if ('${fn.compareEngine(6.1.1):}' < 0):
@@ -67,14 +85,19 @@ onAfterCloneAllNodes:
   reinstallGlusterFSLogic:
     clonedEnv: ${event.params.targetenv}
 
+# Migration takes down each node's client mount of the volume and puts it back
+# afterwards. Bricks (/glustervolume) and glusterd state are never touched.
+# The mount point is removed only when nothing is mounted there any more: an
+# `rm -rf` through the automount would mount the volume and delete the
+# replicated data in EVERY region (reproduced when stopping the automount
+# fails).
 onBeforeMigrate:
-  - umountFuze: ${nodes.storage.join(id,)}
-  - cmd[storage]: sed -i '/glusterfs/d' /etc/fstab; rm -rf ${globals.replicatedPath}
+  - releaseClientMount
 
 onAfterMigrate:
-  # Volume rebuild after a container migration is owned by syncClusterManager;
-  # nothing to do here (the platform will re-mount via the fstab entry).
-  - cmd[storage]: mount -a; exportfs -ra;
+  - restoreClientMount:
+      nodeIds: ${nodes.storage.join(id,)}
+      from: onAfterMigrate
 
 onBeforeStop:
   - umountFuze: ${nodes.storage.join(id,)}
@@ -87,6 +110,11 @@ actions:
   # Best-effort: the firewall API takes ONE port or ONE range per rule (no comma
   # lists), so add the GlusterFS/SSH inbound ports as separate rules. Never fail
   # the install on a firewall hiccup - the cluster is what matters.
+  # Brick ports: GlusterFS >= 10 gives each brick a RANDOM free port between
+  # base-port (49152) and max-port on every start, so the rule must span the
+  # whole range. 50999 is the max-port of the Certified Storage images (which
+  # also expose 49152-50999) and is pinned by pinBrickPortRange - keep the two
+  # in sync.
   setupFirewall:
     - script: |
         var envName = "${env.name}";
@@ -95,7 +123,7 @@ actions:
             var q = jelastic.billing.account.GetOwnerQuotas(appid, session, "firewall.enabled");
             var enabled = (q && q.array && q.array[0]) ? q.array[0].value : 0;
             if (enabled) {
-              var inbound = [["glusterfs-ssh", "22"], ["glusterfs-mgmt", "24007-24008"], ["glusterfs-bricks", "49152-49251"]];
+              var inbound = [["glusterfs-ssh", "22"], ["glusterfs-mgmt", "24007-24008"], ["glusterfs-bricks", "49152-50999"]];
               for (var i = 0; i < inbound.length; i++)
                 jelastic.environment.security.AddRule(envName, session,
                   { direction: "INPUT", name: inbound[i][0], protocol: "TCP", ports: inbound[i][1], src: "ALL", priority: 1080, action: "ALLOW" }, "storage");
@@ -105,6 +133,26 @@ actions:
           }
         } catch (e) { /* firewall is best-effort - never block the install */ }
         return { result: 0 };
+
+  # Keep every brick port inside the range setupFirewall opens (49152-50999):
+  # pin max-port 50999 in glusterd.vol on every storage node. Already the value
+  # on the Certified Storage images, so normally nothing changes; this makes the
+  # package own the invariant. glusterd is restarted only if the file changed
+  # while it was running (bricks keep running and keep their ports). Never fails.
+  pinBrickPortRange:
+    - cmd[storage]: |-
+        F=/etc/glusterfs/glusterd.vol
+        [ -f "$F" ] || exit 0
+        grep -qE '^[[:space:]]*option[[:space:]]+max-port[[:space:]]+50999[[:space:]]*$' "$F" && exit 0
+        if grep -qE '^[[:space:]]*option[[:space:]]+max-port' "$F"; then
+          sed -i -re 's/^[[:space:]]*option[[:space:]]+max-port.*/    option max-port 50999/' "$F"
+        else
+          sed -i -re 's/^end-volume/    option max-port 50999\nend-volume/' "$F"
+        fi
+        echo "$(hostname): glusterd.vol max-port pinned to 50999"
+        if systemctl is-active --quiet glusterd.service; then systemctl restart glusterd.service; fi
+        exit 0
+      user: root
 
   # sync mode: enable glusterd + create brick/mount dirs on every node in this
   # region. The cross-region stretched volume is created by syncClusterManager.
@@ -120,23 +168,155 @@ actions:
         sed -i '/^$/d' /etc/exports;
       user: root
 
-  mountDirectoryToVolume:
-    - cmd[${this.id}]: |-
-        dataBackupDir=$(mktemp -d)
-        [ -n "$(ls -A /${globals.replicatedPath})" ] && { shopt -s dotglob; mv ${globals.replicatedPath}/* ${dataBackupDir}/; shopt -u dotglob; };
-        mount.glusterfs localhost:/${globals.replicatedVolume} ${globals.replicatedPath}
-        chmod 777 ${globals.replicatedPath}
-        [ -n "$(ls -A /${dataBackupDir})" ] && { shopt -s dotglob; mv ${dataBackupDir}/* ${globals.replicatedPath}/; shopt -u dotglob; };
-        rm -rf ${dataBackupDir}
-      user: root
-
-  addAutoMount:
-    - cmd[${this.id}]: |-
-        sed -i '/glusterfs/d' /etc/fstab;
-        echo "localhost:/${globals.replicatedVolume}  ${globals.replicatedPath}   glusterfs   defaults,_netdev,noauto,x-systemd.automount  0 0" >> /etc/fstab;
-
   umountFuze:
     - cmd[${this}]: systemctl stop $(systemd-escape -p --suffix=automount ${globals.replicatedPath}); umount -l ${globals.replicatedPath} || true;
+      user: root
+
+  # onBeforeMigrate, on every storage node: stop the automount, drop the fstab
+  # line and reload systemd (so nothing can re-arm the automount), lazily
+  # unmount everything stacked on the mount point, then remove the now-local
+  # mount point directory. Mounts are read from /proc/self/mountinfo, which does
+  # not trigger the automount. The directory is deleted only if nothing is
+  # mounted at or below it; it is first renamed (rename fails on a mount
+  # point), checked again, and removed with --one-file-system. Otherwise it is
+  # left alone. Never fails, so it cannot block the migration.
+  releaseClientMount:
+    - cmd[storage]: |-
+        P=${globals.replicatedPath}
+        P=$(printf '%s' "$P" | sed 's#/*$##')
+        TAG="[onBeforeMigrate $(hostname)]"
+        case "$P" in /?*) ;; *) echo "$TAG replicatedPath '$P' is not a directory below / - nothing done"; exit 0 ;; esac
+        UNIT=$(systemd-escape -p --suffix=automount "$P")
+        mnts() { awk -v p="$1" '$5 == p || index($5, p "/") == 1 { split($0, a, " - "); split(a[2], b, " "); printf "%s(%s) ", $5, b[1] }' /proc/self/mountinfo; }
+        at_p() { awk -v p="$P" '$5 == p' /proc/self/mountinfo | grep -c .; }
+        topfs() { awk -v p="$P" '$5 == p { split($0, a, " - "); split(a[2], b, " "); print b[1] }' /proc/self/mountinfo | tail -n 1; }
+        echo "$TAG mounted at $P before: $(mnts "$P")"
+        if timeout 60 systemctl stop "$UNIT" >/dev/null 2>&1; then echo "$TAG stopped $UNIT"; else echo "$TAG could not stop $UNIT (not loaded, refused or timed out)"; fi
+        sed -i '/glusterfs/d' /etc/fstab && echo "$TAG removed the glusterfs line from /etc/fstab"
+        timeout 60 systemctl daemon-reload && echo "$TAG reloaded systemd (the fstab automount unit is gone)"
+        echo "$TAG mounted at $P now: $(mnts "$P")"
+        i=0
+        while [ "$(at_p)" -gt 0 ] && [ "$i" -lt 10 ]; do
+          i=$((i+1))
+          timeout 30 systemctl stop "$UNIT" >/dev/null 2>&1
+          T=$(topfs)
+          [ -n "$T" ] || { echo "$TAG pass $i: stopping $UNIT unmounted $P"; break; }
+          if umount -l "$P" 2>/dev/null; then echo "$TAG pass $i: lazily unmounted $T at $P"; else sleep 1; fi
+        done
+        LEFT=$(mnts "$P")
+        if [ -n "$LEFT" ]; then echo "$TAG REFUSED to remove $P - still mounted: $LEFT- nothing deleted"; exit 0; fi
+        echo "$TAG nothing mounted at or below $P"
+        [ -e "$P" ] || { echo "$TAG $P does not exist - nothing to remove"; exit 0; }
+        if [ "$(stat -c %d "$P")" != "$(stat -c %d "$(dirname "$P")")" ]; then echo "$TAG REFUSED to remove $P - it is on another device than its parent - nothing deleted"; exit 0; fi
+        GONE="$P.premigrate.$$"
+        if ! mv -T "$P" "$GONE" 2>/dev/null; then echo "$TAG REFUSED to remove $P - it could not be renamed (mounted again?) - nothing deleted"; exit 0; fi
+        LEFT=$(mnts "$GONE")
+        if [ -n "$LEFT" ]; then echo "$TAG REFUSED to remove $GONE - mounted: $LEFT- nothing deleted"; exit 0; fi
+        N=$(find "$GONE" -xdev -mindepth 1 2>/dev/null | wc -l)
+        rm -rf --one-file-system -- "$GONE" && echo "$TAG removed the local mount point directory $P ($N local entries on the node's own disk; the volume was not mounted)"
+        exit 0
+      user: root
+
+  # Put the volume's client mount back on the nodes in nodeIds (comma-separated
+  # ids): after a redeploy on the redeployed nodes, after a migration on every
+  # node. Set up exactly like the install: the fstab line as the install writes
+  # it, the systemd automount, the mount itself (fuse.glusterfs on top in
+  # mountinfo, and readable), chmod 777, then the NFS exports. glusterd is
+  # started if it is not running; bricks are not touched.
+  # Nothing on the volume is ever moved or deleted. What is at the mount point
+  # is read from /proc/self/mountinfo (which does not trigger the automount),
+  # never by listing the path - listing an armed automount mounts the volume,
+  # and the old redeploy handler then moved the whole volume to local disk:
+  #  - the volume, or an automount: nothing under it is touched;
+  #  - a local directory (nothing mounted at or below it, on its parent's
+  #    device): if it has content (files written while the volume was not
+  #    mounted), the directory is renamed to <path>.local-<time> (same disk, and
+  #    the kernel refuses to rename a mount point), the volume is mounted on a
+  #    fresh mount point, and each set-aside entry whose name is not on the
+  #    volume yet is moved in, never overwriting. <path>.local-<time> is removed
+  #    only once empty; otherwise it is kept and reported;
+  #  - anything else: nothing is moved or mounted, and the step fails.
+  # Fails visibly if the volume does not mount; the exports are refreshed only
+  # once it is mounted. Does nothing unless it runs as root.
+  restoreClientMount:
+    - cmd[${this.nodeIds}]: |-
+        P=${globals.replicatedPath}
+        P=$(printf '%s' "$P" | sed 's#/*$##')
+        V=${globals.replicatedVolume}
+        TAG="[${this.from} $(hostname)]"
+        case "$P" in /?*) ;; *) echo "$TAG replicatedPath '$P' is not a directory below / - nothing done"; exit 0 ;; esac
+        [ "$(id -u)" = 0 ] || { echo "$TAG ERROR: not running as root - nothing done"; exit 1; }
+        UNIT=$(systemd-escape -p --suffix=automount "$P")
+        mnts() { awk -v p="$1" '$5 == p || index($5, p "/") == 1 { split($0, a, " - "); split(a[2], b, " "); printf "%s(%s) ", $5, b[1] }' /proc/self/mountinfo; }
+        top() { awk -v p="$P" '$5 == p { split($0, a, " - "); split(a[2], b, " "); m[$1] = b[1] " " b[2]; up[$2] = 1 } END { for (i in m) if (!(i in up)) print m[i] }' /proc/self/mountinfo | tail -n 1; }
+        topfs() { top | cut -d' ' -f1; }
+        topsrc() { top | cut -d' ' -f2; }
+        HOLD=""
+        T=$(topfs)
+        echo "$TAG mounted at $P: $(mnts "$P")"
+        case "$T" in
+          fuse.glusterfs)
+            case "$(topsrc)" in
+              *":/$V"|*":$V") echo "$TAG the volume is already mounted at $P - nothing under it is touched" ;;
+              *) echo "$TAG ERROR: $(topsrc) is mounted at $P, not the volume $V - nothing done"; exit 1 ;;
+            esac ;;
+          autofs) echo "$TAG $P is an automount - nothing under it is touched" ;;
+          "")
+            if [ -n "$(mnts "$P")" ]; then echo "$TAG ERROR: $P has mounts below it: $(mnts "$P")- nothing moved or mounted"; exit 1; fi
+            if [ -L "$P" ] || { [ -e "$P" ] && [ ! -d "$P" ]; }; then echo "$TAG ERROR: $P is not a directory - nothing done"; exit 1; fi
+            mkdir -p "$P"
+            if [ "$(stat -c %d "$P")" != "$(stat -c %d "$(dirname "$P")")" ]; then echo "$TAG ERROR: $P is on another device than its parent - nothing moved or mounted"; exit 1; fi
+            if [ -n "$(ls -A "$P")" ]; then
+              HOLD="$P.local-$(date +%Y%m%d-%H%M%S)"
+              [ -e "$HOLD" ] && HOLD="$HOLD-$$"
+              if ! mv -T "$P" "$HOLD"; then echo "$TAG ERROR: could not set the local content of $P aside (mounted meanwhile?) - nothing moved or mounted"; exit 1; fi
+              if [ -n "$(mnts "$HOLD")" ]; then echo "$TAG ERROR: $HOLD has mounts: $(mnts "$HOLD")- left as it is, nothing mounted"; exit 1; fi
+              mkdir "$P" && chmod --reference="$HOLD" "$P" && chown --reference="$HOLD" "$P"
+              echo "$TAG $P was a local directory with $(ls -A "$HOLD" | wc -l) entries on the node's own disk, not on the volume - set aside in $HOLD"
+            else
+              echo "$TAG $P is an empty local directory"
+            fi ;;
+          *) echo "$TAG ERROR: a $T filesystem ($(topsrc)) is mounted at $P, not the volume - nothing moved or mounted"; exit 1 ;;
+        esac
+        systemctl is-active --quiet glusterd.service || { timeout 120 systemctl start glusterd.service && echo "$TAG started glusterd" || echo "$TAG WARNING: glusterd did not start"; }
+        RC=0
+        LINE="localhost:/${globals.replicatedVolume}  ${globals.replicatedPath}   glusterfs   defaults,_netdev,noauto,x-systemd.automount  0 0"
+        sed -i '/glusterfs/d' /etc/fstab 2>/dev/null
+        echo "$LINE" >> /etc/fstab
+        if grep -qxF "$LINE" /etc/fstab; then echo "$TAG wrote the fstab line: $LINE"; else echo "$TAG ERROR: could not write the fstab line to /etc/fstab"; RC=1; fi
+        timeout 60 systemctl daemon-reload
+        if [ "$(topfs)" != "fuse.glusterfs" ]; then timeout 60 systemctl start "$UNIT" && echo "$TAG started $UNIT"; fi
+        OK=""
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+          timeout 10 stat "$P/." >/dev/null 2>&1
+          if [ "$(topfs)" = "fuse.glusterfs" ] && timeout 10 ls -A "$P/." >/dev/null 2>&1; then
+            sleep 2
+            [ "$(topfs)" = "fuse.glusterfs" ] && timeout 10 stat -f "$P/." >/dev/null 2>&1 && { OK=1; break; }
+          fi
+          sleep 5
+        done
+        if [ -z "$OK" ]; then
+          echo "$TAG ERROR: the volume is not mounted at $P (top mount: '$(topfs)'); NFS exports not refreshed. Check 'gluster volume status' and 'systemctl status $UNIT'."
+          [ -z "$HOLD" ] || echo "$TAG the local content of $P is kept in $HOLD"
+          exit 1
+        fi
+        chmod 777 "$P"
+        echo "$TAG $P is mounted (fuse.glusterfs) and readable"
+        if exportfs -ra; then echo "$TAG re-exported: $(exportfs | tr -s ' \t\n' ' ')"; else echo "$TAG WARNING: exportfs -ra reported errors (above)"; RC=1; fi
+        if [ -n "$HOLD" ]; then
+          shopt -s dotglob nullglob
+          for F in "$HOLD"/*; do
+            N=$(basename "$F")
+            if [ -e "$P/$N" ] || [ -L "$P/$N" ]; then continue; fi
+            [ "$(topfs)" = "fuse.glusterfs" ] || break
+            mv -n -T "$F" "$P/$N" && echo "$TAG moved the local $N into the volume"
+          done
+          shopt -u dotglob nullglob
+          if rmdir "$HOLD" 2>/dev/null; then echo "$TAG all local content of $P is on the volume now - removed the empty $HOLD"
+          else echo "$TAG WARNING: kept on the node's own disk in $HOLD (the name is already on the volume, or it could not be moved): $(ls -A "$HOLD" | tr '\n' ' ')- merge by hand"; fi
+        fi
+        exit $RC
+      user: root
 
   reinstallGlusterFSLogic:
     install:

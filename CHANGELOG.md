@@ -3,6 +3,33 @@
 What changed in each version of the package, newest first. Releases are tagged `vX.Y`
 on the main branch.
 
+## 3.1.1 - Unreleased
+
+Safety fixes in the region environments' event handlers (`scripts/cluster-logic.jps`).
+
+- **Migrate could delete the whole volume.** Before a region environment was migrated,
+  the handler ran a recursive delete on the volume's mount point. If the automount was
+  still active, the delete went through the mount and removed the replicated data in
+  every region (reproduced in a three-region test). The handler now removes only an
+  empty local directory, after proving nothing is mounted there. After the migration
+  it restores the node's mount and NFS export, which the old handler never did.
+- **Redeploy could move the volume onto one node's disk.** After a storage-node
+  redeploy, the handler moved the mount point's contents aside before mounting. If the
+  volume was already mounted there, that moved the whole volume out of every region and
+  back. It now decides from the mount table, never moves volume data, and only sets
+  genuinely local leftovers aside on the same disk.
+- **Firewall range for bricks widened to 49152-50999.** GlusterFS 10 and later pick a
+  random brick port in that range on every start; the old rule covered about 5% of it.
+  Clusters worked only because the storage image's default rules allow the range. The
+  install also pins `max-port 50999` in `glusterd.vol`.
+- **Redeploy no longer resets `network.ping-timeout` to 10.** The install value 30 is
+  kept; 10 caused needless disconnects during short network stalls between regions.
+- **Existing clusters keep the old handlers** until the region environments are
+  reinstalled. Until then: do not use Migrate on a region environment (use Add Region
+  and Forget Region to move a region); before redeploying a storage node, check that
+  `grep fstab /etc/jelastic/redeploy.conf` prints nothing; and after any storage
+  redeploy, run `gluster volume set data network.ping-timeout 30`.
+
 ## [3.1] - 2026-09-20
 
 - **Manage Cluster:** the **Run** button is now enabled for the pre-selected default

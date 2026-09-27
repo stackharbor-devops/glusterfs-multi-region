@@ -27,10 +27,9 @@ GHA = os.environ.get("GITHUB_ACTIONS") == "true"
 MAIN_BASE = "https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main"
 # Real JPS placeholders. Anything else in ${...} inside a cmd body is a shell variable.
 PLACEHOLDER = re.compile(r"(globals|settings|env|nodes|this|baseUrl|user|event|response|fn|targetNodes|app)\b")
-# Known cases, keyed by (file, variable). dataBackupDir comes from the vendor GlusterFS
-# package (the platform leaves that unknown name untouched). SNAP is in the v1 backup
-# add-on, which backup add-on v2 (package v3.2) replaces - drop it once v3.2 is merged.
-ALLOWED_SHELL_VARS = {("scripts/cluster-logic.jps", "dataBackupDir"), ("addons/backup.jps", "SNAP")}
+# Known case, keyed by (file, variable): SNAP is in the v1 backup add-on, which backup
+# add-on v2 (package v3.2) replaces - drop it once v3.2 is merged.
+ALLOWED_SHELL_VARS = {("addons/backup.jps", "SNAP")}
 
 errors = 0
 warnings = 0
