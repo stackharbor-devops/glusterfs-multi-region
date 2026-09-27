@@ -42,7 +42,8 @@ to every other region. Repository: <https://github.com/stackharbor-devops/gluste
   installed on the client environment.
 - **Optional backup:** at install you can deploy a backup-storage node inside one
   of the cluster regions; scheduled restic backups then run from a single
-  secondary node in that same region.
+  secondary node in that same region, visible in the Tasks log. The backup
+  add-on can be uninstalled and reinstalled without touching the cluster.
 
 ---
 
@@ -306,10 +307,16 @@ Import → URL: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-m
 ```
 Run against the **primary env** (the one with `-1` suffix). Pick a new region in
 the dialog. The addon:
-1. Creates a new regional env at `<prefix>-<next-index>` with `nodesPerRegion`
-   nodes, pinned to the chosen region.
-2. Runs `syncClusterManager` with `action=addRegion` — peer-probes the new node(s),
-   `add-brick replica N+1`, mounts the volume locally, re-hardens `auth.allow`.
+1. Reads the live volume: the new region gets as many nodes as the volume has
+   bricks per region (`Number of Bricks: D x R` → D; a volume reduced to a
+   single region is replica 1 and shows `Number of Bricks: N` → N).
+2. Checks that every `<prefix>-N` environment is a region of the volume (their
+   number equals the replica count) and stops before creating anything if not —
+   typically a region removed with *Forget Region* whose environment was kept.
+3. Creates a new regional env at `<prefix>-<next-index>` with that many nodes,
+   pinned to the chosen region.
+4. Runs `syncClusterManager` with `action=addRegion` — peer-probes the new node(s),
+   `add-brick replica N+1`, mounts the volume locally.
 
 **Note:** keep your region count odd (3, 5, 7) for split-brain protection.
 Adding a single region temporarily makes it even — fine if transitional.
@@ -322,9 +329,14 @@ Import → URL: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-m
 Run against the **primary env**. Pick the region to remove; optionally check
 "Also delete the environment". The addon runs `syncClusterManager` with
 `action=removeRegion` — `remove-brick replica N-1 force`, peer-detach, optional
-env delete.
+env delete. The environment is deleted only after the volume's brick list was
+read and holds none of its nodes; if the volume cannot be read (glusterd
+stopped, wrong volume name), it is kept and the error says why.
 
-Combine forget + add to migrate the cluster off a bad region.
+Combine forget + add to migrate the cluster off a bad region — also down to a
+single remaining region, which Add Region can grow again. Tick "Also delete the
+environment" (or delete it afterwards): Add Region refuses while a forgotten
+region's environment still exists, because it still counts as a region.
 
 ### Add capacity (slicing)
 
@@ -347,36 +359,121 @@ region** — which must be one of your selected cluster regions. The orchestrato
 then:
 
 1. Deploys a Jelastic **backup-storage** env (`<envName>-bkp`) inside that region.
-2. Installs the **GlusterFS Backup/Restore** addon onto that region's cluster env.
-3. The addon picks **one secondary storage node** in that region (the lowest-id
-   non-master node; it falls back to the region master only if the region has a
-   single node) and configures scheduled `restic` backups there.
+2. Installs the **GlusterFS Backup/Restore** add-on on the storage layer of that
+   region's cluster env, scheduled hourly, keeping 24 snapshots.
 
-Only that one node backs up. Because the volume is synchronously replicated, one
-node holds the whole dataset — so a single in-region backup captures everything,
-while leaving the region master unburdened and keeping the NFS write path
-intra-region. Example: 3 regions × 3 nodes = 9 nodes holding identical data; if
-the backup storage is in region B, exactly one secondary node in region B runs
-the backup.
+Backups run from **one secondary storage node** of that region (the lowest-id
+running non-master node; the master only when no other storage node of the
+region is running, for example in a single-node region).
+Because the volume is synchronously replicated, one node holds the whole
+dataset — so a single in-region backup captures everything, while leaving the
+region master unburdened and keeping the NFS write path intra-region. Example:
+3 regions × 3 nodes = 9 nodes holding identical data; if the backup storage is
+in region B, exactly one secondary node in region B runs the backup.
+Install/**Configure** picks that node and every run stays on it (its lock,
+queue and history live there): while it is stopped, runs fail loudly, and
+**Configure → Save** moves backups to another running node. Only if the node
+no longer exists (scaled in) do runs move on their own, to the node the rule
+above picks.
 
-After install you'll see a **GlusterFS Backup/Restore** card on that env's
-storage node-group with four buttons:
+**The card** (storage layer → Add-Ons → **GlusterFS Backup/Restore**):
 
-| Button | What it does |
+| | What it does |
 |---|---|
-| Backup | Runs the restic backup once, now (on the backup node). |
-| Config | Schedule (every 1 min ⚠ / 5 / 10 min / 1 / 2 / 3 / 6 / 12 / 24 h, or custom day+time, or raw cron), backup-storage env, source path (default `/data`), retention count, always-unmount toggle. |
-| Restore | Lists snapshots; pick one + a restore target. Restores in place; since the volume is sync-replicated, the restore propagates to every region. |
-| Verify | `restic check` on the repo. |
+| **Backup Now** | Takes a snapshot now. If a backup is already running, this one is **queued** and starts as soon as it finishes. |
+| **Configure** | Schedule (pre-defined, custom days + time `HH:MM` in a time zone, or raw cron — the platform scheduler runs in UTC), backup storage env, volume mount path (`/data`), snapshots to keep, e-mail on failure. Checks the node and the backup storage before saving. If the current configuration cannot be read, the form says so and pre-selects no storage instead of showing defaults as if they were in force. If only the list of backup storages cannot be read, it says so and keeps the configured storage. |
+| **Restore** | Pick a snapshot and a target: the volume mount itself (in-place, replicates to every region) or a directory inside it (e.g. `/data/restore-check`) to inspect first. A restore is **never queued**: if another job is running it is not started, so it can never overwrite newer data unattended later. |
+| **Verify** | `restic check`, reading back 5% of the stored data. |
+| ⋯ → **Backup Status** | What is running or queued, the last result of each job, snapshot count, restic version. |
+| ⋯ → **Delete All Backups** | Deletes every snapshot of this cluster from the backup storage (type the env name to confirm). The cluster is not touched. |
+| ⋯ → **Uninstall** | Removes the schedule, the runner and the mount. The cluster **and the backup repository** are kept — install the add-on again and backups continue in the same repository. Refused while a restore is running (it would leave the volume half-restored). |
 
-**Backend:** restic over an NFS mount to the backup-storage env. Repo path
-`/data/<envName>/`, password = the env name (so the storage server's
-`getBackups.sh <envName>` lists them). Sub-hourly schedules use `flock` to
-prevent overlapping runs. This does **not** replace Jelastic VAP's node-level
-snapshots — it preserves the GlusterFS volume's *data* state specifically.
+**How it runs.** Backups are started by the **platform scheduler** — a per-env
+platform script `<env>-gfs-backup` — so every run shows in the **Tasks log** as
+*Executing command in the … (nodeXXXX) node*; expand it for the snapshot
+details. The work itself runs in a detached job on the node under one lock:
 
-You can also add it later by importing `addons/backup.jps` onto the cluster env
-in the region where your backup-storage env lives.
+- A scheduled backup that finds another job running is **skipped** with a
+  message (never queued, never overlapping).
+- Once a job has held the lock for about 24 h, scheduled backups check its
+  progress: a heartbeat samples the job's I/O and CPU every 5 minutes. A job
+  that read or wrote under 1 MiB and used under 10 s of CPU in the last 30
+  minutes, a job whose progress cannot be sampled (for example on a full disk),
+  or a lock held that long by a process that is not a backup job makes the run
+  **fail** (red entry, e-mail) instead of skipping. That happens at the first
+  scheduled run past the limit and at every run after it, whatever the schedule,
+  so a hung job cannot silently stop backups. A long job that is still working
+  is left alone.
+- A manual backup or verify **queues** behind the running one (one queued job
+  at most). Restore and Delete All Backups are never queued.
+- A job that runs longer than the platform lets a command run (about 50 min
+  for scheduled runs, 10 min for buttons) continues **in the background**; its
+  result is reported by the next run and by Backup Status. A failure in the
+  background turns the next run's Tasks entry red and sends the failure
+  e-mail — failures are never silent.
+- Runs happen on the backup node picked at Install/Configure. If that node is
+  stopped, runs fail loudly; **Configure → Save** moves backups to another
+  running storage node.
+- A custom schedule (days + time in a time zone) gets one trigger per UTC
+  offset of the zone (standard and daylight time); only the trigger nearest to
+  the configured local time runs, so there is exactly one backup per selected
+  day, also on DST switch days.
+
+**Safety rules built into the runner:** it refuses to back up when the GlusterFS
+FUSE mount is down (an empty `/data` would otherwise rotate every good snapshot
+out of retention), and refuses to write when the backup storage is not
+NFS-mounted (both mounts are automounts on Jelastic; the runner triggers them
+and checks the mount on top). Restores only into the volume mount or a
+directory inside it. A snapshot where some files could not be read is kept but
+marked *warning* and re-tagged `partial`; partial snapshots are rotated only
+among themselves, so they never push a complete snapshot out, and three partial
+backups in a row turn the run red. Restores need restic ≥ 0.17, which replaces
+symlinks it meets in the target instead of writing through them, and the
+target is resolved to make sure it stays inside the volume. Known limit: a
+client that swaps a directory for a symlink *while* a restore runs could still
+redirect it, so stop write workloads before a restore (the Restore dialog says
+so). Verify re-reads every index and tree from the backup storage. If the
+backup storage stops answering while it is still mounted, Restore, Backup
+Status, Configure and Delete All Backups report it as unreachable, never as "no
+snapshots" or "deleted", and Delete All Backups deletes nothing. A GlusterFS
+mount whose client died is refused as "does not respond".
+
+**Backend:** restic ≥ 0.16 over an NFS mount of the backup-storage env's `/data`
+at `/opt/gfs-backup` (the platform mounts it on demand through autofs). Repository `/data/<region-env-name>/` on the storage,
+password = that env name (the Jelastic backup-storage convention, so the
+storage's `getBackups.sh <env>` lists them). One stable restic host per
+cluster; retention `forget --group-by '' --keep-last N`, applied separately to
+complete and to `partial` snapshots (so up to N of each are kept); `prune` at
+most once a day. The node-side runner (`scripts/backup/glusterfs-backup.sh`) is
+installed by Install/**Configure**, which records its checksum; runs only
+execute exactly that version. The backup node keeps its recent runner versions,
+always including the pinned one, in `/usr/local/lib/glusterfs-backup` (listed
+in `/etc/jelastic/redeploy.conf`, so a container redeploy keeps them); if the
+pinned version is missing anyway, a run downloads that exact version while the
+repository still publishes it, and otherwise fails loudly until **Configure →
+Save**. So a later change in this repository reaches a cluster only when you
+click **Configure → Save**, and a failed Configure never leaves the schedule on
+a different version. This does **not** replace Jelastic VAP's node-level
+snapshots — it preserves the GlusterFS volume's *data* state.
+
+**Add it later, reinstall it, or move to a new backup storage** — none of this
+touches the cluster:
+
+1. If you need a backup storage, install **Backup Storage** from the
+   Marketplace in the same region as one of your cluster envs.
+2. Import `https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main/addons/backup.jps`
+   and pick that region's cluster env and its **storage** layer.
+3. To switch storage later, use **Configure**. To start from an empty
+   repository, use **Delete All Backups** (or delete the storage env and
+   create a new one, then pick it in Configure).
+
+**Upgrading from the previous version** (a card without **Uninstall**, backups
+from the node's crontab, invisible in Tasks): import the new `addons/backup.jps`
+on the same env's storage layer as above. It removes the old version — the card,
+its crontab entry, scripts and `/opt/backup` mount — and continues in the same
+repository, so existing snapshots stay restorable. If the old card could not be
+removed automatically, the install message says so; it no longer runs anything,
+so just avoid its buttons.
 
 ---
 
@@ -411,7 +508,7 @@ local storage; no WAN cost.
 | More capacity in existing regions | Scale each region by the same N nodes, run `addCapacitySlice`. |
 | Remove a region (decommission, failure) | Use `forgetRegion`. Add a fresh region after if you want to keep N odd. |
 | Restrict who can mount the volume | Tighten the storage firewall's inbound rules (TCP `24007`, `49152–49251`) — the volume itself stays `auth.allow '*'` |
-| Add scheduled backups after deploy | Import `addons/backup.jps` onto the cluster env in the region where a backup-storage env lives (or redeploy with "Deploy a backup server" ticked). |
+| Add scheduled backups after deploy, or reinstall them | Import `addons/backup.jps` on the **storage** layer of the cluster env in the region where a backup-storage env lives. The cluster is not touched. |
 
 ---
 
@@ -440,6 +537,38 @@ IPs there instead, reset it (*Manage Cluster → Custom CLI command*):
 `gluster volume set data auth.allow '*'`. One volume spans every region, so a
 per-environment allow-list would lock out clients that mounted via another
 region.
+
+### A backup shows as skipped, queued or "still running in the background"
+Only one backup job runs at a time. A scheduled backup that finds another job
+running is skipped. **Backup Now** and **Verify** queue behind it (one queued
+job at most). **Restore** and **Delete All Backups** are not started; run them
+again when **Backup Status** shows no running job. **Backup Status** (card menu)
+shows what is running (with its run id), since when, and the last result of
+each job. A running job's live log is
+`/var/lib/glusterfs-backup/runs/<run id>.log` on the backup node; each finished
+run is appended to `/var/log/glusterfs-backup.log`.
+
+### A scheduled backup's Tasks entry is red
+Expand the entry: the output ends with `GFSB_MESSAGE=` and the reason (storage
+not mounted, GlusterFS mount down, restic error, or an earlier background run
+that failed). With **E-mail me when a scheduled backup fails** on, the same text
+is e-mailed to the environment owner.
+
+### Add Region / Forget Region / Add Capacity Slice complained about "persisted GlusterFS globals"
+The previous version of the backup add-on overwrote the cluster parameters
+stored on the primary env when the backup storage was in the first region.
+These add-ons now rebuild them from the live cluster automatically; the error
+only remains if they are run against an env other than the primary (`-1`).
+
+### Add Region stopped: "has replica R ... but M environment(s) named ... exist"
+Add Region sizes the new replica from the `<prefix>-N` environments, so each of
+them must be a region of the volume. More environments than the replica count:
+a region removed with *Forget Region* without "Also delete the environment" (or
+left over from a failed Add Region) still exists — delete it and run Add Region
+again. Fewer: the volume still holds bricks of a region whose environment was
+deleted without *Forget Region* — remove those bricks first
+(`gluster volume remove-brick data replica <R-1> <ip>:/glustervolume ... force`).
+Nothing is created before this check passes.
 
 ### Writes hang / time out
 - Check `Cluster Status` → look at `Network ping-timeout`. WAN latency higher
@@ -470,6 +599,12 @@ odd number, or accept the reduced fault tolerance for the transitional period.
 manifest.jps                       install orchestrator (regionlist + topology + volume params)
 scripts/
   getClusterEnvs.js                discover sibling regional envs by name prefix
+  loadClusterGlobals.js            day-2 add-ons: load (or rebuild) the persisted cluster parameters
+  backup/manage.js                 backup add-on: install / Configure / uninstall logic
+  backup/backup-task.js            backup add-on: per-env platform script run by the scheduler + buttons
+  backup/glusterfs-backup.sh       backup add-on: node-side runner (restic, locking, background jobs)
+  backup/settings-form.js          backup add-on: install + Configure form
+  backup/restore-form.js           backup add-on: Restore form (snapshot list)
   storage-region.jps               per-region Certified-Storage env (install)
   cluster-logic.jps                in-region node prep (firewall, glusterd, dirs) — permanent addon
   syncClusterManager.jps           cross-region stretched-volume manager — action-dispatch
@@ -483,6 +618,7 @@ addons/
   addCapacitySlice.jps             day-2: grow capacity (sets +1; replica unchanged)
   backup.jps                       optional: scheduled restic backups from one
                                     secondary node in the backup-storage region
+                                    (uninstallable card on the storage layer)
   client.jps                       fallback, import onto an APP env: Gluster-native FUSE
                                     mount of the volume by region (backup-volfile-servers)
 success/success.md                 post-install summary shown to the user

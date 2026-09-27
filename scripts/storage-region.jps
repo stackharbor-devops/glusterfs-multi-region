@@ -2,7 +2,7 @@ type: install
 version: 1.0
 id: glusterfs-storage-region
 name: GlusterFS Storage Region
-baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
+baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/backup-v2
 description:
   short: A single-region GlusterFS cluster on Jelastic Certified Storage nodes.
 

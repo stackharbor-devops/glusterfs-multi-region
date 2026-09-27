@@ -2,7 +2,7 @@ type: update
 version: 1.8
 id: glusterfs-management
 name: GlusterFS Cluster Management
-baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/main
+baseUrl: https://raw.githubusercontent.com/stackharbor-devops/glusterfs-multi-region/backup-v2
 description:
   short: Operational dashboard for the multi-region GlusterFS cluster.
 
