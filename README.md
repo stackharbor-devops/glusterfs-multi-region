@@ -150,9 +150,22 @@ the package is internal-only by design (simpler, cheaper, no exposed IPs).
 Set by the JPS at install via `environment.security.AddRule`, on the storage
 node group:
 - **Outbound:** ALLOW all — so nodes can always reach peers.
-- **Inbound:** ALLOW TCP `22`, `24007–24008`, `49152–49251` (GlusterFS + SSH).
+- **Inbound:** ALLOW TCP `22`, `24007–24008`, `49152–50999` (GlusterFS + SSH).
+
+`49152–50999` is the whole brick port range. GlusterFS 10 and later give each
+brick a random free port between `base-port` (49152) and `max-port` (50999, set
+in `/etc/glusterfs/glusterd.vol` by the Certified Storage image and pinned by the
+package), and a restarted brick comes back on a different port. The image
+declares the same ports, so the layer's default inbound rules normally allow
+them as well.
 
 No-op if the env firewall feature is disabled (nothing is filtered then anyway).
+Check on any storage node:
+
+```
+gluster volume status data | awk '/^Brick/{print $2, $3}'   # every port within 49152-50999
+grep -E 'base-port|max-port' /etc/glusterfs/glusterd.vol     # option max-port 50999
+```
 
 ### Access control
 
@@ -162,7 +175,12 @@ can reach the storage nodes over the platform's private network may mount it.
 Access is governed by **Jelastic network isolation** (private IPs aren't reachable
 by non-client environments) plus the **storage node-group firewall**. To restrict
 who can mount, tighten the firewall's inbound rules for TCP `24007` and
-`49152–49251` — don't rely on `auth.allow`. Inspect on any node:
+`49152–50999` — don't rely on `auth.allow`. The layer's default rules allow the
+same ports and the platform re-adds missing default rules when the firewall
+restarts, so add ALLOW rules
+for the permitted sources (every region's storage layer and the client
+environments) and a DENY rule for everyone else, both with a priority number
+below the default rules (for example 900 and 950). Inspect on any node:
 
 ```
 gluster volume info data | grep auth.allow     # expected: auth.allow: *
@@ -410,7 +428,7 @@ local storage; no WAN cost.
 | More regions (geographic coverage) | Use `addRegion`. Keep region count odd. |
 | More capacity in existing regions | Scale each region by the same N nodes, run `addCapacitySlice`. |
 | Remove a region (decommission, failure) | Use `forgetRegion`. Add a fresh region after if you want to keep N odd. |
-| Restrict who can mount the volume | Tighten the storage firewall's inbound rules (TCP `24007`, `49152–49251`) — the volume itself stays `auth.allow '*'` |
+| Restrict who can mount the volume | Tighten the storage firewall's inbound rules (TCP `24007`, `49152–50999`) — the volume itself stays `auth.allow '*'` |
 | Add scheduled backups after deploy | Import `addons/backup.jps` onto the cluster env in the region where a backup-storage env lives (or redeploy with "Deploy a backup server" ticked). |
 
 ---
@@ -430,7 +448,7 @@ dashboard after installing it; it caches environment data.
 The volume is intentionally open (`auth.allow '*'`), so gluster itself won't
 refuse the client. Check reachability instead: the client env must be able to
 reach the storage nodes' private IPs (Jelastic network isolation), and the
-storage firewall must allow TCP `24007` and `49152–49251` from it — for the
+storage firewall must allow TCP `24007` and `49152–50999` from it — for the
 nodes of **every** region, since a FUSE client talks to all bricks. Quick test
 from the client node: `nc -zv <storage-node-ip> 24007`.
 
@@ -442,12 +460,21 @@ per-environment allow-list would lock out clients that mounted via another
 region.
 
 ### Writes hang / time out
-- Check `Cluster Status` → look at `Network ping-timeout`. WAN latency higher
-  than the ping timeout will cause stalls.
-- Increase it: `Manage Cluster` → Custom CLI command:
+- Check `Cluster Status` → look at `Network ping-timeout` (30 by default). It is
+  how long clients wait for a brick that has stopped answering. When a region
+  goes silent (GRE path down, frozen node), writes in every region wait for up
+  to about twice this value, then continue on the remaining regions. A silence
+  longer than it disconnects every client from that region, and the files
+  written meanwhile are healed afterwards.
+- If the GRE path has stalls longer than 30 s and the disconnects and heals that
+  follow cost more than the waits, increase it: `Manage Cluster` → Custom CLI
+  command:
   ```
   gluster volume set data network.ping-timeout 60
   ```
+  The value is kept across redeploys. Clusters installed before this release
+  reset it to 10 whenever a storage node is redeployed; set it back to 30 after
+  a redeploy there.
 
 ### Geo-rep error in the logs
 The package no longer uses geo-replication (sync mode only since v2.0). If you

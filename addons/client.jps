@@ -196,7 +196,7 @@ actions:
           echo "OK: GlusterFS region node $H:$P (glusterd) reachable from $(hostname)"
         else
           echo "ERROR: cannot reach GlusterFS region node $H on TCP $P from $(hostname)." >&2
-          echo "This is network isolation or firewall, not gluster. Ensure this environment can reach the storage nodes' private IPs and the storage firewall allows TCP 24007 and 49152-49251 from it." >&2
+          echo "This is network isolation or firewall, not gluster. Ensure this environment can reach the storage nodes' private IPs and the storage firewall allows TCP 24007 and 49152-50999 from it." >&2
           exit 1
         fi
       user: root
