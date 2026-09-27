@@ -16,7 +16,9 @@ description:
 #   - "Heal by forgetting" if a region is down and you want to continue
 #     serving the volume from the remaining ones.
 # After forgetting, you can add a fresh region with addRegion.jps to keep
-# the cluster's region count odd (3, 5, 7).
+# the cluster's region count odd (3, 5, 7) - also when a single region is
+# left. Delete the forgotten environment first: Add Region counts every
+# <prefix>-N environment as a region and refuses while one is left over.
 # ---------------------------------------------------------------------------
 
 # Populate a dropdown of candidate secondary environments (name ends in -N, N>=2).
@@ -70,6 +72,9 @@ actions:
 
   # Never delete a region whose nodes still hold bricks of the volume (for
   # example because remove-brick was refused): that would destroy live replicas.
+  # Deletion needs POSITIVE proof: a readable brick list without any brick on
+  # the target's nodes. A volume always has at least one brick, so an empty
+  # list (glusterd down or hung, wrong volume name, no answer) refuses too.
   deleteTargetEnv:
     - script: |
         var target = "${settings.targetEnv}", master = "${globals.master_env_name}", vol = "${globals.volumeName}", ips = [], mid = null, i;
@@ -79,14 +84,25 @@ actions:
         var mi = api.env.control.GetEnvInfo(master, session);
         if (mi.result != 0) return mi;
         for (i = 0; i < (mi.nodes || []).length; i++) if (mi.nodes[i].nodeGroup == "storage" && mi.nodes[i].ismaster) mid = mi.nodes[i].id;
-        var ex = null;
+        if (!mid) return { result: 1, error: "No storage master in " + master + " to read volume " + vol + " from - " + target + " was NOT deleted." };
+        var ex = null, exErr = "";
         try {
-          ex = api.env.control.ExecCmdById(master, session, mid, toJSON([{ command: "gluster volume info " + vol + " 2>/dev/null | awk '/^Brick[0-9]+:/ {print $2}'; echo @@END" }]), true, "root");
-        } catch (e) { ex = null; }
+          // brick lines ("<host>:<path>") plus the CLI's error lines, which name why the volume could not be read
+          ex = api.env.control.ExecCmdById(master, session, mid, toJSON([{ command: "gluster volume info " + vol + " 2>&1 | awk '/^Brick[0-9]+:/ {print $2; next} /failed|does not exist|Error/ {print}'; echo @@END" }]), true, "root");
+        } catch (e) { ex = null; exErr = String(e); }
         var out = (ex && ex.responses && ex.responses.length) ? String(ex.responses[0].out || "") : "";
-        if (out.indexOf("@@END") < 0) return { result: 1, error: "Could not read volume " + vol + " to confirm that " + target + " holds no bricks - the environment was NOT deleted." };
-        for (i = 0; i < ips.length; i++) {
-          if (out.indexOf(ips[i] + ":/glustervolume") >= 0) return { result: 1, error: target + " still holds bricks of volume " + vol + " (" + ips[i] + ") - the environment was NOT deleted." };
+        var lines = out.split("\n"), bricks = [], why = [], l;
+        for (i = 0; i < lines.length; i++) {
+          l = lines[i].replace(/^\s+|\s+$/g, "");
+          if (/^\S+:\/\S*$/.test(l)) bricks.push(l); else if (l && l != "@@END") why.push(l);
+        }
+        if (out.indexOf("@@END") < 0 || !bricks.length) {
+          return { result: 1, error: "Could not read the bricks of volume " + vol + " on node " + mid + " of " + master + " (" +
+                   (why.join(" ") || exErr || (ex && ex.error) || "no brick listed") + ") to confirm that " + target + " holds none - the environment was NOT deleted." };
+        }
+        // exact host match: any brick on one of the target's nodes blocks the deletion
+        for (i = 0; i < bricks.length; i++) {
+          if (ips.indexOf(bricks[i].substring(0, bricks[i].indexOf(":/"))) >= 0) return { result: 1, error: target + " still holds brick " + bricks[i] + " of volume " + vol + " - the environment was NOT deleted." };
         }
         return { result: 0 };
     - api: env.control.DeleteEnv

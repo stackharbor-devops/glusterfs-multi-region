@@ -123,8 +123,9 @@ actions:
 
         return { result: 0, onAfterReturn: { setGlobals: {
           replicaCount: envs.length,
-          // Live bricks per region, so the persisted value (read by Add Region
-          // to size a new region) stays right after Add Capacity Slice.
+          // Storage nodes of the largest region, so the persisted value follows
+          // Add Capacity Slice. Informational: Add Region sizes a new region
+          // from the live volume's bricks per region, not from this value.
           nodesPerRegion: maxK,
           bricksOrdered: bricks.join(' '),
           allNodes: allNodes,                              // for forEach (works on arrays)

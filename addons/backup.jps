@@ -123,6 +123,10 @@ settings:
               cls: x-form-text
               width: 120
               required: true
+              # the times manage.js accepts (settings-form.js sets the same
+              # check; this one applies even if that script cannot load)
+              regex: "^([01]?[0-9]|2[0-3]):[0-5][0-9]$"
+              regexText: "A time as HH:MM on a 24-hour clock, e.g. 02:00 or 23:30."
             - type: compositefield
               name: days
               caption: Days
@@ -264,13 +268,51 @@ onInstall:
 
 # Uninstall runs inline on purpose: it must work even when the package's
 # scripts cannot be downloaded, and a failing step would make the card
-# impossible to remove. It only refuses while a restore is writing into the
-# volume. The backup repository on the backup storage is kept.
+# impossible to remove. It only refuses while a restore is, or may be (a
+# running storage node that does not answer), writing into the volume. The
+# backup repository on the backup storage is kept.
 onUninstall:
   - script: |
       var env = "${env.envName}", envAppid = "${env.appid}", name = env + "-gfs-backup", cfgStr = "", i, j, a, r, t, d, g;
       function unwrap(x) { return (x && x.response && typeof x.response === "object" && x.response.result !== undefined) ? x.response : x; }
       function evalTask(p) { try { return unwrap(jelastic.dev.scripting.Eval(appid, session, name, p)); } catch (e) { return null; } }
+
+      // Step 4 when the remove job did not run (task script missing, API
+      // error): the node cleanup inline, without any package script. The
+      // runner refuses on a node where a restore runs; that node, and a
+      // running node that does not answer, keep their backup storage mount.
+      // Without the node list nothing is touched (and nothing is refused).
+      function removeInline() {
+        var mp = "/opt/gfs-backup", kept = [], unknown = [], msg = [], info, n, x, out, mps, i, k, cmd;
+        try { mp = String(JSON.parse(cfgStr).mountPath || mp); } catch (e) {}
+        cmd = ": glusterfs-backup uninstall\n" +
+              "R=/usr/local/sbin/glusterfs-backup; if [ -x $R ]; then $R remove; fi\n" +
+              "C=/etc/jelastic/redeploy.conf; if [ ! -e $R ] && [ -f $C ]; then sed -i -e '\\#^/usr/local/sbin/glusterfs-backup$#d' " +
+              "-e '\\#^/usr/local/lib/glusterfs-backup/$#d' -e '\\#^/var/lib/glusterfs-backup/$#d' $C; fi\n" +
+              "echo GFSB_CLEANUP=done";
+        try { info = jelastic.env.control.GetEnvInfo(env, session); } catch (e) { info = null; }
+        if (!info || info.result != 0) return { result: 0, restoreRunning: false, message: "" };
+        for (i = 0; i < (info.nodes || []).length; i++) {
+          n = info.nodes[i];
+          if (String(n.nodeGroup) != "storage") continue;
+          out = "";
+          try {
+            x = jelastic.env.control.ExecCmdById(env, session, n.id, toJSON([{ command: cmd }]), true, "root");
+            if (x && x.responses && x.responses.length) out = String(x.responses[0].out || "");
+          } catch (e) { x = null; }
+          if (/GFSB_RESTORE_RUNNING=1/.test(out)) { kept.push(n.id); continue; }
+          if ((!x || x.result != 0) && !/GFSB_CLEANUP=done/.test(out) && (n.status === undefined || n.status == 1)) { unknown.push(n.id); continue; }
+          try {
+            mps = jelastic.env.file.GetMountPoints(env, session, n.id);
+            for (k = 0; mps && mps.result == 0 && k < (mps.array || []).length; k++) {
+              if (String(mps.array[k].path) == mp && String(mps.array[k].type) == "INTERNAL") jelastic.env.file.RemoveMountPointById(env, session, n.id, mp);
+            }
+          } catch (e) {}
+        }
+        if (kept.length) msg.push("A restore is still running on node " + kept.join(", ") + "; its runner and backup storage mount were left there so it can finish. If that restore is stuck, stop it on the node with '/usr/local/sbin/glusterfs-backup stop'.");
+        if (unknown.length) msg.push("Storage node " + unknown.join(", ") + " did not answer the cleanup command, so its runner and backup storage mount were left in place (a restore may be running there). If it stays unreachable, restart it.");
+        return { result: 0, restoreRunning: msg.length > 0, message: msg.join(" ") };
+      }
 
       // 1) Never stop a restore halfway (the live volume would be left partly restored).
       var probe = evalTask({ job: "probe", envName: env });
@@ -307,11 +349,13 @@ onUninstall:
       } catch (e) {}
 
       // 4) Stop jobs, remove the runner, mounts and v1 leftovers from the nodes.
-      //    A restore that started after step 1 keeps its node untouched; the
-      //    card stays so a later Uninstall removes what is left.
+      //    A restore that started after step 1, or a node that does not
+      //    answer, keeps its node untouched; the card stays so a later
+      //    Uninstall removes what is left.
       var rm = evalTask({ job: "remove", envName: env, config: cfgStr });
+      if (!rm || rm.result !== 0 || typeof rm.restoreRunning !== "boolean") rm = removeInline();
       if (rm && rm.result === 0 && rm.restoreRunning) {
-        var msg = String(rm.message) + " The backup schedule was already removed. Uninstall again once the restore has finished; that removes the rest and the add-on.";
+        var msg = String(rm.message) + " The backup schedule was already removed. Uninstall again once that restore has finished (or the node answers again); that removes the rest and the add-on.";
         return { result: 99, error: msg, message: msg, type: "error" };
       }
 

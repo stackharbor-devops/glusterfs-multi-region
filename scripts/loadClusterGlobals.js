@@ -112,13 +112,14 @@ else if (mounts.indexOf("/data") >= 0) path = "/data";
 if (!path) return { result: 1, error: "Could not determine where volume " + volume + " is mounted on " + envName + " (candidates: " + (mounts.join(", ") || "none") + ")." };
 
 // "Number of Bricks: 2 x 3 = 6" -> 2 bricks per region (capacity slices),
-// replica 3 (one brick per region).
+// replica 3 (one brick per region). "Number of Bricks: 2" is replica 1
+// (Distribute): Forget Region left a single region, which holds all 2.
 var replica = 0, perRegion = 0, cur = "";
 for (i = 0; i < vinfo.length; i++) {
     var vn = /^Volume Name:\s*(\S+)/.exec(vinfo[i]);
     if (vn) { cur = vn[1]; continue; }
-    var nb = /^Number of Bricks:\s*(\d+)\s*x\s*(\d+)\s*=/.exec(vinfo[i]);
-    if (nb && cur == volume) { perRegion = parseInt(nb[1], 10); replica = parseInt(nb[2], 10); }
+    var nb = /^Number of Bricks:\s*(\d+)(?:\s*x\s*(\d+)\s*=\s*\d+)?\s*$/.exec(vinfo[i]);
+    if (nb && cur == volume) { perRegion = parseInt(nb[1], 10); replica = nb[2] ? parseInt(nb[2], 10) : 1; }
 }
 
 var siblings = 0, envs = jelastic.environment.control.GetEnvs(appid, session);

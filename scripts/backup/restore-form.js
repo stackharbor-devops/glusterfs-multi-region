@@ -10,10 +10,28 @@
 var envName = "${env.envName}";
 var fields = [], values = [], resp, r, snaps, i, s, tags, mode, partial, j, when, src = "/data", msg = "";
 
+// The task script's own answer is Eval's `response`; the outer result 0 only
+// means that the script ran. Unwrapped like manage.js evalTask, so an answer
+// without a usable result is reported as a failure, never as "no snapshots".
+function taskAnswer(resp) {
+    var x;
+    if (!resp || typeof resp !== "object") return { error: "the backup task script returned no result" };
+    // 1702: no such script (SCRIPT_NOT_FOUND in manage.js)
+    if (resp.result == 1702) return { error: "the backup task script " + envName + "-gfs-backup is missing - open Configure and click Save to re-create it" };
+    x = resp.response;
+    // an answer delivered as JSON text (JS or Java string) is parsed
+    if (x !== null && x !== undefined && x.result === undefined) { try { x = JSON.parse(String(x)); } catch (e) { x = null; } }
+    if (x && typeof x === "object" && x.result !== undefined) return { answer: x };
+    if (resp.result != 0) return { error: resp.error ? String(resp.error) : "the backup task script failed (result " + resp.result + ")" };
+    return { error: "the backup task script returned no result - open Configure and click Save to re-create it" };
+}
+
 try {
-    resp = jelastic.dev.scripting.Eval(appid, session, envName + "-gfs-backup", { job: "list", envName: envName });
-    r = (resp && resp.response && resp.response.result !== undefined) ? resp.response : resp;
-    if (r && r.result == 0) {
+    resp = taskAnswer(jelastic.dev.scripting.Eval(appid, session, envName + "-gfs-backup", { job: "list", envName: envName }));
+    r = resp.answer;
+    if (!r) {
+        msg = resp.error;
+    } else if (r.result == 0) {
         snaps = r.snapshots || [];
         if (r.sourcePath) src = String(r.sourcePath);
         for (i = 0; i < snaps.length; i++) {
@@ -31,7 +49,7 @@ try {
                 (partial ? "   INCOMPLETE (some items could not be read)" : "") });
         }
     } else {
-        msg = (r && (r.message || r.error)) ? String(r.message || r.error) : "the backup task script did not answer";
+        msg = (r.message || r.error) ? String(r.message || r.error) : "the backup task script failed (result " + r.result + ")";
     }
 } catch (e) {
     msg = String(e);
